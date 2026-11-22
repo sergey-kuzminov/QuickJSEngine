@@ -15,13 +15,16 @@
 #ifndef QUICKJSENGINE_H
 #define QUICKJSENGINE_H
 
+#include <QElapsedTimer>
 #include <QHash>
 #include <QObject>
 #include <QPointer>
+#include <QStringList>
 #include <QThread>
 
 #include <atomic>
 #include <chrono>
+#include <limits>
 #include <type_traits>
 
 #include <quickjs.h>
@@ -60,12 +63,23 @@ struct EvalCacheEntry {
     JSValue bytecode;
 };
 
+// One imported file module. "instantiated" records that the def has been
+// driven through JS_EvalFunction at least once (linking done): only then is
+// JS_GetModuleNamespace() safe to call on it. A module loaded through the
+// loader callback during a failed import chain sits in the cache compiled
+// but not yet instantiated.
+struct FileModuleEntry {
+    JSModuleDef* def = nullptr;
+    bool instantiated = false;
+};
+
 struct JSCommonAtoms {
     JSAtom length = JS_ATOM_NULL;
     JSAtom getTime = JS_ATOM_NULL;
     JSAtom stack = JS_ATOM_NULL;
     JSAtom lineNumber = JS_ATOM_NULL;
     JSAtom line = JS_ATOM_NULL;
+    JSAtom name = JS_ATOM_NULL;
 };
 
 // A promise rejection reported by the engine tracker as unhandled. Buffered
@@ -89,6 +103,7 @@ class QQuickJSEngine : public QObject {
     Q_DISABLE_COPY_MOVE(QQuickJSEngine)
 public:
     friend class QQuickJSValue;
+    friend class QQuickJSValueIterator;
     friend struct JSQObjectData;
     friend class QuickJSQObjectProxy;
     friend class QuickJSSignalProxy;
@@ -97,8 +112,40 @@ public:
     explicit QQuickJSEngine(QObject* parent = nullptr);
     ~QQuickJSEngine();
 
-    QQuickJSValue evaluate(const QString& script, const QString& fileName = QString());
-    QQuickJSValue evaluate(const QString& script, const QString& fileName, int lineNumber);
+    QQuickJSValue evaluate(const QString& script, const QString& fileName = QString(),
+                           int lineNumber = 1, QStringList* exceptionStackTrace = nullptr);
+
+    /**
+     * @brief Imports the ECMAScript module located at @p fileName.
+     *
+     * QJSEngine-compatible singleton semantics: the first import loads and
+     * evaluates the module (local file or Qt resource ":/..." path, UTF-8);
+     * subsequent imports of the same file - including imports issued from
+     * other modules by relative specifier - return the already-imported
+     * instance. The file name is normalized with QFileInfo::canonicalFilePath()
+     * for the cache key. On error (missing file, syntax error, an exception
+     * thrown by the module code) the error value is returned.
+     *
+     * Known divergences from QJSEngine are documented in the README: error
+     * message texts differ, and circular imports follow the ECMAScript
+     * specification (allowed) instead of failing like V4.
+     */
+    QQuickJSValue importModule(const QString& fileName);
+
+    /**
+     * @brief Makes @p value importable from JavaScript under @p moduleName.
+     *
+     * QJSEngine-compatible registration: importers use the bare specifier
+     * exactly as registered ("import { a } from \"api.mjs\""), from any
+     * importer location; relative "./..." specifiers always resolve to files.
+     * The value itself serves as the default export; its own enumerable
+     * properties are snapshot (names and values, getters evaluated) at
+     * registration time and become the named exports. Non-object values only
+     * provide the default export. Re-registration with the same name replaces
+     * the previous registration. Returns false when the value does not belong
+     * to this engine or when a snapshot read throws.
+     */
+    bool registerModule(const QString& moduleName, const QQuickJSValue& value);
 
     void setProperty(const QString& name, const QQuickJSValue& value);
     void setProperty(const QByteArray& name, const QQuickJSValue& value);
@@ -134,31 +181,79 @@ public:
      */
     QQuickJSValue newQObject(QObject* obj);
     QQuickJSValue newObject();
+    QQuickJSValue newSymbol(const QString& name);
     QQuickJSValue newArray(uint length = 0);
     QQuickJSValue newFunction(JSCFunction* func, const char* name, int argc);
 
     JSValue toJSValue(const QVariant& var);
     JSValue toJSValueImpl(const QVariant& var, int depth);
     QVariant toVariant(JSValueConst val);
+    QVariant toVariant(JSValueConst val, QQuickJSValue::ObjectConversionBehavior behavior);
+
+    // QJSEngine-compatible conversion entry points. toScriptValue wraps any
+    // registered metatype into a script value; fromScriptValue converts back
+    // and requires a default-constructible T. Script values that cannot be
+    // represented (functions, RegExp, ...) yield a default T.
+    template<typename T>
+    QQuickJSValue toScriptValue(const T& value) {
+        JSValue v = toJSValueImpl(QVariant::fromValue(value), 0);
+        if (JS_IsException(v)) return QQuickJSValue::fromException(this);
+        return QQuickJSValue(this, v, true);
+    }
+
+    template<typename T>
+    T fromScriptValue(const QQuickJSValue& value) {
+        if constexpr (std::is_same_v<std::remove_cv_t<T>, QQuickJSValue>) {
+            return value;
+        } else if constexpr (std::is_same_v<T, QVariant>) {
+            return value.toVariant();
+        } else {
+            QVariant v = value.toVariant();
+            // QMetaType converts floating-point variants to integral types by
+            // rounding to nearest, while QJSEngine truncates toward zero
+            // (ToInteger semantics); mirror the reference behavior.
+            if constexpr (std::is_integral_v<T>) {
+                if (v.userType() == QMetaType::Double || v.userType() == QMetaType::Float) {
+                    const double d = v.toDouble();
+                    // The upper bound cast rounds up for 64-bit types, hence
+                    // '<' to keep the in-range static_cast defined.
+                    if (d >= static_cast<double>(std::numeric_limits<T>::min())
+                        && d < static_cast<double>(std::numeric_limits<T>::max())) {
+                        return static_cast<T>(d);
+                    }
+                }
+            }
+            return v.value<T>();
+        }
+    }
 
     // const_cast is safe: QPointer requires a non-const T*, but QQuickJSValue does not modify the engine when owned=false.
     QQuickJSValue globalObject() const;
 
     enum Extension : quint32 {
-        ConsoleExtension = 0x1,
-        GarbageCollectionExtension = 0x2,
-        TranslationExtension = 0x4,
+        // Values match QJSEngine::Extension so numeric combinations stay
+        // portable between the engines.
+        TranslationExtension = 0x1,
+        ConsoleExtension = 0x2,
+        GarbageCollectionExtension = 0x4,
         AllExtensions = 0xFFFFFFFF
     };
     Q_DECLARE_FLAGS(Extensions, Extension)
-    void installExtensions(Extensions extensions = AllExtensions);
+    /**
+     * @brief Installs the selected extensions onto @p object (or the global
+     * object). Values owned by another engine are rejected with a warning.
+     */
+    void installExtensions(Extensions extensions = AllExtensions,
+                          const QQuickJSValue& object = QQuickJSValue());
 
     /**
-     * @brief Requests an interrupt of the running script.
+     * @brief Interrupts or re-enables JavaScript execution.
      *
-     * Thread-safe. The flag targets the currently running execution: a new
-     * top-level entry point (evaluate(), QQuickJSValue::call(), a signal
-     * callback) always starts with a clean state.
+     * Thread-safe. QJSEngine-compatible semantics: while the flag is set, any
+     * JavaScript execution (evaluate(), calls, signal callbacks) aborts
+     * immediately and yields an "Interrupted" error object; the flag stays set
+     * until this function is called again with @c false. The execution timeout
+     * (setExecutionTimeoutMs) is unaffected: it remains a per-run quota.
      */
     void setInterrupted(bool interrupted);
 
@@ -208,6 +303,37 @@ public:
 
     QQuickJSValue newErrorObject(QQuickJSValue::ErrorType errorType, QAnyStringView message);
 
+    /**
+     * @brief Throws a run-time error (exception) with the given @p message.
+     *
+     * QJSEngine-compatible error delivery: when called from C++ code invoked
+     * by a script (a slot or property accessor), the error is thrown into the
+     * script where try/catch can handle it. When called outside any script
+     * execution, the error stays pending: hasError() returns true, the next
+     * evaluate()/call() returns it without executing, and catchError()
+     * retrieves and clears it.
+     */
+    void throwError(const QString& message);
+    /** @overload throwError(). Throws an error of the given @p errorType. */
+    void throwError(QQuickJSValue::ErrorType errorType, const QString& message = QString());
+    /** @overload throwError(). Throws the pre-constructed @p error value. */
+    void throwError(const QQuickJSValue& error);
+
+    /**
+     * @brief Returns true if an exception is currently pending on the engine
+     * (a throwError() call or a not-yet-caught script exception).
+     *
+     * evaluate() and QQuickJSValue::call() catch exceptions of the code they
+     * run, so hasError() is false after such a call returned.
+     */
+    bool hasError() const;
+    /**
+     * @brief Catches the pending exception and returns it as a value, or an
+     * undefined value when nothing is pending. After the call hasError()
+     * returns false.
+     */
+    QQuickJSValue catchError();
+
     // Exposed for proxies
     JSValue wrapQObject(QObject* obj);
     void processAndEmitException(JSContext* ctx, JSValueConst exc);
@@ -221,10 +347,11 @@ public:
         m_executionDeadlineMs.store(deadlineFromTimeout(m_executionTimeoutMs.load()));
     }
     // Every top-level entry point (evaluate, executeJsCall, signal callbacks)
-    // starts with a clean interrupt/deadline state; nested calls never reset.
+    // starts with a fresh execution-timeout quota; nested calls never reset.
+    // The interrupt flag itself is deliberately not cleared here: it is
+    // sticky until setInterrupted(false), like QJSEngine.
     void resetExecutionState() {
         ensureEngineThread();
-        m_interrupted.store(false);
         resetExecutionTimer();
     }
     JSValue toJSValueFromVoid(void* data, int metaType);
@@ -253,6 +380,22 @@ private:
     QHash<QObject*, JSValue> m_qobjectWrapperCache;
     QHash<const QMetaObject*, JSMetaObjectCache*> m_metaObjectCaches;
 
+    // Console-extension state (console.time/timeEnd and console.count). The
+    // counters are keyed by the printed label: quickjs-ng exposes no call-site
+    // information to C callbacks, unlike V4 which keys by script and line.
+    QHash<QString, QElapsedTimer> m_consoleTimers;
+    QHash<QString, int> m_consoleCounters;
+
+    // ES-module registry. File modules keyed by the canonical path: the
+    // importModule() singleton cache, shared with the module loader callback
+    // so that both entry points agree on one instance per file. Registered
+    // modules map the public name to the unique internal module name created
+    // by registerModule(); re-registration replaces the mapping, matching the
+    // live QJSEngine behavior.
+    QHash<QString, FileModuleEntry> m_fileModules;
+    QHash<QString, QByteArray> m_registeredModules;
+    int m_moduleSerial = 0;
+
     QList<JSGenericReceiver*> m_signalReceivers;
     QList<JSGenericReceiver*> m_garbageReceivers;
 
@@ -269,6 +412,17 @@ private:
 
     static int interruptHandler(JSContext * ctx, void* opaque);
 
+    // ES-module callbacks installed on the runtime; see the definitions in
+    // the .cpp (name resolution, file loading and registered-module init).
+    static char* moduleNormalize(JSContext* ctx, const char* base_name,
+                                 const char* module_name, void* opaque);
+    static JSModuleDef* moduleLoader(JSContext* ctx, const char* module_name, void* opaque);
+    static int registeredModuleInit(JSContext* ctx, JSModuleDef* m);
+
+    // Translates the "stack" property of a caught exception into QJSEngine's
+    // exceptionStackTrace frame format; see the definition in the .cpp.
+    static void collectExceptionStackTrace(QQuickJSEngine* engine, JSValueConst errVal, QStringList* out);
+
     static qint64 steadyNowMs() {
         return std::chrono::duration_cast<std::chrono::milliseconds>(
                    std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -280,7 +434,8 @@ private:
     void queueUnhandledRejection(JSContext* ctx, JSValueConst promise, JSValueConst reason);
     void retractHandledRejection(JSContext* ctx, JSValueConst promise);
 
-    QVariant toVariantImpl(JSValueConst val, JSVisitedStack& visited, int depth);
+    QVariant toVariantImpl(JSValueConst val, JSVisitedStack& visited, int depth,
+                           QQuickJSValue::ObjectConversionBehavior behavior);
 
     void ensureEngineThread() const {
         Q_ASSERT_X(thread() == QThread::currentThread(), "QQuickJSEngine", "Engine methods must be called in the engine's thread");

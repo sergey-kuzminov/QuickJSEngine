@@ -14,6 +14,9 @@
 #include <QDate>
 #include <QDebug>
 #include <QDateTime>
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
 #include <QScopeGuard>
 #include <QStringList>
 #include <QThread>
@@ -51,6 +54,8 @@ QQuickJSEngine::QQuickJSEngine(QObject* parent) : QObject(parent),
     JS_SetContextOpaque(m_ctx, this);
     JS_SetRuntimeOpaque(m_rt, this);
     JS_SetInterruptHandler(m_rt, &QQuickJSEngine::interruptHandler, this);
+    JS_SetModuleLoaderFunc(m_rt, &QQuickJSEngine::moduleNormalize,
+                            &QQuickJSEngine::moduleLoader, this);
 
     JS_SetHostPromiseRejectionTracker(m_rt, [](JSContext* ctx, JSValueConst promise, JSValueConst reason, bool is_handled, void* opaque) {
         QQuickJSEngine* engine = static_cast<QQuickJSEngine*>(opaque);
@@ -71,6 +76,7 @@ QQuickJSEngine::QQuickJSEngine(QObject* parent) : QObject(parent),
     m_atoms.stack = JS_NewAtom(m_ctx, "stack");
     m_atoms.lineNumber = JS_NewAtom(m_ctx, "lineNumber");
     m_atoms.line = JS_NewAtom(m_ctx, "line");
+    m_atoms.name = JS_NewAtom(m_ctx, "name");
 
     JS_NewClassID(m_rt, &m_qobjectClassID);
     JS_NewClassID(m_rt, &m_methodClassID);
@@ -280,6 +286,7 @@ QQuickJSEngine::~QQuickJSEngine() {
     JS_FreeAtom(m_ctx, m_atoms.stack);
     JS_FreeAtom(m_ctx, m_atoms.lineNumber);
     JS_FreeAtom(m_ctx, m_atoms.line);
+    JS_FreeAtom(m_ctx, m_atoms.name);
 
     JS_FreeValue(m_ctx, m_globalObj);
     JS_FreeContext(m_ctx);
@@ -342,8 +349,13 @@ void QQuickJSEngine::setEvalCacheLimit(int limit) {
 
 QQuickJSValue QQuickJSEngine::newErrorObject(QQuickJSValue::ErrorType errorType, QAnyStringView message) {
     ensureEngineThread();
+    if (errorType == QQuickJSValue::NoError) {
+        // QJSEngine parity: NoError yields an undefined value, not an Error.
+        return QQuickJSValue();
+    }
     const char* ctorName = "Error";
     switch (errorType) {
+    case QQuickJSValue::EvalError: ctorName = "EvalError"; break;
     case QQuickJSValue::RangeError: ctorName = "RangeError"; break;
     case QQuickJSValue::ReferenceError: ctorName = "ReferenceError"; break;
     case QQuickJSValue::SyntaxError: ctorName = "SyntaxError"; break;
@@ -368,6 +380,46 @@ QQuickJSValue QQuickJSEngine::newErrorObject(QQuickJSValue::ErrorType errorType,
     return result;
 }
 
+void QQuickJSEngine::throwError(const QString& message) {
+    throwError(QQuickJSValue::GenericError, message);
+}
+
+void QQuickJSEngine::throwError(QQuickJSValue::ErrorType errorType, const QString& message) {
+    ensureEngineThread();
+    QQuickJSValue err = newErrorObject(errorType, message);
+    if (!err.isValid()) return;   // construction failed and was already reported
+    // JS_Throw() consumes the reference it is given; duplicate so that the
+    // local QQuickJSValue keeps its own reference until the end of the scope.
+    JS_Throw(m_ctx, JS_DupValue(m_ctx, err.jsVal()));
+}
+
+void QQuickJSEngine::throwError(const QQuickJSValue& error) {
+    ensureEngineThread();
+    if (!error.m_engine && JS_IsUndefined(error.m_val)) {
+        // Default-constructed value: throw undefined, like QJSEngine does for
+        // an uninitialized QJSValue.
+        JS_Throw(m_ctx, JS_UNDEFINED);
+        return;
+    }
+    if (error.m_engine.data() != this) {
+        qWarning("QQuickJSEngine::throwError: value belongs to another engine or its engine is gone, ignored");
+        return;
+    }
+    JS_Throw(m_ctx, JS_DupValue(m_ctx, error.m_val));
+}
+
+bool QQuickJSEngine::hasError() const {
+    ensureEngineThread();
+    return JS_HasException(m_ctx);
+}
+
+QQuickJSValue QQuickJSEngine::catchError() {
+    ensureEngineThread();
+    // fromException() checks the flag and returns an undefined (default
+    // constructed) value when nothing is pending.
+    return QQuickJSValue::fromException(this);
+}
+
 void QQuickJSEngine::collectGarbage() {
     ensureEngineThread();
     if (m_rt) JS_RunGC(m_rt);
@@ -382,7 +434,10 @@ int QQuickJSEngine::interruptHandler(JSContext * /*ctx*/, void* opaque) {
     QQuickJSEngine* engine = static_cast<QQuickJSEngine*>(opaque);
     if (!engine) return 0;
 
-    if (engine->m_interrupted.exchange(false)) {
+    // QJSEngine parity: the flag is sticky - it stays set (aborting every
+    // execution) until setInterrupted(false); it is never consumed here.
+    // The execution timeout below remains a per-run quota.
+    if (engine->m_interrupted.load()) {
         return 1;
     }
 
@@ -398,15 +453,304 @@ QQuickJSValue QQuickJSEngine::globalObject() const {
     return QQuickJSValue(const_cast<QQuickJSEngine*>(this), m_globalObj, false);
 }
 
-void QQuickJSEngine::installExtensions(QQuickJSEngine::Extensions extensions) {
+// ---------------------------------------------------------------------------
+// Console/translation extension internals (QJSEngine parity; semantics
+// verified against qtdeclarative 6.10 sources: qjsengine.cpp /
+// qqmlbuiltinfunctions.cpp, and against live Qt 6.12 behavior)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+QQuickJSEngine* engineFromContext(JSContext* ctx) {
+    return static_cast<QQuickJSEngine*>(JS_GetRuntimeOpaque(JS_GetRuntime(ctx)));
+}
+
+// One console argument rendered as a display string: ToString semantics for
+// most values; symbols (which refuse implicit conversion) render as
+// "Symbol(description)"; a failed conversion renders as a readable placeholder.
+QString consoleArgToString(JSContext* ctx, JSValueConst val) {
+    QString part = QuickJSConvert::jsToQString(ctx, val);
+    if (part.isNull()) {
+        // jsToQString failed and already cleared the pending exception;
+        // substitute a readable fallback instead of printing nothing.
+        if (JS_IsSymbol(val)) {
+            ScopedJSValue desc(ctx, JS_GetPropertyStr(ctx, val, "description"));
+            QString descStr;
+            if (JS_IsString(desc.value())) {
+                descStr = QuickJSConvert::jsToQString(ctx, desc.value());
+            } else {
+                clearPendingException(ctx);
+            }
+            part = descStr.isNull() ? QStringLiteral("Symbol()")
+                                    : QStringLiteral("Symbol(%1)").arg(descStr);
+        } else {
+            part = QStringLiteral("[unprintable]");
+        }
+    }
+    return part;
+}
+
+// console.assert()/console.exception() message: the arguments joined with a
+// single space, like V4's writeToConsole().
+QString joinConsoleArgs(JSContext* ctx, int argc, JSValueConst* argv, int start) {
+    QStringList parts;
+    for (int i = start; i < argc; ++i) {
+        parts.append(consoleArgToString(ctx, argv[i]));
+    }
+    return parts.join(u' ');
+}
+
+// Caller stack of a console.* invocation, built from a freshly constructed
+// Error object: its "stack" property lists this console.* frame first,
+// followed by the JavaScript callers; the console frame is dropped.
+QString consoleCallerStack(JSContext* ctx) {
+    // JS_GetGlobalObject returns a new reference: scope it to free it.
+    ScopedJSValue global(ctx, JS_GetGlobalObject(ctx));
+    ScopedJSValue errorCtor(ctx, JS_GetPropertyStr(ctx, global.value(), "Error"));
+    if (!JS_IsFunction(ctx, errorCtor.value())) {
+        clearPendingException(ctx);
+        return QString();
+    }
+    ScopedJSValue err(ctx, JS_CallConstructor(ctx, errorCtor.value(), 0, nullptr));
+    if (JS_IsException(err.value())) {
+        clearPendingException(ctx);
+        return QString();
+    }
+    ScopedJSValue stack(ctx, JS_GetPropertyStr(ctx, err.value(), "stack"));
+    if (JS_IsException(stack.value())) {
+        clearPendingException(ctx);
+        return QString();
+    }
+    const QString s = QuickJSConvert::jsToQString(ctx, stack.value());
+    if (s.isNull()) return QString();
+    const qsizetype nl = s.indexOf(u'\n');
+    return nl < 0 ? QString() : s.mid(nl + 1);
+}
+
+} // namespace
+
+// qsTr keeps the fixed "QQuickJSEngine" translation context: the calling
+// script's URL (V4's context source) is not visible to C callbacks in
+// quickjs-ng.
+static JSValue js_qsTr(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    try {
+        if (argc < 1) return JS_ThrowPlainError(ctx, "qsTr() requires at least one argument");
+        if (!JS_IsString(argv[0])) return JS_ThrowPlainError(ctx, "qsTr(): first argument (sourceText) must be a string");
+        if (argc > 1 && !JS_IsString(argv[1])) return JS_ThrowPlainError(ctx, "qsTr(): second argument (disambiguation) must be a string");
+        if (argc > 2 && !JS_IsNumber(argv[2])) return JS_ThrowPlainError(ctx, "qsTr(): third argument (n) must be a number");
+
+        const QString source = QuickJSConvert::jsToQString(ctx, argv[0]);
+        QString comment;
+        if (argc > 1) comment = QuickJSConvert::jsToQString(ctx, argv[1]);
+        int n = -1;
+        if (argc > 2) {
+            double d = 0;
+            if (JS_ToFloat64(ctx, &d, argv[2]) == 0) n = static_cast<int>(d);
+            else clearPendingException(ctx);
+        }
+        return qStringToJS(ctx, QCoreApplication::translate("QQuickJSEngine",
+                                                            source.toUtf8().constData(),
+                                                            comment.toUtf8().constData(),
+                                                            n));
+    } catch (const std::exception& e) {
+        try { JS_ThrowPlainError(ctx, "qsTr: %s", e.what()); } catch (...) {}
+        return JS_EXCEPTION;
+    } catch (...) {
+        try { JS_ThrowInternalError(ctx, "Unknown C++ exception in qsTr"); } catch (...) {}
+        return JS_EXCEPTION;
+    }
+}
+
+static JSValue js_qsTrNoOp(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    if (argc < 1) return JS_UNDEFINED;
+    return JS_DupValue(ctx, argv[0]);
+}
+
+static JSValue js_qsTranslate(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    try {
+        if (argc < 2) return JS_ThrowPlainError(ctx, "qsTranslate() requires at least two arguments");
+        if (!JS_IsString(argv[0])) return JS_ThrowPlainError(ctx, "qsTranslate(): first argument (context) must be a string");
+        if (!JS_IsString(argv[1])) return JS_ThrowPlainError(ctx, "qsTranslate(): second argument (sourceText) must be a string");
+        if (argc > 2 && !JS_IsString(argv[2])) return JS_ThrowPlainError(ctx, "qsTranslate(): third argument (disambiguation) must be a string");
+
+        const QString context = QuickJSConvert::jsToQString(ctx, argv[0]);
+        const QString text = QuickJSConvert::jsToQString(ctx, argv[1]);
+        QString comment;
+        if (argc > 2) comment = QuickJSConvert::jsToQString(ctx, argv[2]);
+
+        int i = 3;
+        if (argc > i && JS_IsString(argv[i])) {
+            qWarning("qsTranslate(): specifying the encoding as fourth argument is deprecated");
+            ++i;
+        }
+        int n = -1;
+        if (argc > i) {
+            double d = 0;
+            if (JS_ToFloat64(ctx, &d, argv[i]) == 0) n = static_cast<int>(d);
+            else clearPendingException(ctx);
+        }
+
+        return qStringToJS(ctx, QCoreApplication::translate(context.toUtf8().constData(),
+                                                            text.toUtf8().constData(),
+                                                            comment.toUtf8().constData(),
+                                                            n));
+    } catch (const std::exception& e) {
+        try { JS_ThrowPlainError(ctx, "qsTranslate: %s", e.what()); } catch (...) {}
+        return JS_EXCEPTION;
+    } catch (...) {
+        try { JS_ThrowInternalError(ctx, "Unknown C++ exception in qsTranslate"); } catch (...) {}
+        return JS_EXCEPTION;
+    }
+}
+
+static JSValue js_qsTranslateNoOp(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    if (argc < 2) return JS_UNDEFINED;
+    return JS_DupValue(ctx, argv[1]);
+}
+
+static JSValue js_qsTrId(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    try {
+        if (argc < 1) return JS_ThrowPlainError(ctx, "qsTrId() requires at least one argument");
+        if (!JS_IsString(argv[0])) return JS_ThrowTypeError(ctx, "qsTrId(): first argument (id) must be a string");
+        if (argc > 1 && !JS_IsNumber(argv[1])) return JS_ThrowTypeError(ctx, "qsTrId(): second argument (n) must be a number");
+
+        const QString id = QuickJSConvert::jsToQString(ctx, argv[0]);
+        int n = -1;
+        if (argc > 1) {
+            double d = 0;
+            if (JS_ToFloat64(ctx, &d, argv[1]) == 0) n = static_cast<int>(d);
+            else clearPendingException(ctx);
+        }
+        return qStringToJS(ctx, qtTrId(id.toUtf8().constData(), n));
+    } catch (const std::exception& e) {
+        try { JS_ThrowPlainError(ctx, "qsTrId: %s", e.what()); } catch (...) {}
+        return JS_EXCEPTION;
+    } catch (...) {
+        try { JS_ThrowInternalError(ctx, "Unknown C++ exception in qsTrId"); } catch (...) {}
+        return JS_EXCEPTION;
+    }
+}
+
+static JSValue js_qsTrIdNoOp(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    if (argc < 1) return JS_UNDEFINED;
+    return JS_DupValue(ctx, argv[0]);
+}
+
+// String.prototype.arg(value): replaces the lowest numbered %N marker, like
+// V4's GlobalExtensions::method_string_arg (int/double/bool/string values
+// map to the corresponding QString::arg() overload).
+static JSValue js_string_arg(JSContext* ctx, JSValueConst thisObj, int argc, JSValueConst* argv) {
+    try {
+        if (argc != 1) return JS_ThrowPlainError(ctx, "String.arg(): Invalid arguments");
+        const QString value = QuickJSConvert::jsToQString(ctx, thisObj);
+        if (value.isNull()) return JS_UNDEFINED;
+
+        if (JS_IsNumber(argv[0])) {
+            if (JS_VALUE_GET_TAG(argv[0]) == JS_TAG_INT) {
+                return qStringToJS(ctx, value.arg(JS_VALUE_GET_INT(argv[0])));
+            }
+            double d = 0;
+            if (JS_ToFloat64(ctx, &d, argv[0]) == 0) return qStringToJS(ctx, value.arg(d));
+            clearPendingException(ctx);
+            return JS_UNDEFINED;
+        }
+        if (JS_IsBool(argv[0])) {
+            return qStringToJS(ctx, value.arg(JS_VALUE_GET_BOOL(argv[0]) != 0));
+        }
+        const QString argStr = QuickJSConvert::jsToQString(ctx, argv[0]);
+        if (argStr.isNull()) return JS_UNDEFINED;
+        return qStringToJS(ctx, value.arg(argStr));
+    } catch (const std::exception& e) {
+        try { JS_ThrowPlainError(ctx, "String.arg: %s", e.what()); } catch (...) {}
+        return JS_EXCEPTION;
+    } catch (...) {
+        try { JS_ThrowInternalError(ctx, "Unknown C++ exception in String.arg"); } catch (...) {}
+        return JS_EXCEPTION;
+    }
+}
+
+static void parseStackLocation(const QString& loc, QString* file, int* lineNo, int* colNo) {
+    *file = loc;
+    const qsizetype c = loc.lastIndexOf(u':');
+    if (c <= 0) return;
+    bool okCol = false;
+    const int col = QStringView{loc}.mid(c + 1).toString().toInt(&okCol);
+    if (!okCol) return;
+    const qsizetype l = loc.lastIndexOf(u':', c - 1);
+    if (l < 0) return;
+    bool okLine = false;
+    const int lineNo2 = QStringView{loc}.mid(l + 1, c - l - 1).toString().toInt(&okLine);
+    if (!okLine) return;
+    *file = loc.left(l);
+    *lineNo = lineNo2;
+    *colNo = col;
+}
+
+// Translates the "stack" property of a caught exception into QJSEngine's
+// exceptionStackTrace frame format "function:line:column:file" (native frames
+// use -1/-1 with an empty file, like V4). quickjs-ng frames look like
+// "    at name (file:line:col)", "    at name (native)" or "    at file:line:col";
+// a bare token without parentheses or location is an eval filename frame and
+// yields an empty function name.
+void QQuickJSEngine::collectExceptionStackTrace(QQuickJSEngine* engine, JSValueConst errVal, QStringList* out) {
+    if (!out) return;
+    out->clear();
+    JSContext* ctx = engine->m_ctx;
+    ScopedJSValue stack(ctx, JS_GetProperty(ctx, errVal, engine->m_atoms.stack));
+    if (JS_IsException(stack.value())) {
+        clearPendingException(ctx);
+        return;
+    }
+    const QString s = QuickJSConvert::jsToQString(ctx, stack.value());
+    if (s.isNull()) return;
+
+    for (QString rawLine : s.split(u'\n')) {
+        QStringView t = QStringView{rawLine}.trimmed();
+        if (!t.startsWith(u"at ")) continue;
+        t = t.mid(3);
+
+        QString func;
+        QString file;
+        int lineNo = -1;
+        int colNo = -1;
+
+        const qsizetype open = t.indexOf(u'(');
+        if (open >= 0 && t.endsWith(u')')) {
+            func = t.left(open).trimmed().toString();
+            const QString loc = t.mid(open + 1, t.size() - open - 2).toString();
+            if (loc != QLatin1String("native") && loc != QLatin1String("missing")) {
+                parseStackLocation(loc, &file, &lineNo, &colNo);
+            }
+        } else {
+            // The eval filename frame: "file", "file:line" or "file:line:col"
+            parseStackLocation(t.toString(), &file, &lineNo, &colNo);
+        }
+
+        out->append(QStringLiteral("%1:%2:%3:%4")
+                        .arg(func, QString::number(lineNo), QString::number(colNo), file));
+    }
+}
+
+void QQuickJSEngine::installExtensions(QQuickJSEngine::Extensions extensions, const QQuickJSValue& object) {
     ensureEngineThread();
 
+    // QJSEngine parity: reject values owned by another engine; non-object
+    // targets (including the default argument) fall back to the global object.
+    JSValue target = m_globalObj;
+    if (object.isValid()) {
+        if (object.m_engine.data() != this) {
+            qWarning("QQuickJSEngine: Trying to install extensions from a different engine");
+            return;
+        }
+        if (JS_IsObject(object.m_val)) target = object.m_val;
+    }
+
     // Deduplicate by the actual property presence, not only by the installed
-    // mask: scripts can delete console/gc/qsTr from the global object, and a
+    // mask: scripts can delete console/gc/qsTr from the target object, and a
     // repeated request must reinstall what is missing.
-    auto needsInstall = [this](Extension ext, const char* propName) -> bool {
+    auto needsInstall = [this, target](Extension ext, const char* propName) -> bool {
         if (!m_installedExtensions.testFlag(ext)) return true;
-        ScopedJSValue v(m_ctx, JS_GetPropertyStr(m_ctx, m_globalObj, propName));
+        ScopedJSValue v(m_ctx, JS_GetPropertyStr(m_ctx, target, propName));
         if (JS_IsException(v.value())) {
             clearPendingException(m_ctx);
             return false;
@@ -432,26 +776,7 @@ void QQuickJSEngine::installExtensions(QQuickJSEngine::Extensions extensions) {
                         try {
                             QStringList msgParts;
                             for (int i = 0; i < argc; i++) {
-                                QString part = QuickJSConvert::jsToQString(ctx, argv[i]);
-                                if (part.isNull()) {
-                                    // jsToQString failed and already cleared the
-                                    // pending exception; substitute a readable
-                                    // fallback instead of printing nothing.
-                                    if (JS_IsSymbol(argv[i])) {
-                                        ScopedJSValue desc(ctx, JS_GetPropertyStr(ctx, argv[i], "description"));
-                                        QString descStr;
-                                        if (JS_IsString(desc.value())) {
-                                            descStr = QuickJSConvert::jsToQString(ctx, desc.value());
-                                        } else {
-                                            clearPendingException(ctx);
-                                        }
-                                        part = descStr.isNull() ? QStringLiteral("Symbol()")
-                                                                : QStringLiteral("Symbol(%1)").arg(descStr);
-                                    } else {
-                                        part = QStringLiteral("[unprintable]");
-                                    }
-                                }
-                                msgParts.append(part);
+                                msgParts.append(consoleArgToString(ctx, argv[i]));
                             }
 
                             switch (static_cast<QtMsgType>(magic)) {
@@ -488,7 +813,145 @@ void QQuickJSEngine::installExtensions(QQuickJSEngine::Extensions extensions) {
             addConsoleMethod(console.value(), "warn", QtWarningMsg);
             addConsoleMethod(console.value(), "error", QtCriticalMsg);
 
-            if (JS_SetPropertyStr(m_ctx, m_globalObj, "console", console.release()) < 0) {
+            // QJSEngine ConsoleExtension parity: assert, count, time, timeEnd,
+            // trace, exception. Timers and counters live on the engine (V4
+            // stores them on the engine, too), not on the target object.
+            auto addConsoleNative = [this](JSValue obj, const char* name, JSCFunction* fn, int length) {
+                JSValue func = JS_NewCFunction(m_ctx, fn, name, length);
+                if (JS_SetPropertyStr(m_ctx, obj, name, func) < 0) {
+                    clearPendingException(m_ctx);
+                }
+            };
+
+            auto jsConsoleAssert = [](JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) -> JSValue {
+                try {
+                    if (argc == 0) return JS_ThrowPlainError(ctx, "console.assert(): Missing argument");
+                    const int truthy = JS_ToBool(ctx, argv[0]);
+                    if (truthy < 0) clearPendingException(ctx);
+                    if (truthy == 1) return JS_UNDEFINED;
+                    const QString message = joinConsoleArgs(ctx, argc, argv, 1);
+                    const QString stack = consoleCallerStack(ctx);
+                    qCritical().noquote() << "[JS console]" << (stack.isEmpty() ? message : message + u'\n' + stack);
+                    return JS_UNDEFINED;
+                } catch (const std::exception& e) {
+                    try { JS_ThrowPlainError(ctx, "console: %s", e.what()); } catch (...) {}
+                    return JS_EXCEPTION;
+                } catch (...) {
+                    try { JS_ThrowInternalError(ctx, "console: unknown C++ exception"); } catch (...) {}
+                    return JS_EXCEPTION;
+                }
+            };
+
+            auto jsConsoleCount = [](JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) -> JSValue {
+                try {
+                    QQuickJSEngine* engine = engineFromContext(ctx);
+                    if (!engine) return JS_UNDEFINED;
+                    const QString label = argc > 0 ? consoleArgToString(ctx, argv[0]) : QString();
+                    const int value = ++engine->m_consoleCounters[label];
+                    qDebug().noquote() << "[JS console]" << QStringLiteral("%1: %2").arg(label).arg(value);
+                    return JS_UNDEFINED;
+                } catch (const std::exception& e) {
+                    try { JS_ThrowPlainError(ctx, "console: %s", e.what()); } catch (...) {}
+                    return JS_EXCEPTION;
+                } catch (...) {
+                    try { JS_ThrowInternalError(ctx, "console: unknown C++ exception"); } catch (...) {}
+                    return JS_EXCEPTION;
+                }
+            };
+
+            auto jsConsoleTime = [](JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) -> JSValue {
+                try {
+                    if (argc != 1) return JS_ThrowPlainError(ctx, "console.time(): Invalid arguments");
+                    QQuickJSEngine* engine = engineFromContext(ctx);
+                    if (engine) {
+                        QElapsedTimer timer;
+                        timer.start();
+                        engine->m_consoleTimers.insert(consoleArgToString(ctx, argv[0]), timer);
+                    }
+                    return JS_UNDEFINED;
+                } catch (const std::exception& e) {
+                    try { JS_ThrowPlainError(ctx, "console: %s", e.what()); } catch (...) {}
+                    return JS_EXCEPTION;
+                } catch (...) {
+                    try { JS_ThrowInternalError(ctx, "console: unknown C++ exception"); } catch (...) {}
+                    return JS_EXCEPTION;
+                }
+            };
+
+            auto jsConsoleTimeEnd = [](JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) -> JSValue {
+                try {
+                    if (argc != 1) return JS_ThrowPlainError(ctx, "console.timeEnd(): Invalid arguments");
+                    QQuickJSEngine* engine = engineFromContext(ctx);
+                    if (engine) {
+                        const QString label = consoleArgToString(ctx, argv[0]);
+                        const auto it = engine->m_consoleTimers.find(label);
+                        if (it != engine->m_consoleTimers.end()) {
+                            const qint64 elapsed = it.value().elapsed();
+                            engine->m_consoleTimers.erase(it);
+                            // V4 format: qDebug("%s: %llims", name, elapsed).
+                            qDebug().noquote() << "[JS console]" << QStringLiteral("%1: %2ms").arg(label).arg(elapsed);
+                        }
+                    }
+                    return JS_UNDEFINED;
+                } catch (const std::exception& e) {
+                    try { JS_ThrowPlainError(ctx, "console: %s", e.what()); } catch (...) {}
+                    return JS_EXCEPTION;
+                } catch (...) {
+                    try { JS_ThrowInternalError(ctx, "console: unknown C++ exception"); } catch (...) {}
+                    return JS_EXCEPTION;
+                }
+            };
+
+            auto jsConsoleTrace = [](JSContext* ctx, JSValueConst, int argc, JSValueConst* /*argv*/) -> JSValue {
+                try {
+                    if (argc != 0) return JS_ThrowPlainError(ctx, "console.trace(): Invalid arguments");
+                    const QString stack = consoleCallerStack(ctx);
+                    if (!stack.isEmpty()) {
+                        qDebug().noquote() << "[JS console]" << stack;
+                    }
+                    return JS_UNDEFINED;
+                } catch (const std::exception& e) {
+                    try { JS_ThrowPlainError(ctx, "console: %s", e.what()); } catch (...) {}
+                    return JS_EXCEPTION;
+                } catch (...) {
+                    try { JS_ThrowInternalError(ctx, "console: unknown C++ exception"); } catch (...) {}
+                    return JS_EXCEPTION;
+                }
+            };
+
+            auto jsConsoleException = [](JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) -> JSValue {
+                try {
+                    if (argc == 0) return JS_ThrowPlainError(ctx, "console.exception(): Missing argument");
+                    const QString message = joinConsoleArgs(ctx, argc, argv, 0);
+                    const QString stack = consoleCallerStack(ctx);
+                    qCritical().noquote() << "[JS console]" << (stack.isEmpty() ? message : message + u'\n' + stack);
+                    return JS_UNDEFINED;
+                } catch (const std::exception& e) {
+                    try { JS_ThrowPlainError(ctx, "console: %s", e.what()); } catch (...) {}
+                    return JS_EXCEPTION;
+                } catch (...) {
+                    try { JS_ThrowInternalError(ctx, "console: unknown C++ exception"); } catch (...) {}
+                    return JS_EXCEPTION;
+                }
+            };
+
+            addConsoleNative(console.value(), "assert", jsConsoleAssert, 1);
+            addConsoleNative(console.value(), "count", jsConsoleCount, 0);
+            addConsoleNative(console.value(), "time", jsConsoleTime, 1);
+            addConsoleNative(console.value(), "timeEnd", jsConsoleTimeEnd, 1);
+            addConsoleNative(console.value(), "trace", jsConsoleTrace, 0);
+            addConsoleNative(console.value(), "exception", jsConsoleException, 1);
+
+            // print(): a console.log() alias installed on the target object
+            // itself, like QJSEngine installs it next to console.
+            ScopedJSValue logFn(m_ctx, JS_GetPropertyStr(m_ctx, console.value(), "log"));
+            if (JS_SetPropertyStr(m_ctx, target, "console", console.release()) < 0) {
+                clearPendingException(m_ctx);
+            } else if (JS_IsFunction(m_ctx, logFn.value())) {
+                if (JS_SetPropertyStr(m_ctx, target, "print", JS_DupValue(m_ctx, logFn.value())) < 0) {
+                    clearPendingException(m_ctx);
+                }
+            } else {
                 clearPendingException(m_ctx);
             }
         }
@@ -510,31 +973,40 @@ void QQuickJSEngine::installExtensions(QQuickJSEngine::Extensions extensions) {
             }
         }, "gc", 0);
 
-        if (JS_SetPropertyStr(m_ctx, m_globalObj, "gc", func) < 0) {
+        if (JS_SetPropertyStr(m_ctx, target, "gc", func) < 0) {
             clearPendingException(m_ctx);
         }
     }
 
     if (toInstall.testFlag(TranslationExtension)) {
-        JSValue func = JS_NewCFunction(m_ctx, [](JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) -> JSValue {
-            try {
-                if (argc > 0 && JS_IsString(argv[0])) {
-                    QString source = QuickJSConvert::jsToQString(ctx, argv[0]);
-                    QString translated = QCoreApplication::translate("QQuickJSEngine", source.toUtf8().constData());
-                    return qStringToJS(ctx, translated);
-                }
-                return JS_UNDEFINED;
-            } catch (const std::exception& e) {
-                try { JS_ThrowPlainError(ctx, "qsTr: %s", e.what()); } catch (...) {}
-                return JS_EXCEPTION;
-            } catch (...) {
-                try { JS_ThrowInternalError(ctx, "Unknown C++ exception in qsTr"); } catch (...) {}
-                return JS_EXCEPTION;
+        auto addTargetFn = [this, target](const char* name, JSCFunction* fn, int length) {
+            JSValue func = JS_NewCFunction(m_ctx, fn, name, length);
+            if (JS_SetPropertyStr(m_ctx, target, name, func) < 0) {
+                clearPendingException(m_ctx);
             }
-        }, "qsTr", 1);
+        };
+        addTargetFn("qsTr", js_qsTr, 1);
+        addTargetFn("QT_TR_NOOP", js_qsTrNoOp, 1);
+        addTargetFn("qsTranslate", js_qsTranslate, 2);
+        addTargetFn("QT_TRANSLATE_NOOP", js_qsTranslateNoOp, 2);
+        addTargetFn("qsTrId", js_qsTrId, 1);
+        addTargetFn("QT_TRID_NOOP", js_qsTrIdNoOp, 1);
 
-        if (JS_SetPropertyStr(m_ctx, m_globalObj, "qsTr", func) < 0) {
+        // String.prototype.arg() is installed on the engine-wide string
+        // prototype (like V4), regardless of the target object.
+        ScopedJSValue stringCtor(m_ctx, JS_GetPropertyStr(m_ctx, m_globalObj, "String"));
+        if (JS_IsException(stringCtor.value())) {
             clearPendingException(m_ctx);
+        } else {
+            ScopedJSValue proto(m_ctx, JS_GetPropertyStr(m_ctx, stringCtor.value(), "prototype"));
+            if (JS_IsException(proto.value())) {
+                clearPendingException(m_ctx);
+            } else if (JS_IsObject(proto.value())) {
+                JSValue func = JS_NewCFunction(m_ctx, js_string_arg, "arg", 1);
+                if (JS_SetPropertyStr(m_ctx, proto.value(), "arg", func) < 0) {
+                    clearPendingException(m_ctx);
+                }
+            }
         }
     }
 
@@ -630,8 +1102,21 @@ void QQuickJSEngine::processPendingJobs() {
     }
 }
 
-QQuickJSValue QQuickJSEngine::evaluate(const QString& script, const QString& fileName, int lineNumber) {
+QQuickJSValue QQuickJSEngine::evaluate(const QString& script, const QString& fileName,
+                                       int lineNumber, QStringList* exceptionStackTrace) {
     ensureEngineThread();
+    if (exceptionStackTrace) exceptionStackTrace->clear();
+
+    // QJSEngine parity: a pending exception (e.g. throwError() called from C++
+    // between script executions) preempts evaluation: the script is not
+    // executed and the pending error is returned, reported like any other
+    // uncaught exception surfaced by evaluate().
+    if (JS_HasException(m_ctx)) {
+        QQuickJSValue errVal = QQuickJSValue::fromException(this);
+        collectExceptionStackTrace(this, errVal.jsVal(), exceptionStackTrace);
+        processAndEmitException(m_ctx, errVal.jsVal());
+        return errVal;
+    }
 
     const bool topLevel = (m_evalDepth == 0);
     if (topLevel) {
@@ -660,9 +1145,16 @@ QQuickJSValue QQuickJSEngine::evaluate(const QString& script, const QString& fil
                 if (m_autoProcessPromises) processPendingJobs();
 
                 if (hadException) {
+                    collectExceptionStackTrace(this, errVal.jsVal(), exceptionStackTrace);
                     processAndEmitException(m_ctx, errVal.jsVal());
-                    return errVal;
                 }
+                // QJSEngine parity: a sticky interrupt flag yields an "Interrupted"
+                // error object even when the script completed without hitting
+                // an interrupt check.
+                if (isInterrupted()) {
+                    return newErrorObject(QQuickJSValue::GenericError, QStringLiteral("Interrupted"));
+                }
+                if (hadException) return errVal;
                 return QQuickJSValue(this, retScoped.release(), true);
             }
         }
@@ -682,7 +1174,11 @@ QQuickJSValue QQuickJSEngine::evaluate(const QString& script, const QString& fil
 
     if (JS_IsException(bc)) {
         QQuickJSValue errVal = QQuickJSValue::fromException(this);
+        collectExceptionStackTrace(this, errVal.jsVal(), exceptionStackTrace);
         processAndEmitException(m_ctx, errVal.jsVal());
+        if (isInterrupted()) {
+            return newErrorObject(QQuickJSValue::GenericError, QStringLiteral("Interrupted"));
+        }
         return errVal;
     }
 
@@ -708,15 +1204,370 @@ QQuickJSValue QQuickJSEngine::evaluate(const QString& script, const QString& fil
     if (m_autoProcessPromises) processPendingJobs();
 
     if (hadException) {
+        collectExceptionStackTrace(this, errVal.jsVal(), exceptionStackTrace);
         processAndEmitException(m_ctx, errVal.jsVal());
-        return errVal;
     }
+    // QJSEngine parity: a sticky interrupt flag yields an "Interrupted" error
+    // object even when the script completed without hitting an interrupt check.
+    if (isInterrupted()) {
+        return newErrorObject(QQuickJSValue::GenericError, QStringLiteral("Interrupted"));
+    }
+    if (hadException) return errVal;
 
     return QQuickJSValue(this, retScoped.release(), true);
 }
 
-QQuickJSValue QQuickJSEngine::evaluate(const QString& script, const QString& fileName) {
-    return evaluate(script, fileName, 1);
+// ---------------------------------------------------------------------------
+// ES modules: importModule() / registerModule() (QJSEngine parity; semantics
+// verified against live Qt 6.12: canonical-path singleton cache, registered
+// modules matched by the bare specifier, default export = the value itself,
+// snapshot of enumerable own properties at registration time)
+// ---------------------------------------------------------------------------
+
+// Canonical cache key for a module file: QFileInfo::canonicalFilePath() with
+// an absolute-path fallback for files that do not exist yet. Qt resource
+// paths (":/...") are already canonical.
+static QString canonicalModulePath(const QString& fileName) {
+    if (fileName.startsWith(QLatin1Char(':'))) return fileName;
+    const QFileInfo fi(fileName);
+    const QString canonical = fi.canonicalFilePath();
+    return canonical.isEmpty() ? fi.absoluteFilePath() : canonical;
+}
+
+char* QQuickJSEngine::moduleNormalize(JSContext* ctx, const char* base_name,
+                                      const char* module_name, void* opaque) {
+    QQuickJSEngine* engine = static_cast<QQuickJSEngine*>(opaque);
+    const QString spec = QString::fromUtf8(module_name);
+
+    if (!spec.startsWith(QLatin1Char('.')) && !spec.startsWith(QLatin1Char('/'))) {
+        // Bare specifier (or a ":/..." resource path): registered modules are
+        // matched by the exact name, like QJSEngine; everything else is passed
+        // through unchanged for the module loader.
+        const auto it = engine->m_registeredModules.find(spec);
+        if (it != engine->m_registeredModules.end()) {
+            return js_strdup(ctx, it.value().constData());
+        }
+        return js_strdup(ctx, module_name);
+    }
+
+    // Relative or root-absolute specifier: resolve against the importing
+    // module's directory and canonicalize, so that different spellings of the
+    // same file resolve to one module instance.
+    QString combined = spec;
+    if (spec.startsWith(QLatin1Char('.')) && base_name && *base_name) {
+        const QString baseDir = QFileInfo(QString::fromUtf8(base_name)).absolutePath();
+        if (!baseDir.isEmpty()) combined = baseDir + QLatin1Char('/') + spec;
+    }
+    const QString canonical = combined.startsWith(QLatin1Char(':'))
+                                  ? QDir::cleanPath(combined)
+                                  : canonicalModulePath(combined);
+    const QByteArray utf8 = canonical.toUtf8();
+    return js_strdup(ctx, utf8.constData());
+}
+
+JSModuleDef* QQuickJSEngine::moduleLoader(JSContext* ctx, const char* module_name, void* opaque) {
+    QQuickJSEngine* engine = static_cast<QQuickJSEngine*>(opaque);
+    if (!engine) return nullptr;
+
+    // The same file may already be loaded under a different spelling (for
+    // example a bare name from one importer and a relative path from another);
+    // unify on the canonical-keyed singleton instance. The entry may still be
+    // uninstantiated (compiled only); the importer's linking instantiates it.
+    const QString cacheKey = canonicalModulePath(QString::fromUtf8(module_name));
+    if (JSModuleDef* existing = engine->m_fileModules.value(cacheKey).def) {
+        return existing;
+    }
+
+    // QFile understands Qt resource paths (":/...").
+    QFile file(cacheKey);
+    if (!file.open(QIODevice::ReadOnly)) {
+        // QJSEngine reports all module-loading failures as SyntaxError
+        // objects; match the error class (the message text is our own).
+        JS_ThrowSyntaxError(ctx, "could not load module filename '%s'", cacheKey.toUtf8().constData());
+        return nullptr;
+    }
+    const QByteArray source = file.readAll();
+
+    const QByteArray nameUtf8 = cacheKey.toUtf8();
+    JSEvalOptions options = {
+        .version = JS_EVAL_OPTIONS_VERSION,
+        .eval_flags = JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY,
+        .filename = nameUtf8.constData(),
+        .line_num = 1,
+    };
+    JSValue mod = JS_Eval2(ctx, source.constData(), static_cast<size_t>(source.size()), &options);
+    if (JS_IsException(mod)) return nullptr;
+    JSModuleDef* def = static_cast<JSModuleDef*>(JS_VALUE_GET_PTR(mod));
+    JS_FreeValue(ctx, mod);
+    engine->m_fileModules.insert(cacheKey, FileModuleEntry{def, false});
+    return def;
+}
+
+int QQuickJSEngine::registeredModuleInit(JSContext* ctx, JSModuleDef* m) {
+    // The snapshot (an internal object holding "default" plus the captured
+    // named exports) was stored as the module's private value by
+    // registerModule(); instantiation hands the values to the engine.
+    ScopedJSValue snap(ctx, JS_GetModulePrivateValue(ctx, m));
+    if (!JS_IsObject(snap.value())) return 0;
+
+    JSPropertyEnum* props = nullptr;
+    uint32_t count = 0;
+    if (JS_GetOwnPropertyNames(ctx, &props, &count, snap.value(), JS_GPN_STRING_MASK) < 0) {
+        return -1;
+    }
+
+    int ret = 0;
+    for (uint32_t i = 0; i < count && ret == 0; ++i) {
+        ScopedCString name(ctx, JS_AtomToCString(ctx, props[i].atom));
+        JSValue val = JS_GetProperty(ctx, snap.value(), props[i].atom);
+        if (!name.isValid() || JS_IsException(val)) {
+            // JS_SetModuleExport() consumes the value in all cases; free the
+            // failed read result manually before bailing out.
+            JS_FreeValue(ctx, val);
+            ret = -1;
+            break;
+        }
+        // Ownership of val passes to the module on success and is freed by
+        // the engine on failure.
+        if (JS_SetModuleExport(ctx, m, name.value(), val) < 0) ret = -1;
+    }
+    JS_FreePropertyEnum(ctx, props, count);
+    return ret;
+}
+
+QQuickJSValue QQuickJSEngine::importModule(const QString& fileName) {
+    ensureEngineThread();
+
+    // QJSEngine parity: a pending exception preempts the import and is
+    // returned as the result instead of executing anything (the leaked
+    // exception of a failed registration surfaces here in live Qt 6.12).
+    if (JS_HasException(m_ctx)) {
+        return QQuickJSValue::fromException(this);
+    }
+
+    const bool topLevel = (m_evalDepth == 0);
+    if (topLevel) {
+        resetExecutionState();
+    }
+    EvalDepthGuard depthGuard(m_evalDepth);
+    // Declared after depthGuard so the flush (which may run user JS via reason
+    // toString) happens while the depth guard is still held. Top-level calls
+    // only: nested imports must not report the enclosing tick.
+    auto rejectionFlush = qScopeGuard([this, topLevel]() { if (topLevel) flushUnhandledRejections(); });
+
+    // Singleton cache: the first import evaluates the module; every later
+    // import - from C++ or from JavaScript - returns the same instance. A
+    // cached entry that has never been driven through JS_EvalFunction (a
+    // dependency whose import chain failed before linking) is evaluated now.
+    const QString cacheKey = canonicalModulePath(fileName);
+    const auto cached = m_fileModules.constFind(cacheKey);
+    if (cached != m_fileModules.cend() && cached->instantiated) {
+        JSValue ns = JS_GetModuleNamespace(m_ctx, cached->def);
+        if (JS_IsException(ns)) {
+            return QQuickJSValue::fromException(this);
+        }
+        return QQuickJSValue(this, ns, true);
+    }
+
+    JSModuleDef* def = nullptr;
+    if (cached != m_fileModules.cend()) {
+        def = cached->def;
+    } else {
+        QFile file(cacheKey);
+        if (!file.open(QIODevice::ReadOnly)) {
+            // QJSEngine reports all module-loading failures as SyntaxError
+            // objects; match the error class (the message text is our own).
+            JS_ThrowSyntaxError(m_ctx, "could not load module filename '%s'", cacheKey.toUtf8().constData());
+            return QQuickJSValue::fromException(this);
+        }
+        const QByteArray source = file.readAll();
+
+        const QByteArray nameUtf8 = cacheKey.toUtf8();
+        JSEvalOptions options = {
+            .version = JS_EVAL_OPTIONS_VERSION,
+            .eval_flags = JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY,
+            .filename = nameUtf8.constData(),
+            .line_num = 1,
+        };
+        JSValue mod = JS_Eval2(m_ctx, source.constData(), static_cast<size_t>(source.size()), &options);
+        if (JS_IsException(mod)) {
+            // Syntax error and the like; Qt reports this as a SyntaxError, too.
+            return QQuickJSValue::fromException(this);
+        }
+        def = static_cast<JSModuleDef*>(JS_VALUE_GET_PTR(mod));
+        JS_FreeValue(m_ctx, mod);
+        // Register before evaluation: a module that throws stays cached, and a
+        // re-import returns its namespace without re-running the code.
+        m_fileModules.insert(cacheKey, FileModuleEntry{def, false});
+    }
+
+    // JS_EvalFunction consumes the module value it is given; hand it a fresh
+    // reference to the def. Evaluation failures come in two shapes: linking
+    // errors raise a context exception, while a module that throws in its
+    // top-level code rejects the evaluation promise.
+    JSValue ret = JS_EvalFunction(m_ctx, JS_DupValue(m_ctx, JS_MKPTR(JS_TAG_MODULE, def)));
+    ScopedJSValue retScoped(m_ctx, ret);
+
+    if (m_autoProcessPromises) processPendingJobs();
+
+    QQuickJSValue errVal;
+    bool linked = true;
+    if (JS_IsException(ret)) {
+        // A linking failure leaves the def uninstantiated: a later import
+        // retries the whole evaluation.
+        errVal = QQuickJSValue::fromException(this);
+        linked = false;
+    } else if (JS_PromiseState(m_ctx, ret) == JS_PROMISE_REJECTED) {
+        JSValue reason = JS_PromiseResult(m_ctx, ret);
+        // The rejection was reported to the unhandled-rejection tracker when
+        // it happened; the error is handed to the C++ caller instead, so
+        // retract the buffered report to avoid a duplicate uncaughtException.
+        retractHandledRejection(m_ctx, ret);
+        errVal = QQuickJSValue(this, reason, true);
+    }
+
+    if (linked) {
+        const auto entry = m_fileModules.find(cacheKey);
+        if (entry != m_fileModules.end()) entry->instantiated = true;
+    }
+
+    // QJSEngine parity: a sticky interrupt flag yields an "Interrupted" error
+    // object even when the module code failed for another reason (the same
+    // precedence evaluate() applies).
+    if (isInterrupted()) {
+        return newErrorObject(QQuickJSValue::GenericError, QStringLiteral("Interrupted"));
+    }
+    if (errVal.isValid()) {
+        return errVal;
+    }
+
+    JSValue ns = JS_GetModuleNamespace(m_ctx, def);
+    if (JS_IsException(ns)) {
+        return QQuickJSValue::fromException(this);
+    }
+    return QQuickJSValue(this, ns, true);
+}
+
+bool QQuickJSEngine::registerModule(const QString& moduleName, const QQuickJSValue& value) {
+    ensureEngineThread();
+
+    // A pending exception preempts the registration, like evaluate().
+    if (JS_HasException(m_ctx)) {
+        return false;
+    }
+
+    if (!value.isValid() || value.engine() != this) {
+        // Passing a foreign value is undefined behavior in QJSEngine; refuse
+        // it with a warning instead of corrupting this engine.
+        qWarning("QQuickJSEngine::registerModule: the value is invalid or belongs to another engine");
+        return false;
+    }
+
+    // The snapshot reads property values, which may run user JavaScript
+    // (getters): start a fresh execution-timeout quota and keep the tick
+    // bookkeeping consistent with the other JS entry points.
+    const bool topLevel = (m_evalDepth == 0);
+    if (topLevel) {
+        resetExecutionState();
+    }
+    EvalDepthGuard depthGuard(m_evalDepth);
+    auto rejectionFlush = qScopeGuard([this, topLevel]() { if (topLevel) flushUnhandledRejections(); });
+
+    // Snapshot: "default" is the value itself; every own enumerable string
+    // property becomes a named export. Values - including getters - are read
+    // exactly once, here; later modifications of the value are not visible to
+    // importers, matching the documented QJSEngine semantics.
+    JSValueConst val = value.jsVal();
+    JSValue snap = JS_NewObject(m_ctx);
+    if (JS_IsException(snap)) {
+        clearPendingException(m_ctx);
+        return false;
+    }
+
+    bool ok = true;
+    QVarLengthArray<QByteArray, 16> exportNames;
+    if (JS_IsObject(val)) {
+        JSPropertyEnum* props = nullptr;
+        uint32_t count = 0;
+        if (JS_GetOwnPropertyNames(m_ctx, &props, &count, val,
+                                   JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) < 0) {
+            clearPendingException(m_ctx);
+            JS_FreeValue(m_ctx, snap);
+            return false;
+        }
+        for (uint32_t i = 0; i < count && ok; ++i) {
+            ScopedCString name(m_ctx, JS_AtomToCString(m_ctx, props[i].atom));
+            if (!name.isValid()) {
+                ok = false;
+                break;
+            }
+            JSValue pv = JS_GetProperty(m_ctx, val, props[i].atom);
+            if (JS_IsException(pv)) {
+                // A throwing getter leaves the exception pending and fails
+                // the registration, like live Qt 6.12 (the next import or
+                // evaluate call surfaces the error).
+                ok = false;
+                break;
+            }
+            // Ownership of pv passes to the snapshot object in both cases.
+            if (JS_SetProperty(m_ctx, snap, props[i].atom, pv) < 0) {
+                ok = false;
+                continue;
+            }
+            // "default" is declared separately (it is the value itself,
+            // like QJSEngine): a same-named property of the value is ignored.
+            if (qstrcmp(name.value(), "default") != 0) {
+                exportNames.append(QByteArray(name.value()));
+            }
+        }
+        JS_FreePropertyEnum(m_ctx, props, count);
+        if (!ok) {
+            JS_FreeValue(m_ctx, snap);
+            return false;
+        }
+    }
+
+    if (JS_SetPropertyStr(m_ctx, snap, "default", JS_DupValue(m_ctx, val)) < 0) {
+        clearPendingException(m_ctx);
+        JS_FreeValue(m_ctx, snap);
+        return false;
+    }
+
+    // A unique internal name lets re-registration replace the module for new
+    // imports (the previous def stays in the engine's list, unreachable). The
+    // public name is mapped by the normalizer.
+    const QByteArray internal = "quickjsengine::module::" + QByteArray::number(++m_moduleSerial)
+                                + "::" + moduleName.toUtf8();
+    JSModuleDef* mod = JS_NewCModule(m_ctx, internal.constData(),
+                                     &QQuickJSEngine::registeredModuleInit);
+    if (!mod) {
+        clearPendingException(m_ctx);
+        JS_FreeValue(m_ctx, snap);
+        return false;
+    }
+
+    if (JS_AddModuleExport(m_ctx, mod, "default") < 0) {
+        ok = false;
+    }
+    for (const QByteArray& exportName : std::as_const(exportNames)) {
+        if (!ok) break;
+        if (JS_AddModuleExport(m_ctx, mod, exportName.constData()) < 0) {
+            ok = false;
+        }
+    }
+
+    if (!ok) {
+        // The half-registered module stays in the list under its unique name;
+        // it is never referenced by the normalizer and cannot be imported.
+        clearPendingException(m_ctx);
+        JS_FreeValue(m_ctx, snap);
+        return false;
+    }
+
+    // JS_SetModulePrivateValue() takes ownership of the snapshot value.
+    JS_SetModulePrivateValue(m_ctx, mod, snap);
+    m_registeredModules.insert(moduleName, internal);
+    return true;
 }
 
 void QQuickJSEngine::setProperty(const char* name, const QQuickJSValue& value) {
@@ -794,6 +1645,18 @@ QQuickJSValue QQuickJSEngine::newObject() {
         return QQuickJSValue::fromException(this);
     }
     return QQuickJSValue(this, obj.release(), true);
+}
+
+QQuickJSValue QQuickJSEngine::newSymbol(const QString& name) {
+    ensureEngineThread();
+    // The description is stored as given: an empty name yields a symbol
+    // with an empty description, like QJSEngine::newSymbol().
+    const QByteArray utf8 = name.toUtf8();
+    ScopedJSValue sym(m_ctx, JS_NewSymbol(m_ctx, utf8.constData(), false));
+    if (JS_IsException(sym.value())) {
+        return QQuickJSValue::fromException(this);
+    }
+    return QQuickJSValue(this, sym.release(), true);
 }
 
 QQuickJSValue QQuickJSEngine::newArray(uint length) {
@@ -933,10 +1796,17 @@ JSValue QQuickJSEngine::toJSValueImpl(const QVariant& var, int depth) {
 QVariant QQuickJSEngine::toVariant(JSValueConst val) {
     ensureEngineThread();
     JSVisitedStack visited;
-    return toVariantImpl(val, visited, 0);
+    return toVariantImpl(val, visited, 0, QQuickJSValue::ConvertJSObjects);
 }
 
-QVariant QQuickJSEngine::toVariantImpl(JSValueConst val, JSVisitedStack& visited, int depth) {
+QVariant QQuickJSEngine::toVariant(JSValueConst val, QQuickJSValue::ObjectConversionBehavior behavior) {
+    ensureEngineThread();
+    JSVisitedStack visited;
+    return toVariantImpl(val, visited, 0, behavior);
+}
+
+QVariant QQuickJSEngine::toVariantImpl(JSValueConst val, JSVisitedStack& visited, int depth,
+                                       QQuickJSValue::ObjectConversionBehavior behavior) {
     ensureEngineThread();
 
     switch (JS_VALUE_GET_TAG(val)) {
@@ -976,6 +1846,17 @@ QVariant QQuickJSEngine::toVariantImpl(JSValueConst val, JSVisitedStack& visited
     case JS_TAG_STRING:
     case JS_TAG_STRING_ROPE:
         return QuickJSConvert::jsToQString(m_ctx, val);
+    case JS_TAG_SYMBOL: {
+        // RetainJSObjects wraps the symbol itself (QJSEngine parity). The
+        // lossy conversion deliberately yields an invalid QVariant instead of
+        // QJSEngine's "Symbol(name)" QString: a string-shaped variant would
+        // silently coerce in metacall conversions (e.g. a nullptr written into
+        // a QObject* property) instead of throwing a TypeError.
+        if (behavior == QQuickJSValue::RetainJSObjects) {
+            return QVariant::fromValue(QQuickJSValue(this, JS_DupValue(m_ctx, val), true));
+        }
+        return QVariant();
+    }
     case JS_TAG_OBJECT: {
         void* ptr = JS_VALUE_GET_PTR(val);
         if (visited.contains(ptr)) return QVariant();   // cycle: invalid QVariant instead of a copy
@@ -1007,7 +1888,7 @@ QVariant QQuickJSEngine::toVariantImpl(JSValueConst val, JSVisitedStack& visited
                     result = QVariant();
                 }
             } else {
-                result = QuickJSConvert::variantFromJSObject(this, m_ctx, val, m_qobjectClassID, m_objectClassID, visited, depth + 1);
+                result = QuickJSConvert::variantFromJSObject(this, m_ctx, val, m_qobjectClassID, m_objectClassID, visited, depth + 1, behavior);
             }
         } catch (...) {
             visited.pop();

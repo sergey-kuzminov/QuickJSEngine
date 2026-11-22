@@ -130,7 +130,11 @@ JSValue QuickJSQObjectProxy::getMetaProperty(QQuickJSEngine* engine, JSContext* 
     JSValue jsVal = engine->toJSValue(val);
 
     if (JS_IsUndefined(jsVal) && val.isValid() && !val.isNull()) {
-        return JS_ThrowTypeError(ctx, "Cannot read property: type '%s' is not supported", QMetaType(metaType).name());
+        // V4-like: a property of an unsupported type reads as undefined
+        // instead of throwing, so Object.keys()/for...in survive it. Only a
+        // JS exception deliberately thrown by the C++ code (throwError()) or
+        // a C++ exception escaping the metacall propagate as errors.
+        return JS_UNDEFINED;
     }
 
     return jsVal;
@@ -194,10 +198,10 @@ int QuickJSQObjectProxy::qobject_get_own_property(JSContext* ctx, JSPropertyDesc
         }
 
         const MetaCacheEntry* it = data->metaCache->find(prop);
-        // Design note: asymmetry in error handling. If reading a meta-property
-        // throws (e.g. unsupported type), clear it and return JS_UNDEFINED so
-        // Object.keys()/for...in survive a bad property. Dynamic properties and
-        // direct method calls do re-throw.
+        // A JS exception thrown by the C++ accessor (throwError(), or a C++
+        // exception caught by safeMetacall) propagates like a method call
+        // does. A property of an unsupported type reads as undefined
+        // (V4-like), so Object.keys()/for...in survive it.
         if (it) {
             if (it->kind == MetaCacheEntry::Kind::Property) {
                 if (desc) {
@@ -210,8 +214,10 @@ int QuickJSQObjectProxy::qobject_get_own_property(JSContext* ctx, JSPropertyDesc
                     } else {
                         desc->value = getMetaProperty(engine, ctx, data, *it);
                         if (JS_IsException(desc->value)) {
-                            clearPendingException(ctx);
-                            desc->value = JS_UNDEFINED;
+                            // Keep the pending exception: the read fails with
+                            // the thrown error instead of silently producing
+                            // undefined.
+                            return -1;
                         }
                     }
                 }

@@ -22,8 +22,25 @@ The core is **quickjs-ng** (ng — next generation) — a fork of the original Q
 **QuickJSEngine** is a *lightweight* counterpart; it does **not** aim to implement absolutely all of **QJSEngine**'s functionality, since that is incompatible with the lightweight concept. Nor is all of QJSEngine's functionality required: the project targets console applications, not QML graphics. Still, the engine strives to stay as close as possible to the **QJSEngine** API for easy porting of existing code.
 
 **What is not implemented (or implemented differently) compared to QJSEngine:**
-* **Object ownership policy:** in **QJSEngine**, the GC (garbage collector) can delete a C++ object. In QuickJSEngine, C++ objects are never deleted by the JS garbage collector. Lifetime is controlled exclusively by C++ code (via `parent` or `delete`), which is safer.
-* **Q_GADGET:** Passing Q_GADGET structures by value is not supported. Use `QObject*` or `QVariantMap`.
+* **Object ownership:** in **QJSEngine**, the GC (garbage collector) can delete a C++ object. In QuickJSEngine, C++ objects are never deleted by the JS garbage collector: lifetime is controlled exclusively by C++ code (via `parent` or `delete`), which is safer.
+* **Q_GADGET:** passing Q_GADGET structures by value is not supported. Use `QObject*` or `QVariantMap`.
+* **Lossy `toVariant()`:** in the default mode, JS-specific types (Map/Set/WeakMap/WeakSet/Promise/RegExp/DataView) and Symbols yield an *invalid* QVariant, where QJSEngine yields an empty `QVariantMap`, a `QRegularExpression` or a descriptive string. Use `toVariant(RetainJSObjects)` for a lossless `QVariant<QQuickJSValue>` wrap.
+* **ES modules:** `importModule()` / `registerModule()` follow QJSEngine semantics; where QJSEngine refuses, the ECMAScript specification wins — circular imports, `import.meta`, top-level `await` and dynamic `import()` all work (each of them is a SyntaxError in QJSEngine).
+* **Intentionally absent:** the V4 interop layer (`QJSManagedValue`, `QJSPrimitiveValue`, `coerceValue()`, `fromVariant()` — it mirrors the V4 memory model), engine-less `QJSValue(42)` constructors (every value is bound to its engine: thread-safety by design), `isVariant()` / `isUrl()` (deprecated in Qt 6.9 / V4-specific URL objects — QUrl converts to a string here), `uiLanguage()` (JS-driven language switching is out of scope for console applications).
+* **Minor divergences:** `newSymbol()` follows ECMA-262 (the `description` is set; V4 leaves it undefined), `console.count()` keys counters by the printed label instead of by script and line, the `qsTr()` translation context is fixed, and `Object.keys()` invokes C++ getters (a throwing getter fails the enumeration), where QJSEngine never invokes getters during key enumeration.
+
+<details>
+<summary>Fine print: exact divergences</summary>
+
+* **ES modules, exact list:** `importModule()` / `registerModule()` are implemented with QJSEngine semantics: a singleton cache keyed by the canonical file path, registered modules matched by the bare specifier, the registered value itself as the default export, a snapshot of enumerable own properties at registration time, `":/..."` Qt resource paths, and a module that threw at top level is not re-executed on the next import. Beyond that, each of the following is a SyntaxError in QJSEngine but works here: circular imports (allowed by the ECMAScript specification), `import.meta` (a plain object per the specification), top-level `await` (ES2022), dynamic `import()` inside `evaluate()` scripts (which can request registered modules too), registered names without a `.mjs` suffix, and a bare specifier that is not a registered module resolving as a file relative to the current working directory. All module-loading failures are `SyntaxError` objects like in QJSEngine, with our own message texts (a missing file is named in the message instead of V4's cryptic `Invalid null URL`). `importModule()` pumps the microtask queue by default (`setAutoProcessPromises(false)` disables it), so modules with a top-level `await` complete synchronously.
+* **Error delivery:** exceptions of JS signal handlers are reported (the `uncaughtException` signal, or a `qWarning` when nobody listens) and the signal emission continues, exactly like QJSEngine; `Object.keys()` on a QObject whose C++ getter throws (via `throwError()`) fails with that error, where QJSEngine never invokes getters during key enumeration at all.
+* **Lossy `toVariant()` refusals:** in the default (ConvertJSObjects) mode, Map/Set/WeakMap/WeakSet/Promise/RegExp/DataView yield an *invalid* QVariant, where QJSEngine yields an empty `QVariantMap` (Map/Set/Promise) or a `QRegularExpression` (RegExp). Symbols also yield an invalid QVariant, where QJSEngine yields the descriptive `"Symbol(name)"` string. This is deliberate: a string-shaped variant would silently coerce in metacall conversions (e.g. a nullptr written into a `QObject*` property) instead of throwing a TypeError. Use `toVariant(RetainJSObjects)` for a lossless `QVariant<QQuickJSValue>` wrap (function objects are retained in both modes, like in Qt 6.12).
+* **`newSymbol()` description:** QuickJSEngine follows ECMA-262 (`Symbol('x').description === 'x'`); V4's `newSymbol()` leaves the description undefined even though `String()` still shows the name.
+* **`console.count()` keying:** counters are keyed by the printed label (Node.js semantics), not by script and line number like V4 — quickjs-ng exposes no call-site information to C callbacks. The printed format (`label: N`) is identical.
+* **`qsTr()` context:** the translation context is fixed (`"QQuickJSEngine"`); V4 derives it from the calling script's URL, which is not visible to C callbacks in quickjs-ng.
+* **`exceptionStackTrace` frames:** parsed from the quickjs-ng `Error.stack` property into the V4 frame format `function:line:column:file`; native frames carry `-1/-1` and an empty file, like V4. A thrown non-Error value (e.g. `throw 'str'`) yields an empty list, since quickjs-ng attaches no stack to it.
+
+</details>
 
 **Additional API capabilities**
 
@@ -41,7 +58,7 @@ Since QuickJSEngine was created for console applications, it includes performanc
 * **01_example** — a simple example of using QuickJSEngine and QJSEngine.
 * **02_speed** — a benchmark comparing the speed of QuickJSEngine and QJSEngine.
 * **03_tests** — tests verifying that QuickJSEngine behavior matches QJSEngine.
-* **04_leakgate** — a memory leak detection test (`leakgate [cycles] [logEvery] [--dump-leaks]`; after a normal run, a `--dump-leaks` dump run with the same parameters is executed automatically — except for launches from ctest; disable with `LEAKGATE_AUTO_DUMP=0`).
+* **04_leakgate** — a long-run memory leak detector (a memory-growth regression gate over a repeated workload in one engine).
 * **quickjs-ng** — the quickjs-ng core sources.
 * **src** — the QuickJSEngine wrapper sources.
 

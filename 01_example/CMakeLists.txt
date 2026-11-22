@@ -2,8 +2,6 @@ cmake_minimum_required(VERSION 3.21)
 
 project(example LANGUAGES C CXX)
 
-# Build against the stock QJSEngine instead of QQuickJSEngine
-# (was: commented "DEFINES += USE_QT_JSENGINE" in example.pro).
 option(USE_QT_JSENGINE "Build against the stock QJSEngine" OFF)
 
 if(USE_QT_JSENGINE)
@@ -14,12 +12,12 @@ endif()
 
 qt_standard_project_setup()
 
-# Phase D (porting guide): C++20 after qt_standard_project_setup()
+# qt_standard_project_setup() defaults to C++17; the wrapper needs C++20
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# quickjs-ng vendor C sources: C11 (gnu11) as before
+# vendored quickjs-ng requires C11
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
@@ -43,13 +41,7 @@ else()
         ${CMAKE_CURRENT_SOURCE_DIR}/../quickjs-ng
         ${CMAKE_CURRENT_SOURCE_DIR}/../src
     )
-    # Required by quickjs-ng on Linux/POSIX (was: QMAKE_CFLAGS += -D_GNU_SOURCE)
+    # Required by quickjs-ng on Linux/POSIX
     target_compile_definitions(example PRIVATE _GNU_SOURCE)
     target_link_libraries(example PRIVATE Qt6::Core)
 endif()
-
-# -O3 in release carried over from example.pro (explicit flag, porting guide §6.4)
-target_compile_options(example PRIVATE
-    $<$<AND:$<CONFIG:Release>,$<COMPILE_LANG_AND_ID:C,GNU,Clang,AppleClang>>:-O3>
-    $<$<AND:$<CONFIG:Release>,$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>>:-O3>
-)

@@ -8,6 +8,7 @@
 #ifndef QUICKJSVALUE_H
 #define QUICKJSVALUE_H
 
+#include <QDateTime>
 #include <QList>
 #include <QPointer>
 #include <QString>
@@ -35,13 +36,23 @@ class QQuickJSEngine;
  */
 class QQuickJSValue {
 public:
+    // Values mirror QJSEngine-compatible numbering so error classes can be
+    // compared numerically against QJSEngine-based code.
     enum ErrorType {
-        GenericError,
-        RangeError,
-        ReferenceError,
-        SyntaxError,
-        TypeError,
-        URIError
+        NoError = 0,
+        GenericError = 1,
+        EvalError = 2,
+        RangeError = 3,
+        ReferenceError = 4,
+        SyntaxError = 5,
+        TypeError = 6,
+        URIError = 7
+    };
+
+    // Values mirror QJSValue::ObjectConversionBehavior.
+    enum ObjectConversionBehavior {
+        ConvertJSObjects = 0,
+        RetainJSObjects = 1
     };
 
     static constexpr int InlineArgumentCount = 10;
@@ -61,6 +72,7 @@ public:
 
     bool isValid() const;
     bool isError() const;
+    ErrorType errorType() const;
     bool isCallable() const;
     bool isObject() const;
     bool isArray() const;
@@ -69,6 +81,11 @@ public:
     bool isBool() const;
     bool isNull() const;
     bool isUndefined() const;
+    bool isRegExp() const;
+    bool isDate() const;
+    bool isQObject() const;
+    bool isSymbol() const;
+    bool isPromise() const;
 
     [[nodiscard]] static QQuickJSValue fromException(QQuickJSEngine* engine);
 
@@ -110,23 +127,39 @@ public:
     bool deleteProperty(const char* name);
     bool deleteProperty(QStringView name);
 
+    bool hasOwnProperty(const QString& name) const;
+    bool hasOwnProperty(const QByteArray& name) const;
+    bool hasOwnProperty(const char* name) const;
+    bool hasOwnProperty(QStringView name) const;
+
+    QQuickJSValue prototype() const;
+    void setPrototype(const QQuickJSValue& prototype);
+
     int toInt() const;
+    quint32 toUInt() const;
     bool toBool() const;
     double toDouble() const;
     QString toString() const;
     QVariant toVariant() const;
+    QVariant toVariant(ObjectConversionBehavior behavior) const;
+    QDateTime toDateTime() const;
+    QObject* toQObject() const;
 
     QQuickJSValue call(const QVariantList& args = {}, const QQuickJSValue& thisObj = QQuickJSValue());
     QQuickJSValue call(const QList<QQuickJSValue>& args, const QQuickJSValue& thisObj = QQuickJSValue());
+    QQuickJSValue callWithInstance(const QQuickJSValue& instance, const QVariantList& args = {});
+    QQuickJSValue callWithInstance(const QQuickJSValue& instance, const QList<QQuickJSValue>& args);
 
     QQuickJSValue construct(const QVariantList& args = {});
     QQuickJSValue callAsConstructor(const QList<QQuickJSValue>& args);
 
+    bool equals(const QQuickJSValue& other) const;
     bool strictlyEquals(const QQuickJSValue& other) const;
     bool instanceOf(const QQuickJSValue& other) const;
 
 private:
     friend class QQuickJSEngine;
+    friend class QQuickJSValueIterator;
 
     static QQuickJSValue executeJsCall(QQuickJSEngine* engine, JSContext* ctx, JSValueConst funcVal,
                                        JSValueConst* jsArgs, int argc,

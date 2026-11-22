@@ -1,9 +1,15 @@
 #include <QCoreApplication>
 #include <QJSEngine>
+#include <QJSValueIterator>
 #include <QDebug>
 #include <QElapsedTimer>
 #include <QDateTime>
 #include <QDate>
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
+#include <QScopeGuard>
+#include <QTemporaryDir>
 #include <QTime>
 #include <QThread>
 #include <QVariantList>
@@ -11,7 +17,22 @@
 #include <QStringList>
 
 #include "QuickJSEngine.h"
+#include "QuickJSValueIterator.h"
 #include "JsErrorTranslator.h"
+
+// Compile-time parity of the shared enums with QJSEngine (this test binary
+// links both engines, so any drift fails the build).
+static_assert(static_cast<int>(QQuickJSValue::NoError) == static_cast<int>(QJSValue::NoError));
+static_assert(static_cast<int>(QQuickJSValue::GenericError) == static_cast<int>(QJSValue::GenericError));
+static_assert(static_cast<int>(QQuickJSValue::EvalError) == static_cast<int>(QJSValue::EvalError));
+static_assert(static_cast<int>(QQuickJSValue::RangeError) == static_cast<int>(QJSValue::RangeError));
+static_assert(static_cast<int>(QQuickJSValue::ReferenceError) == static_cast<int>(QJSValue::ReferenceError));
+static_assert(static_cast<int>(QQuickJSValue::SyntaxError) == static_cast<int>(QJSValue::SyntaxError));
+static_assert(static_cast<int>(QQuickJSValue::TypeError) == static_cast<int>(QJSValue::TypeError));
+static_assert(static_cast<int>(QQuickJSValue::URIError) == static_cast<int>(QJSValue::URIError));
+static_assert(static_cast<int>(QQuickJSEngine::TranslationExtension) == static_cast<int>(QJSEngine::TranslationExtension));
+static_assert(static_cast<int>(QQuickJSEngine::ConsoleExtension) == static_cast<int>(QJSEngine::ConsoleExtension));
+static_assert(static_cast<int>(QQuickJSEngine::GarbageCollectionExtension) == static_cast<int>(QJSEngine::GarbageCollectionExtension));
 
 // ------------------------------------------------------------------------------------------------
 // Test C++ Classes
@@ -196,6 +217,62 @@ private:
 };
 
 // ------------------------------------------------------------------------------------------------
+// Dual-engine object for throwError() parity scenarios: each instance is
+// exposed to exactly one engine, and every invokable acts on that engine.
+// ------------------------------------------------------------------------------------------------
+class ThrowProbeObject : public QObject {
+    Q_OBJECT
+    Q_PROPERTY(int throwingProp READ getThrowingProp WRITE setThrowingProp)
+public:
+    QJSEngine* qtEngine = nullptr;
+    QQuickJSEngine* qjsEngine = nullptr;
+    bool sawError = false;
+
+    Q_INVOKABLE void fail() {
+        if (qtEngine) qtEngine->throwError(QStringLiteral("slot boom"));
+        if (qjsEngine) qjsEngine->throwError(QStringLiteral("slot boom"));
+    }
+    Q_INVOKABLE void failTyped() {
+        if (qtEngine) qtEngine->throwError(QJSValue::RangeError, QStringLiteral("slot range"));
+        if (qjsEngine) qjsEngine->throwError(QQuickJSValue::RangeError, QStringLiteral("slot range"));
+    }
+    Q_INVOKABLE void failValue() {
+        if (qtEngine) {
+            QJSValue e = qtEngine->newErrorObject(QJSValue::TypeError, QStringLiteral("typed boom"));
+            e.setProperty(QStringLiteral("code"), 42);
+            qtEngine->throwError(e);
+        } else if (qjsEngine) {
+            QQuickJSValue e = qjsEngine->newErrorObject(QQuickJSValue::TypeError, QStringLiteral("typed boom"));
+            e.setProperty(QStringLiteral("code"), 42);
+            qjsEngine->throwError(e);
+        }
+    }
+    Q_INVOKABLE void throwDefault() {
+        if (qtEngine) qtEngine->throwError(QJSValue());
+        if (qjsEngine) qjsEngine->throwError(QQuickJSValue());
+    }
+    Q_INVOKABLE void failAndRecord() {
+        // throwError() first: hasError() must already be true inside the slot.
+        if (qtEngine) { qtEngine->throwError(QStringLiteral("record boom")); sawError = qtEngine->hasError(); }
+        if (qjsEngine) { qjsEngine->throwError(QStringLiteral("record boom")); sawError = qjsEngine->hasError(); }
+    }
+    Q_INVOKABLE void emitPing() { emit ping(); }
+
+    int getThrowingProp() const {
+        if (qtEngine) qtEngine->throwError(QStringLiteral("getter boom"));
+        if (qjsEngine) qjsEngine->throwError(QStringLiteral("getter boom"));
+        return 0;
+    }
+    void setThrowingProp(int) {
+        if (qtEngine) qtEngine->throwError(QStringLiteral("setter boom"));
+        if (qjsEngine) qjsEngine->throwError(QStringLiteral("setter boom"));
+    }
+
+signals:
+    void ping();
+};
+
+// ------------------------------------------------------------------------------------------------
 // Test Helpers
 // ------------------------------------------------------------------------------------------------
 int passed = 0, failed = 0, warnings = 0;
@@ -204,6 +281,23 @@ static QStringList g_capturedWarnings;
 static void captureWarningHandler(QtMsgType type, const QMessageLogContext&, const QString& msg) {
     if (type == QtWarningMsg) g_capturedWarnings.append(msg);
 }
+
+static QStringList g_capturedMessages;
+static void captureAllMessagesHandler(QtMsgType, const QMessageLogContext&, const QString& msg) {
+    g_capturedMessages.append(msg);
+}
+
+// RAII guard: routes every message type (console output verification) into
+// g_capturedMessages while in scope and always restores the previous handler
+class MessageCaptureGuard {
+public:
+    MessageCaptureGuard() : m_oldHandler(qInstallMessageHandler(captureAllMessagesHandler)) { g_capturedMessages.clear(); }
+    ~MessageCaptureGuard() { qInstallMessageHandler(m_oldHandler); }
+    MessageCaptureGuard(const MessageCaptureGuard&) = delete;
+    MessageCaptureGuard& operator=(const MessageCaptureGuard&) = delete;
+private:
+    QtMessageHandler m_oldHandler;
+};
 
 // RAII guard: routes qWarning output into g_capturedWarnings while in scope and
 // always restores the previous handler (safe against early returns/exceptions)
@@ -283,6 +377,66 @@ void compareQObjectEngines(const char* name, TestObject* obj, const char* code) 
     } else {
         TEST_RESULT(name, qtRes.toString() == qRes.toString(), QString::fromUtf8("QJSEngine='%1', QuickJS='%2'").arg(qtRes.toString()).arg(qRes.toString()));
     }
+}
+
+// Runs the same JS with a ThrowProbeObject exposed as "obj" in both engines
+// and compares the outcome (stage 3: throwError parity).
+static void compareThrowEngines(const char* name, const char* code) {
+    QJSEngine qtEng;
+    QQuickJSEngine qEng;
+    ThrowProbeObject qtObj, qObj;
+    qtObj.qtEngine = &qtEng;
+    qObj.qjsEngine = &qEng;
+    qtEng.globalObject().setProperty(QStringLiteral("obj"), qtEng.newQObject(&qtObj));
+    qEng.globalObject().setProperty(QStringLiteral("obj"), qEng.newQObject(&qObj));
+
+    QJSValue qtRes = qtEng.evaluate(QString::fromUtf8(code));
+    QQuickJSValue qRes = qEng.evaluate(QString::fromUtf8(code));
+
+    const bool qtErr = qtRes.isError();
+    const bool qErr = qRes.isError();
+
+    if (qtErr && qErr) {
+        TEST_RESULT(name,
+                    qtRes.property(QStringLiteral("name")).toString() == qRes.property(QStringLiteral("name")).toString()
+                        && qtRes.toString() == qRes.toString(),
+                    QStringLiteral("error mismatch: QJSEngine='%1', QuickJS='%2'")
+                        .arg(qtRes.toString(), qRes.toString()));
+    } else if (qtErr != qErr) {
+        QString d = QString::fromUtf8("QJSEngine err=%1 (%2), QuickJS err=%3 (%4)")
+                        .arg(qtErr).arg(qtRes.toString()).arg(qErr).arg(qRes.toString());
+        TEST_RESULT(name, false, d);
+    } else {
+        TEST_RESULT(name, qtRes.toString() == qRes.toString(),
+                    QString::fromUtf8("QJSEngine='%1', QuickJS='%2'").arg(qtRes.toString(), qRes.toString()));
+    }
+}
+
+// Qt reports a failed importModule() as an Error value in some builds
+// (Qt 6.12: isError() + errorType()); other builds return a plain value whose
+// string form is "<ErrorClass>: message". Reduce both forms to a single
+// QJSValue::ErrorType id so module parity holds across Qt versions.
+static int moduleFailureClass(const QJSValue& v)
+{
+    static const struct { QLatin1String prefix; QJSValue::ErrorType type; } kErrorPrefixes[] = {
+        { QLatin1String("EvalError:"),      QJSValue::EvalError },
+        { QLatin1String("RangeError:"),     QJSValue::RangeError },
+        { QLatin1String("ReferenceError:"), QJSValue::ReferenceError },
+        { QLatin1String("SyntaxError:"),    QJSValue::SyntaxError },
+        { QLatin1String("TypeError:"),      QJSValue::TypeError },
+        { QLatin1String("URIError:"),       QJSValue::URIError },
+        { QLatin1String("Error:"),          QJSValue::GenericError },
+    };
+    if (v.isError())
+        return static_cast<int>(v.errorType());
+    if (v.isUndefined() || v.isNull())
+        return static_cast<int>(QJSValue::NoError);
+    const QString text = v.toString();
+    for (const auto& e : kErrorPrefixes) {
+        if (text.startsWith(e.prefix))
+            return static_cast<int>(e.type);
+    }
+    return static_cast<int>(QJSValue::NoError);
 }
 
 // Runs the full test suite
@@ -494,10 +648,11 @@ static void runAllTests(const bool runDangerous) {
     {
         QQuickJSEngine qEng;
 
+        // QJSEngine parity: function objects are retained even in the lossy
+        // conversion (verified against live Qt 6.12); the rest is still refused.
         const char* exotic[] = {
             "new Map([[1, 2]])", "new Set([1])", "new WeakMap()", "new WeakSet()",
-            "Promise.resolve(1)", "/re?gex*/", "new DataView(new ArrayBuffer(8))",
-            "(function(){})"
+            "Promise.resolve(1)", "/re?gex*/", "new DataView(new ArrayBuffer(8))"
         };
         bool allRefused = true;
         for (const char* e : exotic) {
@@ -505,6 +660,9 @@ static void runAllTests(const bool runDangerous) {
             if (v.isValid()) allRefused = false;
         }
         TEST_RESULT("Convert: exotic objects refused", allRefused, "an exotic object produced a valid QVariant");
+        TEST_RESULT("Convert: function retained (Qt parity)",
+                    qEng.evaluate("(function(){})").toVariant().userType() == qMetaTypeId<QQuickJSValue>(),
+                    "function toVariant() is not a QVariant<QQuickJSValue>");
 
         QVariant plain = qEng.evaluate("({a: 1, b: 'x'})").toVariant();
         TEST_RESULT("Convert: plain object to QVariantMap",
@@ -744,18 +902,24 @@ static void runAllTests(const bool runDangerous) {
         delete obj;
     }
 
-    // A stale interrupt flag must not kill the next entry point
+    // Qt parity: the interrupt flag is sticky - any execution aborts until
+    // setInterrupted(false) (QJSEngine documented semantics)
     {
         QQuickJSEngine qEng;
         QQuickJSValue func = qEng.evaluate("(function() { return 42; })");
         qEng.setInterrupted(true);
-        QQuickJSValue res = func.call();
-        TEST_RESULT("Interrupt: Stale flag does not kill next call()",
-                    res.toInt() == 42,
-                    QStringLiteral("call() interrupted by a stale flag: '%1'").arg(res.toString()));
-        qEng.setInterrupted(true);
-        TEST_RESULT("Interrupt: Stale flag does not kill next evaluate()",
-                    qEng.evaluate("1 + 1").toInt() == 2, "evaluate() interrupted by a stale flag");
+        TEST_RESULT("Interrupt: sticky flag aborts evaluate()",
+                    qEng.evaluate("1 + 1").isError()
+                        && qEng.evaluate("1 + 1").toString().contains(QStringLiteral("Interrupted")),
+                    QStringLiteral("evaluate() ran with the interrupt flag set"));
+        TEST_RESULT("Interrupt: sticky flag aborts call()",
+                    func.call().isError()
+                        && func.call().toString().contains(QStringLiteral("Interrupted")),
+                    QStringLiteral("call() ran with the interrupt flag set"));
+        qEng.setInterrupted(false);
+        TEST_RESULT("Interrupt: cleared flag resumes execution",
+                    qEng.evaluate("1 + 1").toInt() == 2 && func.call().toInt() == 42,
+                    "execution did not resume after setInterrupted(false)");
     }
 
     // 11. API Compliance
@@ -805,6 +969,60 @@ static void runAllTests(const bool runDangerous) {
             TEST_RESULT("API: installExtensions restores deleted console",
                         qEng.evaluate("typeof console").toString() == "object" && qEng.evaluate("typeof console.log").toString() == "function",
                         "a repeated installExtensions did not restore the deleted console");
+        }
+
+        // newSymbol: ECMAScript symbol semantics. V4's QJSEngine::newSymbol()
+        // does not expose the description property (it stays undefined there
+        // even though String(sym) still shows the name), so this check
+        // deliberately verifies the spec-compliant behavior instead of
+        // comparing the engines.
+        {
+            QQuickJSEngine qEng2;
+            qEng2.globalObject().setProperty("sym", qEng2.newSymbol("mysym"));
+            qEng2.globalObject().setProperty("emptySym", qEng2.newSymbol(QString()));
+            const QString res = qEng2.evaluate(QStringLiteral(
+                "typeof sym + '|' + sym.description + '|' + String(sym) + '|' + (sym == sym) + ';' + "
+                "typeof emptySym + '|' + String(emptySym) + '|' + (emptySym.description === '')")).toString();
+            TEST_RESULT("API: newSymbol", res == QStringLiteral("symbol|mysym|Symbol(mysym)|true;symbol|Symbol()|true"), res);
+        }
+
+        // toScriptValue / fromScriptValue round-trips and coercions
+        TEST_RESULT("API: toScriptValue(int)", qEng.toScriptValue(42).toInt() == 42, "int round-trip failed");
+        TEST_RESULT("API: toScriptValue(QString)", qEng.toScriptValue(QStringLiteral("привет")).toString() == QStringLiteral("привет"), "QString round-trip failed");
+        TEST_RESULT("API: toScriptValue(double)", qFuzzyCompare(qEng.toScriptValue(3.5).toDouble(), 3.5), "double round-trip failed");
+        {
+            QVariantList list = {QVariant(1), QVariant(2)};
+            QQuickJSValue v = qEng.toScriptValue(list);
+            TEST_RESULT("API: toScriptValue(QVariantList)", v.isArray() && v.property(1).toInt() == 2, "QVariantList round-trip failed");
+            TEST_RESULT("API: fromScriptValue(QVariantList)", qEng.fromScriptValue<QVariantList>(v) == list, "QVariantList back-conversion failed");
+        }
+        TEST_RESULT("API: fromScriptValue(int)", qEng.fromScriptValue<int>(qEng.evaluate("42")) == 42, "int back-conversion failed");
+        TEST_RESULT("API: fromScriptValue(QString)", qEng.fromScriptValue<QString>(qEng.evaluate("42")) == QStringLiteral("42"), "QString back-conversion failed");
+        TEST_RESULT("API: fromScriptValue default on unrepresentable", qEng.fromScriptValue<int>(qEng.evaluate("(function(){})")) == 0, "function must yield a default T");
+        {
+            QJSEngine qtEng;
+            const int qtI = qtEng.fromScriptValue<int>(qtEng.evaluate("4.7"));
+            const int qI = qEng.fromScriptValue<int>(qEng.evaluate("4.7"));
+            TEST_RESULT("API: fromScriptValue<int> number coercion parity", qI == qtI,
+                        QStringLiteral("QJSEngine=%1, QuickJS=%2").arg(qtI).arg(qI));
+        }
+
+        // errorType(): the class of an error object, NoError otherwise
+        {
+            QJSEngine qtEng;
+            QJSValue qtErr = qtEng.evaluate("null.x");
+            QQuickJSValue qErr = qEng.evaluate("null.x");
+            TEST_RESULT("API: errorType parity",
+                        qErr.errorType() == QQuickJSValue::TypeError
+                            && static_cast<int>(qErr.errorType()) == static_cast<int>(qtErr.errorType()),
+                        QStringLiteral("QJSEngine=%1, QuickJS=%2")
+                            .arg(static_cast<int>(qtErr.errorType())).arg(static_cast<int>(qErr.errorType())));
+            TEST_RESULT("API: errorType (NoError)", qEng.evaluate("'str'").errorType() == QQuickJSValue::NoError, "non-error must be NoError");
+            QQuickJSValue evalErr = qEng.newErrorObject(QQuickJSValue::EvalError, "eval fail");
+            TEST_RESULT("API: newErrorObject(EvalError)",
+                        evalErr.isError() && evalErr.property("name").toString() == QStringLiteral("EvalError")
+                            && evalErr.errorType() == QQuickJSValue::EvalError,
+                        "EvalError creation failed");
         }
 
         qEng.setAutoProcessPromises(false);
@@ -867,7 +1085,9 @@ static void runAllTests(const bool runDangerous) {
         TEST_RESULT("API: isValid", qEng.evaluate("42").isValid() && qEng.evaluate("undefined").isValid() && !QQuickJSValue().isValid(), "isValid failed");
 
         QQuickJSValue invalid;
-        TEST_RESULT("API: invalid value operations (no crash)", !invalid.property("test").isValid() && !invalid.hasProperty("test") && !invalid.deleteProperty("test") && invalid.toInt() == 0 && !invalid.toBool() && qIsNaN(invalid.toDouble()) && invalid.toString().isEmpty() && !invalid.toVariant().isValid() && !invalid.isValid() && !invalid.isError() && !invalid.isCallable() && !invalid.isObject() && !invalid.isArray() && !invalid.isString() && !invalid.isNumber() && !invalid.isBool() && !invalid.isNull() && invalid.isUndefined(), "Invalid value operations should be safe");
+        invalid.setPrototype(invalid);   // no-op on an invalid value: must not crash
+        invalid.callWithInstance(invalid);   // no engine: must not crash
+        TEST_RESULT("API: invalid value operations (no crash)", !invalid.property("test").isValid() && !invalid.hasProperty("test") && !invalid.deleteProperty("test") && invalid.toInt() == 0 && invalid.toUInt() == 0 && !invalid.toBool() && qIsNaN(invalid.toDouble()) && invalid.toString().isEmpty() && !invalid.toVariant().isValid() && !invalid.toDateTime().isValid() && invalid.toQObject() == nullptr && !invalid.isValid() && !invalid.isError() && invalid.errorType() == QQuickJSValue::NoError && !invalid.isCallable() && !invalid.isObject() && !invalid.isArray() && !invalid.isString() && !invalid.isNumber() && !invalid.isBool() && !invalid.isNull() && !invalid.isRegExp() && !invalid.isDate() && !invalid.isQObject() && invalid.isUndefined() && !invalid.prototype().isValid() && !invalid.hasOwnProperty("test") && !invalid.equals(invalid), "Invalid value operations should be safe");
 
         qEng.evaluate("function sumArgs(a,b,c) { return a+b+c; }");
         QQuickJSValue func = qEng.evaluate("sumArgs");
@@ -880,6 +1100,86 @@ static void runAllTests(const bool runDangerous) {
         QQuickJSValue v2 = otherEng.evaluate("42");
         TEST_RESULT("API: strictlyEquals (cross-context)", !v1.strictlyEquals(v2), "Cross-context should not be equal");
         TEST_RESULT("API: call (cross-context args)", !func.call(QList<QQuickJSValue>{v2}).isValid(), "Cross-context args should fail");
+
+        // equals(): ECMA-262 abstract equality
+        {
+            QQuickJSValue num42 = qEng.evaluate("42");
+            QQuickJSValue str42 = qEng.evaluate("'42'");
+            QQuickJSValue str42b = qEng.evaluate("'42'");
+            TEST_RESULT("API: equals (loose)", num42.equals(str42) && !num42.strictlyEquals(str42) && str42.equals(str42b), "equals != abstract equality");
+            TEST_RESULT("API: equals (false)", !qEng.evaluate("'abc'").equals(qEng.evaluate("42")), "equals mismatch");
+            TEST_RESULT("API: equals (cross-engine)", !num42.equals(otherEng.evaluate("42")), "cross-engine equals must fail");
+            TEST_RESULT("API: equals (invalid)", !QQuickJSValue().equals(num42) && !num42.equals(QQuickJSValue()), "invalid equals must be false");
+        }
+
+        // new predicates
+        TEST_RESULT("API: isRegExp", qEng.evaluate("/ab+c/").isRegExp() && !qEng.evaluate("'ab+c'").isRegExp() && !qEng.evaluate("({})").isRegExp(), "isRegExp failed");
+        TEST_RESULT("API: isDate", qEng.evaluate("new Date()").isDate() && !qEng.evaluate("Date.now()").isDate() && !qEng.evaluate("({})").isDate(), "isDate failed");
+        {
+            TestObject obj;
+            QQuickJSValue jsObj = qEng.newQObject(&obj);
+            TEST_RESULT("API: isQObject", jsObj.isQObject() && !qEng.evaluate("({})").isQObject() && !qEng.evaluate("null").isQObject(), "isQObject failed");
+            TEST_RESULT("API: toQObject", jsObj.toQObject() == &obj && qEng.evaluate("({})").toQObject() == nullptr, "toQObject failed");
+        }
+
+        // hasOwnProperty / prototype
+        {
+            QQuickJSValue o = qEng.evaluate("const base = {inherited: 1}; const derived = Object.create(base); derived.own = 2; derived");
+            TEST_RESULT("API: hasOwnProperty", o.hasOwnProperty("own") && !o.hasOwnProperty("inherited") && o.hasProperty("inherited"), "hasOwnProperty failed");
+            TEST_RESULT("API: hasOwnProperty (char*/QByteArray/QStringView)", o.hasOwnProperty("own") && !o.hasOwnProperty(QByteArrayLiteral("inherited")) && !o.hasOwnProperty(QStringView(u"something-else")), "hasOwnProperty overloads failed");
+            // Accessor properties: the descriptor cleanup must free the
+            // getter/setter refs as well (regression test).
+            QQuickJSValue acc = qEng.evaluate("({get x() { return 1; }, set x(v) {}})");
+            TEST_RESULT("API: hasOwnProperty (accessor)", acc.hasOwnProperty("x") && !acc.hasOwnProperty("y"), "accessor hasOwnProperty failed");
+            QQuickJSValue proto = o.prototype();
+            TEST_RESULT("API: prototype", proto.isValid() && proto.isObject() && proto.property("inherited").toInt() == 1, "prototype failed");
+            TEST_RESULT("API: prototype (non-object)", !qEng.evaluate("42").prototype().isValid() && !qEng.evaluate("'s'").prototype().isValid(), "prototype of primitive must be invalid");
+            QQuickJSValue replacement = qEng.evaluate("({inherited: 5})");
+            o.setPrototype(replacement);
+            TEST_RESULT("API: setPrototype", o.property("inherited").toInt() == 5, "setPrototype failed");
+            o.setPrototype(qEng.evaluate("null"));
+            TEST_RESULT("API: setPrototype (null)", !o.hasProperty("inherited"), "null prototype failed");
+            o.setPrototype(qEng.evaluate("42"));
+            TEST_RESULT("API: setPrototype (primitive ignored)", !o.hasProperty("inherited"), "primitive prototype must be ignored");
+            // parity with QJSEngine for the prototype of a primitive
+            {
+                QJSEngine qtEng;
+                QJSValue qtProto = qtEng.evaluate("42").prototype();
+                QQuickJSValue qProto = qEng.evaluate("42").prototype();
+                TEST_RESULT("API: prototype parity (primitive)", qtProto.isUndefined() == qProto.isUndefined() && qtProto.isObject() == qProto.isObject(), "prototype of primitive diverges from QJSEngine");
+            }
+        }
+
+        // toUInt / toDateTime
+        TEST_RESULT("API: toUInt", qEng.evaluate("42").toUInt() == 42 && qEng.evaluate("-1").toUInt() == 4294967295u && qEng.evaluate("4294967296").toUInt() == 0, "toUInt failed");
+        {
+            QJSEngine qtEng;
+            TEST_RESULT("API: toUInt parity", qEng.evaluate("-1").toUInt() == qtEng.evaluate("-1").toUInt() && qEng.evaluate("4294967296").toUInt() == qtEng.evaluate("4294967296").toUInt(), "toUInt diverges from QJSEngine");
+        }
+        {
+            QJSEngine qtEng;
+            QQuickJSValue qDate = qEng.evaluate("new Date(1234567890)");
+            QJSValue qtDate = qtEng.evaluate("new Date(1234567890)");
+            TEST_RESULT("API: toDateTime parity", qDate.toDateTime() == qtDate.toDateTime(), "toDateTime diverges from QJSEngine");
+            TEST_RESULT("API: toDateTime (invalid)", !qEng.evaluate("new Date(NaN)").toDateTime().isValid() && !qEng.evaluate("'str'").toDateTime().isValid(), "toDateTime invalid handling failed");
+        }
+
+        // callWithInstance(): QJSEngine 'this' semantics
+        qEng.evaluate("function readTag() { return this.tag; } function isGlobal() { return this === globalThis; }");
+        QQuickJSValue tagFn = qEng.evaluate("readTag");
+        QQuickJSValue globFn = qEng.evaluate("isGlobal");
+        QQuickJSValue receiver = qEng.evaluate("({tag: 'obj'})");
+        TEST_RESULT("API: callWithInstance (object)", tagFn.callWithInstance(receiver).toString() == QStringLiteral("obj"), "object instance failed");
+        TEST_RESULT("API: callWithInstance (primitive -> global)", globFn.callWithInstance(qEng.evaluate("42")).toBool(), "primitive instance must bind the global object");
+        TEST_RESULT("API: callWithInstance (QVariantList args)", tagFn.callWithInstance(receiver, QVariantList()).toString() == QStringLiteral("obj"), "QVariantList overload failed");
+        TEST_RESULT("API: callWithInstance (QList args)", tagFn.callWithInstance(receiver, QList<QQuickJSValue>()).toString() == QStringLiteral("obj"), "QList overload failed");
+        {
+            QJSEngine qtEng;
+            qtEng.evaluate("function isGlobal() { return this === globalThis; }");
+            const bool qtPrim = qtEng.evaluate("isGlobal").callWithInstance(qtEng.evaluate("42")).toBool();
+            const bool qPrim = globFn.callWithInstance(qEng.evaluate("42")).toBool();
+            TEST_RESULT("API: callWithInstance parity (primitive)", qPrim == qtPrim, "primitive-instance 'this' diverges from QJSEngine");
+        }
 
         QQuickJSValue fnP = qEng.evaluate("(function() { Promise.resolve(7).then(function(v) { globalThis.res = v; }); return 1; })");
         QQuickJSValue rP = fnP.call();
@@ -1622,7 +1922,1233 @@ static void runAllTests(const bool runDangerous) {
                     "delete via the cache is broken");
     }
 
-    // 19. Final Engine Stats
+    // 19. QJSEngine Parity Stage 2: extensions, iterator, conversion behavior, sticky interrupt
+    {
+        // --- QQuickJSValueIterator ---
+        {
+            QQuickJSEngine qEng;
+            QQuickJSValue obj = qEng.evaluate("({a: 1, b: 'x'})");
+
+            QStringList names;
+            QVariantHash values;
+            QQuickJSValueIterator it(obj);
+            TEST_RESULT("Iterator: hasNext before the first property", it.hasNext(), "hasNext false on a fresh iterator");
+            while (it.hasNext()) {
+                it.next();
+                names.append(it.name());
+                values.insert(it.name(), it.value().toVariant());
+            }
+            TEST_RESULT("Iterator: own properties enumerated",
+                        names.size() == 2 && names.contains(QStringLiteral("a")) && names.contains(QStringLiteral("b"))
+                            && values.value(QStringLiteral("a")).toInt() == 1
+                            && values.value(QStringLiteral("b")).toString() == QLatin1String("x"),
+                        QStringLiteral("names=%1").arg(names.join(u',')));
+            TEST_RESULT("Iterator: exhausted after the last property",
+                        !it.hasNext() && !it.next() && it.name() == QLatin1String("b")
+                            && it.value().toString() == QLatin1String("x"),
+                        "iterator exhausted state differs from the last-jumped-over semantics");
+
+            // Live parity: the same object iterated through QJSValueIterator
+            {
+                QJSEngine qtEng;
+                QJSValue qtObj = qtEng.evaluate("({a: 1, b: 'x'})");
+                QStringList qtNames;
+                QJSValueIterator qtIt(qtObj);
+                while (qtIt.hasNext()) { qtIt.next(); qtNames.append(qtIt.name()); }
+                QStringList sortedNames = names, sortedQtNames = qtNames;
+                sortedNames.sort();
+                sortedQtNames.sort();
+                TEST_RESULT("Iterator: plain-object name parity with QJSValueIterator",
+                            sortedNames == sortedQtNames,
+                            QStringLiteral("ours=%1 Qt=%2").arg(sortedNames.join(u','), sortedQtNames.join(u',')));
+            }
+
+            // Arrays: own indices plus "length", symbol keys skipped (probe-verified Qt behavior)
+            {
+                QQuickJSValue arr = qEng.evaluate("[10, 20]");
+                QStringList arrNames;
+                QQuickJSValueIterator it2(arr);
+                while (it2.hasNext()) { it2.next(); arrNames.append(it2.name()); }
+
+                QJSEngine qtEng;
+                QJSValue qtArr = qtEng.evaluate("[10, 20]");
+                QStringList qtArrNames;
+                QJSValueIterator qtIt2(qtArr);
+                while (qtIt2.hasNext()) { qtIt2.next(); qtArrNames.append(qtIt2.name()); }
+                QStringList sortedArrNames = arrNames, sortedQtArrNames = qtArrNames;
+                sortedArrNames.sort();
+                sortedQtArrNames.sort();
+                TEST_RESULT("Iterator: array names parity with QJSValueIterator (length included)",
+                            sortedArrNames == sortedQtArrNames && arrNames.contains(QStringLiteral("length")),
+                            QStringLiteral("ours=%1 Qt=%2").arg(sortedArrNames.join(u','), sortedQtArrNames.join(u',')));
+
+                it2 = arr;   // operator= restarts the iteration
+                bool got0 = false, got1 = false;
+                while (it2.hasNext()) {
+                    it2.next();
+                    if (it2.name() == QLatin1String("0")) got0 = it2.value().toInt() == 10;
+                    if (it2.name() == QLatin1String("1")) got1 = it2.value().toInt() == 20;
+                }
+                TEST_RESULT("Iterator: operator= restarts and reads element values",
+                            got0 && got1, "array element values not read after operator=");
+            }
+
+            // Prototype chain not followed; symbol-keyed properties skipped
+            {
+                QQuickJSValue protoObj = qEng.evaluate(
+                    "(function(){ var o = {own: 1}; o[Symbol('s')] = 2; return o; })()");
+                QStringList protoNames;
+                QQuickJSValueIterator it3(protoObj);
+                while (it3.hasNext()) { it3.next(); protoNames.append(it3.name()); }
+                TEST_RESULT("Iterator: own properties only, symbols skipped",
+                            protoNames == QStringList{QStringLiteral("own")},
+                            QStringLiteral("names=%1").arg(protoNames.join(u',')));
+            }
+
+            // value() is lazy: enumeration runs no getters, value() does
+            {
+                QQuickJSValue getterObj = qEng.evaluate(
+                    "({ get g() { globalThis.getterRuns = (globalThis.getterRuns||0)+1; return 7; },"
+                    "   get boom() { throw new Error('getter'); } })");
+                qEng.evaluate("globalThis.getterRuns = 0");
+                QQuickJSValueIterator it4(getterObj);
+                while (it4.hasNext()) { it4.next(); }   // name sweep only
+                TEST_RESULT("Iterator: enumeration runs no getters",
+                            qEng.globalObject().property(QStringLiteral("getterRuns")).toInt() == 0,
+                            "enumeration triggered a getter");
+
+                it4 = getterObj;
+                int runsAfterValue = 0;
+                while (it4.hasNext()) {
+                    it4.next();
+                    if (it4.name() == QLatin1String("g")) {
+                        it4.value();
+                        runsAfterValue = qEng.globalObject().property(QStringLiteral("getterRuns")).toInt();
+                    }
+                }
+                TEST_RESULT("Iterator: value() runs the getter lazily",
+                            runsAfterValue == 1, "value() did not run the getter exactly once");
+
+                it4 = getterObj;
+                bool threwInvalid = false;
+                while (it4.hasNext()) {
+                    it4.next();
+                    if (it4.name() == QLatin1String("boom")) threwInvalid = !it4.value().isValid();
+                }
+                TEST_RESULT("Iterator: throwing getter yields an invalid value",
+                            threwInvalid, "a throwing getter did not yield an invalid value");
+            }
+
+            // Non-object and invalid values yield exhausted iterators
+            {
+                QQuickJSValueIterator prim(qEng.evaluate("42"));
+                QQuickJSValueIterator invalid{QQuickJSValue()};
+                TEST_RESULT("Iterator: primitive and invalid values are exhausted",
+                            !prim.hasNext() && !prim.next() && prim.name().isEmpty()
+                                && !invalid.hasNext() && !invalid.next() && !invalid.value().isValid(),
+                            "a non-object value produced a working iterator");
+            }
+        }
+
+        // --- toVariant(ObjectConversionBehavior) ---
+        {
+            QQuickJSEngine qEng;
+            QVariant fnR = qEng.evaluate("(function(){ return 1; })").toVariant(QQuickJSValue::RetainJSObjects);
+            TEST_RESULT("toVariant: RetainJSObjects wraps a function",
+                        fnR.userType() == qMetaTypeId<QQuickJSValue>() && fnR.value<QQuickJSValue>().isCallable(),
+                        "function not retained");
+            QVariant plainR = qEng.evaluate("({a: 1})").toVariant(QQuickJSValue::RetainJSObjects);
+            TEST_RESULT("toVariant: RetainJSObjects wraps a plain object",
+                        plainR.userType() == qMetaTypeId<QQuickJSValue>()
+                            && plainR.value<QQuickJSValue>().property(QStringLiteral("a")).toInt() == 1,
+                        "plain object not retained");
+            QVariant arrR = qEng.evaluate("[1, 2, 3]").toVariant(QQuickJSValue::RetainJSObjects);
+            TEST_RESULT("toVariant: RetainJSObjects wraps an array",
+                        arrR.userType() == qMetaTypeId<QQuickJSValue>() && arrR.value<QQuickJSValue>().isArray(),
+                        "array not retained");
+            QVariant dateR = qEng.evaluate("new Date(1700000000000)").toVariant(QQuickJSValue::RetainJSObjects);
+            TEST_RESULT("toVariant: RetainJSObjects keeps the native Date conversion",
+                        dateR.userType() == QMetaType::QDateTime
+                            && dateR.toDateTime().toMSecsSinceEpoch() == 1700000000000LL,
+                        "Date conversion lost in retain mode");
+            QVariant symR = qEng.newSymbol(QStringLiteral("mysym")).toVariant(QQuickJSValue::RetainJSObjects);
+            TEST_RESULT("toVariant: RetainJSObjects wraps a symbol",
+                        symR.userType() == qMetaTypeId<QQuickJSValue>() && symR.value<QQuickJSValue>().isSymbol(),
+                        "symbol not retained");
+            QVariant mapR = qEng.evaluate("new Map()").toVariant(QQuickJSValue::RetainJSObjects);
+            TEST_RESULT("toVariant: RetainJSObjects wraps exotic objects",
+                        mapR.userType() == qMetaTypeId<QQuickJSValue>(), "exotic object not retained");
+
+            // Live parity: QJSEngine also retains plain objects in retain mode
+            {
+                QJSEngine qtEng;
+                QVariant qtPlain = qtEng.evaluate("({a: 1})").toVariant(QJSValue::RetainJSObjects);
+                QVariant qtFn = qtEng.evaluate("(function(){})").toVariant(QJSValue::RetainJSObjects);
+                TEST_RESULT("toVariant: RetainJSObjects parity with QJSEngine",
+                            qtPlain.userType() == qMetaTypeId<QJSValue>()
+                                && qtFn.userType() == qMetaTypeId<QJSValue>()
+                                && plainR.userType() == qMetaTypeId<QQuickJSValue>()
+                                && fnR.userType() == qMetaTypeId<QQuickJSValue>(),
+                            QStringLiteral("Qt plain=%1 fn=%2, ours plain=%3 fn=%4")
+                                .arg(qtPlain.typeName(), qtFn.typeName(), plainR.typeName(), fnR.typeName()));
+            }
+        }
+
+        // --- installExtensions(extensions, object) ---
+        {
+            QQuickJSEngine qEng;
+            QQuickJSValue target = qEng.newObject();
+            qEng.installExtensions(QQuickJSEngine::ConsoleExtension | QQuickJSEngine::TranslationExtension
+                                       | QQuickJSEngine::GarbageCollectionExtension, target);
+            TEST_RESULT("installExtensions: console installed on the target object",
+                        target.property(QStringLiteral("console")).isObject()
+                            && target.property(QStringLiteral("console")).property(QStringLiteral("log")).isCallable(),
+                        "console missing on the target");
+            TEST_RESULT("installExtensions: print installed on the target object",
+                        target.property(QStringLiteral("print")).isCallable(), "print missing on the target");
+            TEST_RESULT("installExtensions: translation functions installed on the target",
+                        target.property(QStringLiteral("qsTr")).isCallable()
+                            && target.property(QStringLiteral("qsTranslate")).isCallable()
+                            && target.property(QStringLiteral("qsTrId")).isCallable(),
+                        "translation functions missing on the target");
+            TEST_RESULT("installExtensions: gc installed on the target",
+                        target.property(QStringLiteral("gc")).isCallable(), "gc missing on the target");
+            TEST_RESULT("installExtensions: global object untouched by a custom target",
+                        qEng.globalObject().property(QStringLiteral("console")).isUndefined()
+                            && qEng.globalObject().property(QStringLiteral("qsTr")).isUndefined(),
+                        "extensions leaked onto the global object");
+            TEST_RESULT("installExtensions: String.prototype.arg installed engine-wide",
+                        qEng.evaluate("'%1'.arg(7)").toString() == QLatin1String("7"),
+                        "String.prototype.arg missing");
+
+            // A non-object target falls back to the global object (QJSEngine parity)
+            {
+                QQuickJSEngine qEng2;
+                qEng2.installExtensions(QQuickJSEngine::ConsoleExtension, qEng2.evaluate("42"));
+                TEST_RESULT("installExtensions: non-object target falls back to the global object",
+                            qEng2.globalObject().property(QStringLiteral("console")).isObject()
+                                && qEng2.globalObject().property(QStringLiteral("print")).isCallable(),
+                            "console not installed on the global object");
+            }
+
+            // A value owned by another engine is rejected
+            {
+                QQuickJSEngine other;
+                QQuickJSEngine qEng3;
+                QQuickJSValue foreign = other.newObject();
+                WarningCaptureGuard capture;   // the rejection warning must be emitted
+                qEng3.installExtensions(QQuickJSEngine::ConsoleExtension, foreign);
+                TEST_RESULT("installExtensions: foreign-engine value rejected",
+                            foreign.property(QStringLiteral("console")).isUndefined()
+                                && !qEng3.globalObject().property(QStringLiteral("console")).isCallable()
+                                && g_capturedWarnings.size() == 1,
+                            QStringLiteral("warnings=%1").arg(g_capturedWarnings.join(u',')));
+            }
+
+            // Live parity with QJSEngine
+            {
+                QJSEngine qtEng;
+                QJSValue qtTarget = qtEng.newObject();
+                qtEng.installExtensions(QJSEngine::ConsoleExtension, qtTarget);
+                TEST_RESULT("installExtensions: custom-target parity with QJSEngine",
+                            qtTarget.property(QStringLiteral("console")).isObject()
+                                && qtTarget.property(QStringLiteral("print")).isCallable()
+                                && qtEng.globalObject().property(QStringLiteral("console")).isUndefined(),
+                            "QJSEngine custom-target behavior differs");
+            }
+        }
+
+        // --- Console extension ---
+        {
+            QQuickJSEngine qEng;
+            qEng.installExtensions(QQuickJSEngine::ConsoleExtension);
+            TEST_RESULT("Console: full method surface",
+                        qEng.evaluate("typeof console.assert").toString() == QLatin1String("function")
+                            && qEng.evaluate("typeof console.count").toString() == QLatin1String("function")
+                            && qEng.evaluate("typeof console.time").toString() == QLatin1String("function")
+                            && qEng.evaluate("typeof console.timeEnd").toString() == QLatin1String("function")
+                            && qEng.evaluate("typeof console.trace").toString() == QLatin1String("function")
+                            && qEng.evaluate("typeof console.exception").toString() == QLatin1String("function")
+                            && qEng.evaluate("typeof print").toString() == QLatin1String("function"),
+                        "console method missing");
+
+            {
+                QJSEngine qtEng;
+                qtEng.installExtensions(QJSEngine::ConsoleExtension);
+                TEST_RESULT("Console: method-surface parity with QJSEngine",
+                            qtEng.evaluate("typeof print").toString() == QLatin1String("function")
+                                && qtEng.evaluate("typeof console.assert").toString() == QLatin1String("function")
+                                && qtEng.evaluate("typeof console.trace").toString() == QLatin1String("function"),
+                            "QJSEngine console surface differs");
+            }
+
+            TEST_RESULT("Console: print behaves like console.log",
+                        qEng.evaluate("print('hello')").isUndefined() && !qEng.evaluate("print('hello')").isError(),
+                        "print failed");
+            TEST_RESULT("Console: assert with a truthy expression returns undefined",
+                        qEng.evaluate("console.assert(true, 'never printed')").isUndefined(),
+                        "truthy assert failed");
+            TEST_RESULT("Console: assert with a falsy expression returns undefined (prints)",
+                        qEng.evaluate("console.assert(false, 'failure detail')").isUndefined(),
+                        "falsy assert failed");
+            TEST_RESULT("Console: assert without arguments throws",
+                        qEng.evaluate("console.assert()").isError(),
+                        "missing-argument assert did not throw");
+            TEST_RESULT("Console: time without a label throws",
+                        qEng.evaluate("console.time()").isError(), "console.time() did not throw");
+            TEST_RESULT("Console: timeEnd without a label throws",
+                        qEng.evaluate("console.timeEnd()").isError(), "console.timeEnd() did not throw");
+            TEST_RESULT("Console: time/timeEnd round-trip and an unknown label are silent",
+                        qEng.evaluate("console.time('t'); console.timeEnd('t'); console.timeEnd('unknown');").isUndefined(),
+                        "time/timeEnd round-trip failed");
+            TEST_RESULT("Console: trace with arguments throws",
+                        qEng.evaluate("console.trace(1)").isError(), "console.trace(1) did not throw");
+            TEST_RESULT("Console: exception without arguments throws",
+                        qEng.evaluate("console.exception()").isError(), "console.exception() did not throw");
+            TEST_RESULT("Console: exception with arguments returns undefined",
+                        qEng.evaluate("console.exception(new Error('e'))").isUndefined(),
+                        "console.exception failed");
+            TEST_RESULT("Console: count returns undefined",
+                        qEng.evaluate("console.count('c'); console.count('c');").isUndefined(),
+                        "console.count failed");
+            TEST_RESULT("Console: symbol arguments do not throw",
+                        qEng.evaluate("console.log(Symbol('s')); console.count(Symbol('k'))").isUndefined(),
+                        "a symbol argument broke console output");
+
+            // Output formats follow V4's console: timeEnd prints "label: Nms",
+            // count prints "label: N" (keyed by the printed label - a documented
+            // divergence from V4's per-call-site counters).
+            {
+                QQuickJSEngine qEng2;
+                qEng2.installExtensions(QQuickJSEngine::ConsoleExtension);
+                MessageCaptureGuard capture;
+                qEng2.evaluate("console.time('t1'); console.timeEnd('t1'); console.count('c1'); console.count('c1');");
+                bool timeFormatOk = false;
+                for (const QString& m : std::as_const(g_capturedMessages)) {
+                    if (m.startsWith(QStringLiteral("[JS console] t1: ")) && m.endsWith(QStringLiteral("ms"))) timeFormatOk = true;
+                }
+                TEST_RESULT("Console: timeEnd output format",
+                            timeFormatOk, QStringLiteral("captured=%1").arg(g_capturedMessages.join(u' ')));
+                TEST_RESULT("Console: count output format (label-keyed)",
+                            g_capturedMessages.contains(QStringLiteral("[JS console] c1: 1"))
+                                && g_capturedMessages.contains(QStringLiteral("[JS console] c1: 2")),
+                            QStringLiteral("captured=%1").arg(g_capturedMessages.join(u' ')));
+            }
+        }
+
+        // --- Translation extension ---
+        {
+            QQuickJSEngine qEng;
+            qEng.installExtensions(QQuickJSEngine::TranslationExtension);
+            {
+                QJSEngine qtEng;
+                qtEng.installExtensions(QJSEngine::TranslationExtension);
+                TEST_RESULT("Translation: function-surface parity with QJSEngine",
+                            qtEng.evaluate("typeof qsTranslate").toString() == QLatin1String("function")
+                                && qtEng.evaluate("typeof QT_TRANSLATE_NOOP").toString() == QLatin1String("function")
+                                && qtEng.evaluate("typeof qsTrId").toString() == QLatin1String("function")
+                                && qtEng.evaluate("typeof QT_TRID_NOOP").toString() == QLatin1String("function"),
+                            "QJSEngine translation surface differs");
+                TEST_RESULT("Translation: our function surface",
+                            qEng.evaluate("typeof qsTranslate").toString() == QLatin1String("function")
+                                && qEng.evaluate("typeof QT_TRANSLATE_NOOP").toString() == QLatin1String("function")
+                                && qEng.evaluate("typeof QT_TR_NOOP").toString() == QLatin1String("function")
+                                && qEng.evaluate("typeof qsTrId").toString() == QLatin1String("function")
+                                && qEng.evaluate("typeof QT_TRID_NOOP").toString() == QLatin1String("function"),
+                            "translation function missing");
+                TEST_RESULT("Translation: qsTranslate parity",
+                            qEng.evaluate("qsTranslate('ctx', 'source')").toString() == QLatin1String("source")
+                                && qtEng.evaluate("qsTranslate('ctx', 'source')").toString() == QLatin1String("source"),
+                            "qsTranslate diverged from QJSEngine");
+                TEST_RESULT("Translation: qsTranslate with disambiguation and n",
+                            qEng.evaluate("qsTranslate('ctx', '%n files', 'dis', 5)").toString() == QLatin1String("5 files")
+                                && qtEng.evaluate("qsTranslate('ctx', '%n files', 'dis', 5)").toString() == QLatin1String("5 files"),
+                            "qsTranslate extended form diverged from QJSEngine");
+                TEST_RESULT("Translation: qsTrId parity (no translator: the id is returned)",
+                            qEng.evaluate("qsTrId('my.id')").toString() == QLatin1String("my.id")
+                                && qtEng.evaluate("qsTrId('my.id')").toString() == QLatin1String("my.id"),
+                            "qsTrId diverged from QJSEngine");
+                TEST_RESULT("Translation: NOOP parity",
+                            qEng.evaluate("QT_TR_NOOP('x')").toString() == QLatin1String("x")
+                                && qEng.evaluate("QT_TRANSLATE_NOOP('c', 's')").toString() == QLatin1String("s")
+                                && qEng.evaluate("QT_TRID_NOOP('i')").toString() == QLatin1String("i")
+                                && qtEng.evaluate("QT_TR_NOOP('x')").toString() == QLatin1String("x")
+                                && qtEng.evaluate("QT_TRANSLATE_NOOP('c', 's')").toString() == QLatin1String("s")
+                                && qtEng.evaluate("QT_TRID_NOOP('i')").toString() == QLatin1String("i"),
+                            "NOOP behavior diverged from QJSEngine");
+                TEST_RESULT("Translation: NOOP with too few arguments is undefined",
+                            qEng.evaluate("QT_TR_NOOP()").isUndefined()
+                                && qEng.evaluate("QT_TRANSLATE_NOOP('c')").isUndefined()
+                                && qEng.evaluate("QT_TRID_NOOP()").isUndefined()
+                                && qtEng.evaluate("QT_TR_NOOP()").isUndefined(),
+                            "NOOP arity behavior diverged from QJSEngine");
+                TEST_RESULT("Translation: String.prototype.arg parity",
+                            qEng.evaluate("'%1 %2'.arg(5)").toString() == qtEng.evaluate("'%1 %2'.arg(5)").toString()
+                                && qEng.evaluate("'%1'.arg(1.5)").toString() == qtEng.evaluate("'%1'.arg(1.5)").toString()
+                                && qEng.evaluate("'%1'.arg(true)").toString() == qtEng.evaluate("'%1'.arg(true)").toString()
+                                && qEng.evaluate("'%1'.arg('str')").toString() == qtEng.evaluate("'%1'.arg('str')").toString()
+                                && qEng.evaluate("'%1 %2'.arg(5)").toString() == QLatin1String("5 %2"),
+                            "String.prototype.arg diverged from QJSEngine");
+            }
+            TEST_RESULT("Translation: qsTr extended signature",
+                        qEng.evaluate("qsTr('s', 'comment', 5)").toString() == QLatin1String("s"),
+                        "qsTr extended form failed");
+            TEST_RESULT("Translation: qsTr argument validation",
+                        qEng.evaluate("qsTr()").isError()
+                            && qEng.evaluate("qsTr(42)").isError()
+                            && qEng.evaluate("qsTr('s', 42)").isError()
+                            && qEng.evaluate("qsTr('s', 'c', 'x')").isError(),
+                        "qsTr argument validation failed");
+            TEST_RESULT("Translation: qsTranslate argument validation",
+                        qEng.evaluate("qsTranslate('c')").isError()
+                            && qEng.evaluate("qsTranslate('c', 's', 5)").isError()
+                            && qEng.evaluate("qsTranslate(42, 's')").isError(),
+                        "qsTranslate argument validation failed");
+            TEST_RESULT("Translation: qsTranslate() missing-arguments message",
+                        qEng.evaluate("qsTranslate('c')").toString().contains(QStringLiteral("requires at least two")),
+                        "wrong missing-arguments message");
+            TEST_RESULT("Translation: qsTrId argument validation",
+                        qEng.evaluate("qsTrId()").isError()
+                            && qEng.evaluate("qsTrId(42)").isError()
+                            && qEng.evaluate("qsTrId('id', 'x')").isError(),
+                        "qsTrId argument validation failed");
+            TEST_RESULT("Translation: qsTrId wrong-type is a TypeError",
+                        qEng.evaluate("qsTrId(42)").errorType() == QQuickJSValue::TypeError,
+                        "qsTrId type validation is not a TypeError");
+            TEST_RESULT("Translation: String.arg argument validation",
+                        qEng.evaluate("'x'.arg()").isError() && qEng.evaluate("'x'.arg(1, 2)").isError(),
+                        "String.arg argument validation failed");
+        }
+
+        // --- evaluate(..., exceptionStackTrace) ---
+        {
+            QQuickJSEngine qEng;
+            QStringList stack;
+            QQuickJSValue res = qEng.evaluate(
+                "function f(){\n  throw new Error('boom');\n}\nf();", QStringLiteral("sc.js"), 1, &stack);
+            TEST_RESULT("StackTrace: populated for an uncaught Error",
+                        res.isError() && !stack.isEmpty(),
+                        QStringLiteral("stack=%1").arg(stack.join(u' ')));
+            bool frameOk = false;
+            for (const QString& f : std::as_const(stack)) {
+                if (f.startsWith(QStringLiteral("f:2:")) && f.endsWith(QStringLiteral(":sc.js"))) frameOk = true;
+            }
+            TEST_RESULT("StackTrace: frame format function:line:column:file",
+                        frameOk, QStringLiteral("stack=%1").arg(stack.join(u' ')));
+
+            QStringList clean;
+            TEST_RESULT("StackTrace: empty without an exception",
+                        qEng.evaluate("1 + 1", QString(), 1, &clean).toInt() == 2 && clean.isEmpty(),
+                        "non-empty stack without an exception");
+
+            {
+                QJSEngine qtEng;
+                QStringList qtStack;
+                QJSValue qtRes = qtEng.evaluate(
+                    "function f(){\n  throw new Error('boom');\n}\nf();", QStringLiteral("sc.js"), 1, &qtStack);
+                bool qtFrame = false;
+                for (const QString& f : std::as_const(qtStack)) {
+                    if (f.contains(QStringLiteral(":2:"))) qtFrame = true;
+                }
+                TEST_RESULT("StackTrace: parity with QJSEngine (throwing frame at line 2)",
+                            qtRes.isError() && !qtStack.isEmpty() && qtFrame && frameOk,
+                            QStringLiteral("Qt=%1 ours=%2").arg(qtStack.join(u' '), stack.join(u' ')));
+            }
+
+            QStringList plainThrow;
+            qEng.evaluate("throw 'str'", QString(), 1, &plainThrow);
+            TEST_RESULT("StackTrace: non-Error throw yields an empty list",
+                        plainThrow.isEmpty(), QStringLiteral("stack=%1").arg(plainThrow.join(u' ')));
+
+            QStringList caught;
+            qEng.evaluate("try { throw new Error('x') } catch(e) { }", QString(), 1, &caught);
+            TEST_RESULT("StackTrace: caught exception yields an empty list",
+                        caught.isEmpty(), QStringLiteral("stack=%1").arg(caught.join(u' ')));
+        }
+
+        // --- isSymbol()/isPromise() ---
+        {
+            QQuickJSEngine qEng;
+            TEST_RESULT("API: isPromise",
+                        qEng.evaluate("Promise.resolve(1)").isPromise()
+                            && qEng.evaluate("(async function(){})()").isPromise()
+                            && !qEng.evaluate("({})").isPromise()
+                            && !qEng.evaluate("(function(){})").isPromise(),
+                        "isPromise failed");
+            TEST_RESULT("API: isSymbol",
+                        qEng.newSymbol(QStringLiteral("d")).isSymbol()
+                            && qEng.evaluate("Symbol('x')").isSymbol()
+                            && !qEng.evaluate("'s'").isSymbol()
+                            && !qEng.evaluate("42").isSymbol()
+                            && !qEng.evaluate("({})").isSymbol(),
+                        "isSymbol failed");
+        }
+
+        // --- Sticky interrupt: live parity with QJSEngine ---
+        {
+            QJSEngine qtEng;
+            qtEng.setInterrupted(true);
+            QJSValue qtRes = qtEng.evaluate("1 + 1");
+            qtEng.setInterrupted(false);
+            TEST_RESULT("Interrupt: sticky semantics parity with QJSEngine",
+                        qtRes.isError() && qtEng.evaluate("1 + 1").toInt() == 2,
+                        QStringLiteral("Qt evaluate result: %1").arg(qtRes.toString()));
+        }
+    }
+
+    // 20. QJSEngine Parity Stage 3: throwError/hasError/catchError
+    // Semantics pinned against live Qt 6.12 (scripts/probe-qt-throw.cpp):
+    // a pending error preempts evaluate()/call() without executing the code,
+    // evaluate() and call() clear hasError(), catchError() returns undefined
+    // when nothing is pending, and exceptions of signal handlers are
+    // reported without aborting the emission.
+    {
+        // --- direct dual-engine semantics (C++ level) ---
+        {
+            QJSEngine qtEng;
+            QQuickJSEngine qEng;
+            qtEng.throwError(QStringLiteral("plain boom"));
+            qEng.throwError(QStringLiteral("plain boom"));
+            TEST_RESULT("Throw: hasError after throwError",
+                        qtEng.hasError() && qEng.hasError(), "hasError false right after throwError");
+
+            QJSValue qtC1 = qtEng.catchError();
+            QQuickJSValue qC1 = qEng.catchError();
+            TEST_RESULT("Throw: catchError returns the thrown error",
+                        qtC1.isError() && qC1.isError()
+                            && qtC1.toString() == QLatin1String("Error: plain boom")
+                            && qC1.toString() == QLatin1String("Error: plain boom")
+                            && qtC1.errorType() == QJSValue::GenericError
+                            && qC1.errorType() == QQuickJSValue::GenericError,
+                        QStringLiteral("Qt='%1' ours='%2'").arg(qtC1.toString(), qC1.toString()));
+            TEST_RESULT("Throw: hasError false after catchError",
+                        !qtEng.hasError() && !qEng.hasError(), "catchError did not clear the pending error");
+
+            QJSValue qtC2 = qtEng.catchError();
+            QQuickJSValue qC2 = qEng.catchError();
+            TEST_RESULT("Throw: catchError without pending is undefined",
+                        qtC2.isUndefined() && qC2.isUndefined(), "catchError with nothing pending must be undefined");
+        }
+
+        // typed errors: class preserved through throwError/catchError
+        {
+            QJSEngine qtEng;
+            QQuickJSEngine qEng;
+            qtEng.throwError(QJSValue::RangeError, QStringLiteral("range boom"));
+            qEng.throwError(QQuickJSValue::RangeError, QStringLiteral("range boom"));
+            QJSValue qtR = qtEng.catchError();
+            QQuickJSValue qR = qEng.catchError();
+            TEST_RESULT("Throw: RangeError class preserved",
+                        qtR.toString() == QLatin1String("RangeError: range boom")
+                            && qR.toString() == QLatin1String("RangeError: range boom")
+                            && qtR.errorType() == QJSValue::RangeError && qR.errorType() == QQuickJSValue::RangeError,
+                        QStringLiteral("Qt='%1' ours='%2'").arg(qtR.toString(), qR.toString()));
+
+            qtEng.throwError(QJSValue::EvalError, QStringLiteral("eval boom"));
+            qEng.throwError(QQuickJSValue::EvalError, QStringLiteral("eval boom"));
+            QJSValue qtE = qtEng.catchError();
+            QQuickJSValue qE = qEng.catchError();
+            TEST_RESULT("Throw: EvalError class preserved",
+                        qtE.errorType() == QJSValue::EvalError && qE.errorType() == QQuickJSValue::EvalError
+                            && qtE.toString() == QLatin1String("EvalError: eval boom")
+                            && qE.toString() == QLatin1String("EvalError: eval boom"),
+                        QStringLiteral("Qt='%1' ours='%2'").arg(qtE.toString(), qE.toString()));
+
+            // default (empty) message: toString keeps the class prefix only
+            qtEng.throwError(QJSValue::RangeError);
+            qEng.throwError(QQuickJSValue::RangeError);
+            QJSValue qtEmpty = qtEng.catchError();
+            QQuickJSValue qEmpty = qEng.catchError();
+            TEST_RESULT("Throw: empty message keeps the error class",
+                        qtEmpty.toString() == QLatin1String("RangeError") && qEmpty.toString() == QLatin1String("RangeError"),
+                        QStringLiteral("Qt='%1' ours='%2'").arg(qtEmpty.toString(), qEmpty.toString()));
+        }
+
+        // a pending error preempts evaluate(): the script is not executed
+        {
+            QJSEngine qtEng;
+            QQuickJSEngine qEng;
+            qtEng.throwError(QStringLiteral("pending boom"));
+            qEng.throwError(QStringLiteral("pending boom"));
+            QJSValue qtR = qtEng.evaluate(QStringLiteral("globalThis.ran = 1; 1 + 1"));
+            QQuickJSValue qR = qEng.evaluate(QStringLiteral("globalThis.ran = 1; 1 + 1"));
+            TEST_RESULT("Throw: pending error preempts evaluate",
+                        qtR.isError() && qR.isError()
+                            && qtR.toString() == QLatin1String("Error: pending boom")
+                            && qR.toString() == QLatin1String("Error: pending boom"),
+                        QStringLiteral("Qt='%1' ours='%2'").arg(qtR.toString(), qR.toString()));
+            TEST_RESULT("Throw: preempted evaluate did not run the script",
+                        qtEng.globalObject().property(QStringLiteral("ran")).isUndefined()
+                            && qEng.globalObject().property(QStringLiteral("ran")).isUndefined(),
+                        "script side effect visible after a preempted evaluate");
+            TEST_RESULT("Throw: hasError false after preempted evaluate",
+                        !qtEng.hasError() && !qEng.hasError(), "preempted evaluate left the error pending");
+        }
+
+        // a pending error preempts call(): the function is not invoked
+        {
+            QJSEngine qtEng;
+            QQuickJSEngine qEng;
+            QJSValue qtFn = qtEng.evaluate(QStringLiteral("(function(a){ globalThis.calledWith = a; return a * 2; })"));
+            QQuickJSValue qFn = qEng.evaluate(QStringLiteral("(function(a){ globalThis.calledWith = a; return a * 2; })"));
+            qtEng.throwError(QStringLiteral("pending call"));
+            qEng.throwError(QStringLiteral("pending call"));
+            QJSValue qtR = qtFn.call(QJSValueList() << 21);
+            QQuickJSValue qR = qFn.call(QVariantList() << 21);
+            TEST_RESULT("Throw: pending error preempts call",
+                        qtR.isError() && qR.isError()
+                            && qtR.toString() == QLatin1String("Error: pending call")
+                            && qR.toString() == QLatin1String("Error: pending call"),
+                        QStringLiteral("Qt='%1' ours='%2'").arg(qtR.toString(), qR.toString()));
+            TEST_RESULT("Throw: preempted call did not invoke the function",
+                        qtEng.globalObject().property(QStringLiteral("calledWith")).isUndefined()
+                            && qEng.globalObject().property(QStringLiteral("calledWith")).isUndefined(),
+                        "function ran despite the pending error");
+        }
+
+        // evaluate() clears hasError() for its own script exceptions
+        {
+            QJSEngine qtEng;
+            QQuickJSEngine qEng;
+            qtEng.evaluate(QStringLiteral("throw 'script error'"));
+            qEng.evaluate(QStringLiteral("throw 'script error'"));
+            TEST_RESULT("Throw: hasError false after failing evaluate",
+                        !qtEng.hasError() && !qEng.hasError(),
+                        "evaluate() did not clear hasError() for its own exception");
+        }
+
+        // catchError() clears the error: subsequent evaluate() runs normally
+        {
+            QJSEngine qtEng;
+            QQuickJSEngine qEng;
+            qtEng.throwError(QStringLiteral("transient"));
+            qEng.throwError(QStringLiteral("transient"));
+            qtEng.catchError();
+            qEng.catchError();
+            QJSValue qtR = qtEng.evaluate(QStringLiteral("2 + 3"));
+            QQuickJSValue qR = qEng.evaluate(QStringLiteral("2 + 3"));
+            TEST_RESULT("Throw: evaluate runs normally after catchError",
+                        qtR.toString() == QLatin1String("5") && qR.toString() == QLatin1String("5")
+                            && !qtEng.hasError() && !qEng.hasError(),
+                        QStringLiteral("Qt='%1' ours='%2'").arg(qtR.toString(), qR.toString()));
+        }
+
+        // throwError(value): custom properties survive the catch
+        {
+            QJSEngine qtEng;
+            QQuickJSEngine qEng;
+            QJSValue qtErr = qtEng.newErrorObject(QJSValue::TypeError, QStringLiteral("typed boom"));
+            qtErr.setProperty(QStringLiteral("code"), 42);
+            qtEng.throwError(qtErr);
+            QQuickJSValue qErr = qEng.newErrorObject(QQuickJSValue::TypeError, QStringLiteral("typed boom"));
+            qErr.setProperty(QStringLiteral("code"), 42);
+            qEng.throwError(qErr);
+            QJSValue qtC = qtEng.catchError();
+            QQuickJSValue qC = qEng.catchError();
+            TEST_RESULT("Throw: custom properties survive throwError(value)",
+                        qtC.property(QStringLiteral("code")).toInt() == 42 && qC.property(QStringLiteral("code")).toInt() == 42
+                            && qtC.errorType() == QJSValue::TypeError && qC.errorType() == QQuickJSValue::TypeError,
+                        QStringLiteral("Qt code=%1 ours code=%2")
+                            .arg(qtC.property(QStringLiteral("code")).toInt())
+                            .arg(qC.property(QStringLiteral("code")).toInt()));
+        }
+
+        // newErrorObject(NoError) yields undefined, throwError(NoError) is a no-op
+        {
+            QJSEngine qtEng;
+            QQuickJSEngine qEng;
+            TEST_RESULT("Throw: newErrorObject(NoError) is undefined",
+                        qtEng.newErrorObject(QJSValue::NoError, QStringLiteral("m")).isUndefined()
+                            && qEng.newErrorObject(QQuickJSValue::NoError, QStringLiteral("m")).isUndefined(),
+                        "newErrorObject(NoError) must be undefined");
+            qtEng.throwError(QJSValue::NoError, QStringLiteral("ignored"));
+            qEng.throwError(QQuickJSValue::NoError, QStringLiteral("ignored"));
+            TEST_RESULT("Throw: throwError(NoError) is a no-op",
+                        !qtEng.hasError() && !qEng.hasError(),
+                        "throwError(NoError) must not leave a pending error");
+        }
+
+        // --- JS-visible delivery through native call boundaries ---
+        compareThrowEngines("Throw: slot error caught in JS",
+                            "(function(){ try { obj.fail(); return 'no'; } catch(e) { return 'caught:' + e.message; } })()");
+        compareThrowEngines("Throw: slot error uncaught",
+                            "obj.fail()");
+        compareThrowEngines("Throw: typed slot error uncaught",
+                            "obj.failTyped()");
+        compareThrowEngines("Throw: value slot error uncaught",
+                            "obj.failValue()");
+        compareThrowEngines("Throw: getter error caught in JS",
+                            "(function(){ try { return 'got:' + obj.throwingProp; } catch(e) { return 'getter-caught:' + e.message; } })()");
+        compareThrowEngines("Throw: setter error caught in JS (strict)",
+                            "(function(){ 'use strict'; try { obj.throwingProp = 5; return 'set-ok'; } catch(e) { return 'setter-caught:' + e.message; } })()");
+        compareThrowEngines("Throw: setter error caught in JS (sloppy)",
+                            "(function(){ try { obj.throwingProp = 6; return 'set-ok'; } catch(e) { return 'setter-caught:' + e.message; } })()");
+        compareThrowEngines("Throw: default value throws undefined",
+                            "(function(){ try { obj.throwDefault(); return 'no'; } catch(e) { return 'caught-default:' + String(e); } })()");
+        compareThrowEngines("Throw: signal handler exception does not abort emission",
+                            "(function(){ obj.ping.connect(function(){ throw 'handler boom'; }); obj.emitPing(); return 'emit-ok'; })()");
+
+        // hasError() is already true inside the slot that threw
+        {
+            QJSEngine qtEng;
+            QQuickJSEngine qEng;
+            ThrowProbeObject qtObj, qObj;
+            qtObj.qtEngine = &qtEng;
+            qObj.qjsEngine = &qEng;
+            qtEng.globalObject().setProperty(QStringLiteral("obj"), qtEng.newQObject(&qtObj));
+            qEng.globalObject().setProperty(QStringLiteral("obj"), qEng.newQObject(&qObj));
+            QJSValue qtR = qtEng.evaluate(QStringLiteral("(function(){ try { obj.failAndRecord(); return 'no'; } catch(e) { return 'ok:' + e.message; } })()"));
+            QQuickJSValue qR = qEng.evaluate(QStringLiteral("(function(){ try { obj.failAndRecord(); return 'no'; } catch(e) { return 'ok:' + e.message; } })()"));
+            TEST_RESULT("Throw: hasError true inside the throwing slot",
+                        qtObj.sawError && qObj.sawError && !qtEng.hasError() && !qEng.hasError()
+                            && qtR.toString() == QLatin1String("ok:record boom") && qR.toString() == QLatin1String("ok:record boom"),
+                        QStringLiteral("Qt saw=%1 ours saw=%2").arg(qtObj.sawError).arg(qObj.sawError));
+        }
+
+        // --- QQuickJSEngine-specific delivery details ---
+        {
+            // The preempted evaluate reports the error through uncaughtException
+            QQuickJSEngine qEng;
+            int reports = 0;
+            QString msg;
+            QObject::connect(&qEng, &QQuickJSEngine::uncaughtException, [&](const QString& m, int) { reports++; msg = m; });
+            qEng.throwError(QStringLiteral("pending reported"));
+            QQuickJSValue r = qEng.evaluate(QStringLiteral("1 + 1"));
+            TEST_RESULT("Throw: preempted evaluate reports via uncaughtException",
+                        r.isError() && reports == 1 && msg.contains(QLatin1String("pending reported")),
+                        QStringLiteral("reports=%1 msg=%2").arg(reports).arg(msg));
+
+            // A value from another engine is rejected with a warning
+            QQuickJSEngine otherEngine;
+            QQuickJSValue foreign = otherEngine.newErrorObject(QQuickJSValue::TypeError, QStringLiteral("foreign"));
+            {
+                WarningCaptureGuard guard;
+                qEng.throwError(foreign);
+                TEST_RESULT("Throw: cross-engine value rejected with warning",
+                            !qEng.hasError() && !g_capturedWarnings.isEmpty()
+                                && g_capturedWarnings.first().contains(QLatin1String("another engine")),
+                            QStringLiteral("hasError=%1 warnings=%2").arg(qEng.hasError()).arg(g_capturedWarnings.size()));
+            }
+        }
+    }
+
+    // 21. QJSEngine Parity Stage 4: ES modules (importModule / registerModule)
+    {
+        QTemporaryDir moduleTmp;
+        QDir moduleDir(moduleTmp.path());
+        const QString modulePath = moduleDir.path();
+
+        auto writeModule = [&moduleDir](const QString& name, const QString& code) {
+            QFile f(moduleDir.filePath(name));
+            if (f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+                f.write(code.toUtf8());
+            }
+        };
+
+        writeModule(QStringLiteral("mod.mjs"),
+            "export const x = 42;\n"
+            "export function f(){ return 7; }\n"
+            "export default \"defval\";\n");
+        writeModule(QStringLiteral("counter.mjs"),
+            "export let n = 0;\n"
+            "export function bump(){ n++; return n; }\n");
+        writeModule(QStringLiteral("calls.mjs"),
+            "import { f } from \"./mod.mjs\";\n"
+            "export const seven = f();\n");
+        writeModule(QStringLiteral("bump1.mjs"),
+            "import { bump } from \"./counter.mjs\";\n"
+            "export const first = bump();\n");
+        writeModule(QStringLiteral("bump2.mjs"),
+            "import { bump } from \"./counter.mjs\";\n"
+            "export const second = bump();\n");
+        writeModule(QStringLiteral("meta.mjs"),
+            "export const hasUrl = 'url' in import.meta;\n"
+            "export const keyCount = Object.keys(import.meta).length;\n");
+        writeModule(QStringLiteral("synbad.mjs"), "export const x = ;\n");
+        writeModule(QStringLiteral("throws.mjs"), "throw new TypeError('module boom');\n");
+        writeModule(QStringLiteral("missingdep.mjs"),
+            "import { q } from \"./gone.mjs\";\n"
+            "export const q2 = 1;\n");
+        writeModule(QStringLiteral("circA.mjs"),
+            "import { getB } from \"./circB.mjs\";\n"
+            "export const a = 1;\n"
+            "export const bViaB = getB();\n");
+        writeModule(QStringLiteral("circB.mjs"),
+            "import { a } from \"./circA.mjs\";\n"
+            "export function getB(){ return 11; }\n"
+            "export function readA(){ return a; }\n");
+
+        // Both engines import @p entry; the namespace property @p prop is
+        // compared as a string. A null prop compares the import result itself
+        // (failure flags and error class; the Qt failure form varies between
+        // builds — normalized via moduleFailureClass()).
+        auto importParity = [&moduleDir](const char* name, const QString& entry, const char* prop) {
+            QJSEngine qtEng;
+            QQuickJSEngine qEng;
+            QJSValue qtRes = qtEng.importModule(entry);
+            QQuickJSValue qRes = qEng.importModule(entry);
+            const bool qtErr = qtRes.isError();
+            const bool qErr = qRes.isError();
+            if (qtErr || qErr) {
+                // QuickJS must return a real error; Qt may report the failure
+                // as an Error value or as a plain stringified value, so both
+                // sides are normalized through moduleFailureClass().
+                const int qtClass = moduleFailureClass(qtRes);
+                const int qClass = static_cast<int>(qRes.errorType());
+                TEST_RESULT(name,
+                            qErr && qClass != static_cast<int>(QJSValue::NoError) && qtClass == qClass,
+                            QStringLiteral("QJSEngine err=%1 (%2/%3), QuickJS err=%4 (%5/%6)")
+                                .arg(qtErr).arg(qtRes.toString()).arg(qtClass)
+                                .arg(qErr).arg(qRes.toString()).arg(qClass));
+            } else {
+                const QString qtV = prop ? qtRes.property(QLatin1String(prop)).toString()
+                                         : qtRes.toString();
+                const QString qV = prop ? qRes.property(QLatin1String(prop)).toString()
+                                        : qRes.toString();
+                TEST_RESULT(name, qtV == qV,
+                            QStringLiteral("QJSEngine='%1', QuickJS='%2'").arg(qtV).arg(qV));
+            }
+        };
+        const QString modPath = moduleDir.filePath(QStringLiteral("mod.mjs"));
+        const QString counterPath = moduleDir.filePath(QStringLiteral("counter.mjs"));
+
+        importParity("Module: namespace exports value", modPath, "x");
+        importParity("Module: default export property", modPath, "default");
+        importParity("Module: imported function call", moduleDir.filePath(QStringLiteral("calls.mjs")), "seven");
+        importParity("Module: nested import shares instance",
+                     moduleDir.filePath(QStringLiteral("bump1.mjs")), "first");
+        importParity("Module: nested import second caller",
+                     moduleDir.filePath(QStringLiteral("bump2.mjs")), "second");
+        importParity("Module: syntax error is SyntaxError",
+                     moduleDir.filePath(QStringLiteral("synbad.mjs")), nullptr);
+        importParity("Module: top-level throw propagates",
+                     moduleDir.filePath(QStringLiteral("throws.mjs")), nullptr);
+        importParity("Module: missing file is SyntaxError error class",
+                     moduleDir.filePath(QStringLiteral("nope.mjs")), nullptr);
+        importParity("Module: missing dependency is SyntaxError error class",
+                     moduleDir.filePath(QStringLiteral("missingdep.mjs")), nullptr);
+
+        // Singleton through the C++ entry: two importModule() calls and one
+        // cross-module import share one instance; different spellings of the
+        // same file (relative vs absolute) normalize to one cache key.
+        {
+            QJSEngine qtEng;
+            QQuickJSEngine qEng;
+            QJSValue qtNs = qtEng.importModule(counterPath);
+            QJSValue qtNs2 = qtEng.importModule(moduleDir.filePath(QStringLiteral("./counter.mjs")));
+            QQuickJSValue qNs = qEng.importModule(counterPath);
+            QQuickJSValue qNs2 = qEng.importModule(moduleDir.filePath(QStringLiteral("./counter.mjs")));
+            const QString qt1 = qtNs.property(QStringLiteral("bump")).call().toString();
+            const QString qt2 = qtNs2.property(QStringLiteral("bump")).call().toString();
+            const QString q1 = qNs.property(QStringLiteral("bump")).call().toString();
+            const QString q2 = qNs2.property(QStringLiteral("bump")).call().toString();
+            TEST_RESULT("Module: C++ singleton + path normalization",
+                        qt1 == q1 && qt2 == q2 && qt2.toInt() == 2 && q2.toInt() == 2,
+                        QStringLiteral("Qt %1/%2, QuickJS %3/%4").arg(qt1).arg(qt2).arg(q1).arg(q2));
+        }
+
+        // A module that threw at top level stays cached: the re-import returns
+        // its namespace without re-running the code.
+        {
+            const QString throwsPath = moduleDir.filePath(QStringLiteral("throws.mjs"));
+            QJSEngine qtEng;
+            QQuickJSEngine qEng;
+            (void)qtEng.importModule(throwsPath);
+            (void)qEng.importModule(throwsPath);
+            const bool qtAgain = qtEng.importModule(throwsPath).isError();
+            const bool qAgain = qEng.importModule(throwsPath).isError();
+            TEST_RESULT("Module: failed module is not re-imported", !qtAgain && !qAgain,
+                        QStringLiteral("Qt err=%1, QuickJS err=%2").arg(qtAgain).arg(qAgain));
+        }
+
+        // import declarations are not valid classic scripts on either engine.
+        compareEngines("Module: import statement is script syntax error",
+                       "import { x } from \"./mod.mjs\";");
+
+        // qrc modules: the same ":/..." path on both engines.
+        importParity("Module: qrc resource import",
+                     QStringLiteral(":/qjsmodules/modules/embedded.mjs"), "x");
+
+        // ---- registerModule ----
+        {
+            QJSEngine qtEng;
+            QQuickJSEngine qEng;
+            QJSValue qtVal = qtEng.evaluate(QStringLiteral("({ a: 1, b: 'x' })"));
+            QQuickJSValue qVal = qEng.evaluate(QStringLiteral("({ a: 1, b: 'x' })"));
+            const bool qtOk = qtEng.registerModule(QStringLiteral("regmod.mjs"), qtVal);
+            const bool qOk = qEng.registerModule(QStringLiteral("regmod.mjs"), qVal);
+            writeModule(QStringLiteral("usereg.mjs"),
+                "import v, { a, b } from \"regmod.mjs\";\n"
+                "export const ok = (a === 1 && b === 'x' && v.a === 1);\n");
+            const QString usePath = moduleDir.filePath(QStringLiteral("usereg.mjs"));
+            QJSValue qtNs = qtEng.importModule(usePath);
+            QQuickJSValue qNs = qEng.importModule(usePath);
+            TEST_RESULT("RegModule: named + default exports",
+                        qtOk && qOk && !qtNs.isError() && !qNs.isError()
+                            && qtNs.property(QStringLiteral("ok")).toBool()
+                            && qNs.property(QStringLiteral("ok")).toBool(),
+                        QStringLiteral("register %1/%2, ok %3/%4")
+                            .arg(qtOk).arg(qOk)
+                            .arg(qtNs.property(QStringLiteral("ok")).toBool())
+                            .arg(qNs.property(QStringLiteral("ok")).toBool()));
+        }
+
+        // Registered modules are matched by the bare specifier from any
+        // importer location (verified against live Qt 6.12).
+        {
+            moduleDir.mkdir(QStringLiteral("sub"));
+            writeModule(QStringLiteral("sub/usereg.mjs"),
+                "import v, { a } from \"regmod.mjs\";\n"
+                "export const ok = (a === 1 && v.a === 1);\n");
+            const QString subPath = moduleDir.filePath(QStringLiteral("sub/usereg.mjs"));
+            importParity("RegModule: bare name from subdir", subPath, "ok");
+        }
+
+        // Non-object values: the default export is the value itself.
+        {
+            QJSEngine qtEng;
+            QQuickJSEngine qEng;
+            (void)qtEng.registerModule(QStringLiteral("numreg.mjs"), qtEng.toScriptValue(42));
+            (void)qEng.registerModule(QStringLiteral("numreg.mjs"), qEng.toScriptValue(42));
+            writeModule(QStringLiteral("usenum.mjs"),
+                "import n from \"numreg.mjs\";\n"
+                "export const N = n;\n");
+            importParity("RegModule: number default export",
+                         moduleDir.filePath(QStringLiteral("usenum.mjs")), "N");
+            writeModule(QStringLiteral("usenumbad.mjs"),
+                "import { x } from \"numreg.mjs\";\n"
+                "export const X = x;\n");
+            importParity("RegModule: named import from number errors",
+                         moduleDir.filePath(QStringLiteral("usenumbad.mjs")), nullptr);
+        }
+
+        // Snapshot: values (and getter results) are read at registration time.
+        {
+            QJSEngine qtEng;
+            QQuickJSEngine qEng;
+            QJSValue qtVal = qtEng.evaluate(QStringLiteral("({ v: 1 })"));
+            QQuickJSValue qVal = qEng.evaluate(QStringLiteral("({ v: 1 })"));
+            (void)qtEng.registerModule(QStringLiteral("snapmod.mjs"), qtVal);
+            (void)qEng.registerModule(QStringLiteral("snapmod.mjs"), qVal);
+            qtVal.setProperty(QStringLiteral("v"), 99);
+            qVal.setProperty(QStringLiteral("v"), 99);
+            writeModule(QStringLiteral("usesnap.mjs"),
+                "import { v } from \"snapmod.mjs\";\n"
+                "export const V = v;\n");
+            importParity("RegModule: snapshot at registration",
+                         moduleDir.filePath(QStringLiteral("usesnap.mjs")), "V");
+        }
+
+        // Non-enumerable properties are not exported as named exports, but
+        // remain reachable through the default export.
+        {
+            QJSEngine qtEng;
+            QQuickJSEngine qEng;
+            const char* src = "(function(){ var o = { e: 1 }; "
+                              "Object.defineProperty(o, 'hidden', { value: 5, enumerable: false }); "
+                              "return o; })()";
+            QJSValue qtVal = qtEng.evaluate(QString::fromUtf8(src));
+            QQuickJSValue qVal = qEng.evaluate(QString::fromUtf8(src));
+            (void)qtEng.registerModule(QStringLiteral("hiddenmod.mjs"), qtVal);
+            (void)qEng.registerModule(QStringLiteral("hiddenmod.mjs"), qVal);
+            writeModule(QStringLiteral("usehidden.mjs"),
+                "import h, { e } from \"hiddenmod.mjs\";\n"
+                "export const E = e;\n"
+                "export const hasHidden = 'hidden' in h;\n");
+            importParity("RegModule: non-enumerable via default only",
+                         moduleDir.filePath(QStringLiteral("usehidden.mjs")), "E");
+            {
+                QJSEngine qtEng2;
+                QQuickJSEngine qEng2;
+                QJSValue qtVal2 = qtEng2.evaluate(QString::fromUtf8(src));
+                QQuickJSValue qVal2 = qEng2.evaluate(QString::fromUtf8(src));
+                (void)qtEng2.registerModule(QStringLiteral("hiddenmod.mjs"), qtVal2);
+                (void)qEng2.registerModule(QStringLiteral("hiddenmod.mjs"), qVal2);
+                QJSValue qtNs = qtEng2.importModule(moduleDir.filePath(QStringLiteral("usehidden.mjs")));
+                QQuickJSValue qNs = qEng2.importModule(moduleDir.filePath(QStringLiteral("usehidden.mjs")));
+                TEST_RESULT("RegModule: non-enumerable reachable via default",
+                            qtNs.property(QStringLiteral("hasHidden")).toBool()
+                                && qNs.property(QStringLiteral("hasHidden")).toBool(),
+                            QStringLiteral("Qt %1, QuickJS %2")
+                                .arg(qtNs.property(QStringLiteral("hasHidden")).toBool())
+                                .arg(qNs.property(QStringLiteral("hasHidden")).toBool()));
+            }
+        }
+
+        // Re-registration with the same name: the new value wins for new
+        // imports (verified against live Qt 6.12).
+        {
+            QJSEngine qtEng;
+            QQuickJSEngine qEng;
+            (void)qtEng.registerModule(QStringLiteral("dupmod.mjs"), qtEng.evaluate(QStringLiteral("({ who: 'first' })")));
+            (void)qEng.registerModule(QStringLiteral("dupmod.mjs"), qEng.evaluate(QStringLiteral("({ who: 'first' })")));
+            (void)qtEng.registerModule(QStringLiteral("dupmod.mjs"), qtEng.evaluate(QStringLiteral("({ who: 'second' })")));
+            (void)qEng.registerModule(QStringLiteral("dupmod.mjs"), qEng.evaluate(QStringLiteral("({ who: 'second' })")));
+            writeModule(QStringLiteral("usedup.mjs"),
+                "import d from \"dupmod.mjs\";\n"
+                "export const W = d.who;\n");
+            importParity("RegModule: re-registration replaces",
+                         moduleDir.filePath(QStringLiteral("usedup.mjs")), "W");
+        }
+
+        // A "default" property on the value is ignored: the default export is
+        // the value itself, like QJSEngine (code-review regression test).
+        {
+            QJSEngine qtEng;
+            QQuickJSEngine qEng;
+            const char* src = "({ a: 1, dflt: 9, default: 'ownprop' })";
+            (void)qtEng.registerModule(QStringLiteral("defmod.mjs"), qtEng.evaluate(QString::fromUtf8(src)));
+            (void)qEng.registerModule(QStringLiteral("defmod.mjs"), qEng.evaluate(QString::fromUtf8(src)));
+            writeModule(QStringLiteral("usedef.mjs"),
+                "import v, { a } from \"defmod.mjs\";\n"
+                "export const ok = (v.a === 1 && v.dflt === 9 && v.default === 'ownprop');\n");
+            importParity("RegModule: value 'default' property ignored",
+                         moduleDir.filePath(QStringLiteral("usedef.mjs")), "ok");
+        }
+
+        // A throwing getter fails the registration and leaves the exception
+        // pending; the next import surfaces it (live Qt 6.12 behavior).
+        {
+            QJSEngine qtEng;
+            QQuickJSEngine qEng;
+            const bool qtOk = qtEng.registerModule(QStringLiteral("getmod.mjs"),
+                qtEng.evaluate(QStringLiteral("({ get g(){ throw new TypeError('getter-boom'); }, p: 5 })")));
+            const bool qOk = qEng.registerModule(QStringLiteral("getmod.mjs"),
+                qEng.evaluate(QStringLiteral("({ get g(){ throw new TypeError('getter-boom'); }, p: 5 })")));
+            writeModule(QStringLiteral("useget.mjs"),
+                "import { p } from \"getmod.mjs\";\n"
+                "export const P = p;\n");
+            QJSValue qtRes = qtEng.importModule(moduleDir.filePath(QStringLiteral("useget.mjs")));
+            QQuickJSValue qRes = qEng.importModule(moduleDir.filePath(QStringLiteral("useget.mjs")));
+            TEST_RESULT("RegModule: throwing getter fails registration",
+                        !qtOk && !qOk && qtRes.isError() && qRes.isError()
+                            && qtRes.errorType() == QJSValue::TypeError
+                            && qRes.errorType() == QQuickJSValue::TypeError
+                            && qtRes.toString() == qRes.toString(),
+                        QStringLiteral("register %1/%2, import '%3' vs '%4'")
+                            .arg(qtOk).arg(qOk).arg(qtRes.toString()).arg(qRes.toString()));
+        }
+
+        // Registered name vs a same-named real file: the bare specifier uses
+        // the registration, the relative specifier uses the file.
+        {
+            writeModule(QStringLiteral("coexist.mjs"), "export const src = 'from-file';\n");
+            writeModule(QStringLiteral("usecoexist.mjs"),
+                "import { src } from \"coexist.mjs\";\n"
+                "export const S = src;\n");
+            writeModule(QStringLiteral("usecoexistrel.mjs"),
+                "import { src } from \"./coexist.mjs\";\n"
+                "export const S = src;\n");
+            {
+                QJSEngine qtEng;
+                QQuickJSEngine qEng;
+                (void)qtEng.registerModule(QStringLiteral("coexist.mjs"),
+                    qtEng.evaluate(QStringLiteral("({ src: 'from-register' })")));
+                (void)qEng.registerModule(QStringLiteral("coexist.mjs"),
+                    qEng.evaluate(QStringLiteral("({ src: 'from-register' })")));
+                QJSValue qtNs = qtEng.importModule(moduleDir.filePath(QStringLiteral("usecoexist.mjs")));
+                QQuickJSValue qNs = qEng.importModule(moduleDir.filePath(QStringLiteral("usecoexist.mjs")));
+                TEST_RESULT("RegModule: bare name beats same-named file",
+                            qtNs.property(QStringLiteral("S")).toString() == QLatin1String("from-register")
+                                && qNs.property(QStringLiteral("S")).toString() == QLatin1String("from-register"),
+                            QStringLiteral("Qt '%1', QuickJS '%2'")
+                                .arg(qtNs.property(QStringLiteral("S")).toString())
+                                .arg(qNs.property(QStringLiteral("S")).toString()));
+            }
+            importParity("RegModule: relative path beats registration",
+                         moduleDir.filePath(QStringLiteral("usecoexistrel.mjs")), "S");
+        }
+
+        // Registered modules are not visible through the global object and
+        // not importable through importModule() by their registered name.
+        {
+            QJSEngine qtEng;
+            QQuickJSEngine qEng;
+            (void)qtEng.registerModule(QStringLiteral("globmod.mjs"), qtEng.evaluate(QStringLiteral("({ g: 1 })")));
+            (void)qEng.registerModule(QStringLiteral("globmod.mjs"), qEng.evaluate(QStringLiteral("({ g: 1 })")));
+            const bool qtHidden = qtEng.globalObject().property(QStringLiteral("globmod.mjs")).isUndefined();
+            const bool qHidden = qEng.globalObject().property(QStringLiteral("globmod.mjs")).isUndefined();
+            const bool qtByImport = qtEng.importModule(QStringLiteral("globmod.mjs")).isError();
+            const bool qByImport = qEng.importModule(QStringLiteral("globmod.mjs")).isError();
+            TEST_RESULT("RegModule: invisible to global object and importModule",
+                        qtHidden && qHidden && qtByImport && qByImport,
+                        QStringLiteral("hidden %1/%2, import error %3/%4")
+                            .arg(qtHidden).arg(qHidden).arg(qtByImport).arg(qByImport));
+        }
+
+        // Relative specifiers never resolve to registered modules.
+        {
+            QJSEngine qtEng;
+            QQuickJSEngine qEng;
+            (void)qtEng.registerModule(QStringLiteral("relreg.mjs"), qtEng.evaluate(QStringLiteral("({ r: 8 })")));
+            (void)qEng.registerModule(QStringLiteral("relreg.mjs"), qEng.evaluate(QStringLiteral("({ r: 8 })")));
+            writeModule(QStringLiteral("userelreg.mjs"),
+                "import { r } from \"./relreg.mjs\";\n"
+                "export const R = r;\n");
+            importParity("RegModule: relative specifier bypasses registry",
+                         moduleDir.filePath(QStringLiteral("userelreg.mjs")), nullptr);
+        }
+
+        // ---- QuickJSEngine-specific module behavior ----
+        {
+            // Code-review regression: a dependency loaded during a failed
+            // import chain (its importer failed at another missing import)
+            // sits in the cache compiled but not instantiated; importing it
+            // afterwards must evaluate and return its namespace.
+            {
+                writeModule(QStringLiteral("chainA.mjs"),
+                    "import { x } from \"./chainB.mjs\";\n"
+                    "import { q } from \"./gone.mjs\";\n"
+                    "export const r = x;\n");
+                writeModule(QStringLiteral("chainB.mjs"), "export const x = 7;\n");
+                QQuickJSEngine qEng;
+                QQuickJSValue chainAResult = qEng.importModule(moduleDir.filePath(QStringLiteral("chainA.mjs")));
+                QQuickJSValue late = qEng.importModule(moduleDir.filePath(QStringLiteral("chainB.mjs")));
+                TEST_RESULT("Module: dependency of failed chain importable",
+                            chainAResult.isError() && !late.isError()
+                                && late.property(QStringLiteral("x")).toInt() == 7,
+                            QStringLiteral("chainA: %1, chainB: %2")
+                                .arg(chainAResult.toString()).arg(late.toString()));
+            }
+
+            // Code-review regression: an expired execution-timeout deadline
+            // must not interrupt the getter reads of a later registration.
+            {
+                QQuickJSEngine qEng;
+                qEng.setExecutionTimeoutMs(1);
+                (void)qEng.evaluate(QStringLiteral(
+                    "var t = Date.now(); while (Date.now() - t < 30);"));
+                const bool ok = qEng.registerModule(QStringLiteral("deadlinemod.mjs"),
+                    qEng.evaluate(QStringLiteral("({ get v() { return 11; } })")));
+                writeModule(QStringLiteral("usedeadline.mjs"),
+                    "import { v } from \"deadlinemod.mjs\";\n"
+                    "export const V = v;\n");
+                QQuickJSValue ns = qEng.importModule(moduleDir.filePath(QStringLiteral("usedeadline.mjs")));
+                TEST_RESULT("RegModule: expired deadline does not interrupt snapshot",
+                            ok && !ns.isError() && ns.property(QStringLiteral("V")).toInt() == 11,
+                            QStringLiteral("register=%1 V=%2")
+                                .arg(ok).arg(ns.property(QStringLiteral("V")).toInt()));
+            }
+
+            // Error details: the message names the missing file, and the
+            // engine state is clean afterwards (hasError() false).
+            QQuickJSEngine qEng;
+            QQuickJSValue r = qEng.importModule(moduleDir.filePath(QStringLiteral("gone.mjs")));
+            TEST_RESULT("Module: missing file message names the file",
+                        r.isError() && r.toString().contains(QLatin1String("gone.mjs"))
+                            && !qEng.hasError(),
+                        QStringLiteral("result: %1, hasError=%2").arg(r.toString()).arg(qEng.hasError()));
+
+            // A sticky interrupt flag yields an "Interrupted" error object.
+            QQuickJSEngine qEng2;
+            qEng2.setInterrupted(true);
+            QQuickJSValue r2 = qEng2.importModule(modPath);
+            TEST_RESULT("Module: interrupted import yields Interrupted",
+                        r2.isError() && r2.toString().contains(QLatin1String("Interrupted")),
+                        QStringLiteral("result: %1").arg(r2.toString()));
+
+            // Values from another engine are rejected with a warning.
+            QQuickJSEngine qEng3;
+            QQuickJSEngine otherEngine;
+            {
+                WarningCaptureGuard guard;
+                const bool rejected = !qEng3.registerModule(QStringLiteral("foreign.mjs"),
+                                                            otherEngine.newObject());
+                TEST_RESULT("RegModule: cross-engine value rejected",
+                            rejected && !g_capturedWarnings.isEmpty()
+                                && g_capturedWarnings.first().contains(QLatin1String("another engine")),
+                            QStringLiteral("rejected=%1 warnings=%2")
+                                .arg(rejected).arg(g_capturedWarnings.size()));
+            }
+            // Uninitialized values are rejected the same way.
+            {
+                WarningCaptureGuard guard;
+                const bool rejected = !qEng3.registerModule(QStringLiteral("invalid.mjs"), QQuickJSValue());
+                TEST_RESULT("RegModule: invalid value rejected",
+                            rejected && !g_capturedWarnings.isEmpty(),
+                            QStringLiteral("rejected=%1 warnings=%2")
+                                .arg(rejected).arg(g_capturedWarnings.size()));
+            }
+
+            // Circular imports follow the ECMAScript specification (V4 fails
+            // to load circular modules at all - documented divergence).
+            QQuickJSEngine qEng4;
+            QQuickJSValue circA = qEng4.importModule(moduleDir.filePath(QStringLiteral("circA.mjs")));
+            QQuickJSValue circB = qEng4.importModule(moduleDir.filePath(QStringLiteral("circB.mjs")));
+            TEST_RESULT("Module: circular imports (spec semantics, beyond Qt)",
+                        !circA.isError() && !circB.isError()
+                            && circA.property(QStringLiteral("a")).toInt() == 1
+                            && circA.property(QStringLiteral("bViaB")).toInt() == 11
+                            && circB.property(QStringLiteral("readA")).call().toInt() == 1,
+                        QStringLiteral("a=%1 bViaB=%2 readA()=%3")
+                            .arg(circA.property(QStringLiteral("a")).toInt())
+                            .arg(circA.property(QStringLiteral("bViaB")).toInt())
+                            .arg(circB.property(QStringLiteral("readA")).call().toInt()));
+
+            // import.meta: quickjs-ng implements the ES2020 object; live
+            // QJSEngine 6.12 rejects any import.meta use with a SyntaxError
+            // (documented divergence: our behavior follows the specification).
+            QQuickJSValue meta = qEng4.importModule(moduleDir.filePath(QStringLiteral("meta.mjs")));
+            TEST_RESULT("Module: import.meta object (spec semantics, beyond Qt)",
+                        !meta.isError()
+                            && !meta.property(QStringLiteral("hasUrl")).toBool()
+                            && meta.property(QStringLiteral("keyCount")).toInt() == 0,
+                        QStringLiteral("hasUrl=%1 keyCount=%2")
+                            .arg(meta.property(QStringLiteral("hasUrl")).toBool())
+                            .arg(meta.property(QStringLiteral("keyCount")).toInt()));
+
+            // Top-level await (unsupported by QJSEngine 6.12; quickjs-ng
+            // implements the ES2022 behavior) resolves through the microtask
+            // queue that importModule() pumps by default.
+            writeModule(QStringLiteral("tla.mjs"),
+                "export const x = await Promise.resolve(42);\n");
+            QQuickJSValue tla = qEng4.importModule(moduleDir.filePath(QStringLiteral("tla.mjs")));
+            TEST_RESULT("Module: top-level await (spec semantics, beyond Qt)",
+                        !tla.isError() && tla.property(QStringLiteral("x")).toInt() == 42,
+                        QStringLiteral("result: %1").arg(tla.toString()));
+
+            // Dynamic import() works inside evaluate() scripts (a SyntaxError
+            // on QJSEngine - documented beyond-parity extra); both file
+            // modules and registered modules can be requested.
+            (void)qEng4.registerModule(QStringLiteral("regdyn.mjs"),
+                                       qEng4.evaluate(QStringLiteral("({ d: 'dyn' })")));
+            const QString dynScript = QStringLiteral(
+                "globalThis.res = 'pending';\n"
+                "globalThis.res2 = 'pending';\n"
+                "import('%1').then(function(m){ globalThis.res = m.x; });\n"
+                "import('regdyn.mjs').then(function(m){ globalThis.res2 = m.d; });\n").arg(modPath);
+            (void)qEng4.evaluate(dynScript);
+            TEST_RESULT("Module: dynamic import() in scripts (beyond Qt)",
+                        qEng4.globalObject().property(QStringLiteral("res")).toInt() == 42
+                            && qEng4.globalObject().property(QStringLiteral("res2")).toString() == QLatin1String("dyn"),
+                        QStringLiteral("res=%1 res2=%2")
+                            .arg(qEng4.globalObject().property(QStringLiteral("res")).toString())
+                            .arg(qEng4.globalObject().property(QStringLiteral("res2")).toString()));
+
+            // Registered modules without a .mjs suffix are importable too
+            // (QJSEngine rejects the import - documented divergence).
+            QQuickJSEngine qEng5;
+            (void)qEng5.registerModule(QStringLiteral("plainmod"), qEng5.evaluate(QStringLiteral("({ c: 3 })")));
+            writeModule(QStringLiteral("useplain.mjs"),
+                "import { c } from \"plainmod\";\n"
+                "export const C = c;\n");
+            QQuickJSValue plain = qEng5.importModule(moduleDir.filePath(QStringLiteral("useplain.mjs")));
+            TEST_RESULT("RegModule: non-mjs name importable (beyond Qt)",
+                        !plain.isError() && plain.property(QStringLiteral("C")).toInt() == 3,
+                        QStringLiteral("result: %1").arg(plain.toString()));
+        }
+
+        // Relative fileName resolution against the current working directory.
+        {
+            const QString oldCwd = QDir::currentPath();
+            QDir::setCurrent(modulePath);
+            auto cwdGuard = qScopeGuard([oldCwd]() { QDir::setCurrent(oldCwd); });
+            importParity("Module: relative fileName against CWD",
+                         QStringLiteral("counter.mjs"), "n");
+        }
+    }
+
+    // 22. Final Engine Stats
     qInfo().noquote() << QStringLiteral("\n=== ENGINE INFO ===");
     qInfo().noquote() << QStringLiteral("QuickJS Version:") << QQuickJSEngine::version();
     {
@@ -1652,9 +3178,12 @@ static void runAllTests(const bool runDangerous) {
 int main(int argc, char *argv[]) {
     QCoreApplication a(argc, argv);
 
+    // Module files for the importModule() qrc tests (see qjsmodules.qrc)
+    Q_INIT_RESOURCE(qjsmodules);
+
     const bool runDangerous = !a.arguments().contains(QStringLiteral("--skip-dangerous"));
 
-    // Check whether the serial-run mode is enabled via the .pro file
+    // Stress mode: set at build time via the SERIAL_TEST_RUNS option
 #ifdef SERIAL_TEST_RUNS
     int runs = SERIAL_TEST_RUNS;
 #else

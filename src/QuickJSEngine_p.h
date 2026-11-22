@@ -185,13 +185,17 @@ static inline void clearPendingException(JSContext* ctx) {
 static inline bool safeMetacall(JSContext* ctx, QObject* obj, QMetaObject::Call call, int idx, void** args) {
     try {
         QMetaObject::metacall(obj, call, idx, args);
-        return true;
     } catch (const std::exception& e) {
         try { JS_ThrowPlainError(ctx, "C++ exception in meta-call: %s", e.what()); } catch (...) {}
     } catch (...) {
         try { JS_ThrowInternalError(ctx, "Unknown C++ exception in meta-call"); } catch (...) {}
     }
-    return false;
+    // The called C++ code may have thrown a JS exception via
+    // QQuickJSEngine::throwError(). Propagate it: callers translate false
+    // into JS_EXCEPTION, which keeps the pending exception intact for the
+    // interpreter instead of returning a value that would silently swallow
+    // it (a stale pending exception corrupts hasError()/catchError()).
+    return !JS_HasException(ctx);
 }
 
 enum class PropertyCacheState { Invalid = -1, Dynamic = -2 };

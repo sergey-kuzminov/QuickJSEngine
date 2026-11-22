@@ -2,8 +2,8 @@
 #include <QDebug>
 #include <QObject>
 
-// Uncomment DEFINES += USE_QT_JSENGINE in example.pro to build this example
-// against the stock Qt QJSEngine instead of QQuickJSEngine.
+// Build with -DUSE_QT_JSENGINE=ON (CMake) to compile this example against
+// the stock Qt QJSEngine instead of QQuickJSEngine.
 
 #ifdef USE_QT_JSENGINE
 #include <QJSEngine>

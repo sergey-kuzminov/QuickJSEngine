@@ -15,6 +15,8 @@
 
 #include <ranges>
 
+#include "QuickJSValue.h"
+
 class QQuickJSEngine;
 
 // Cycle detection for JS -> QVariant conversion. At any moment the stack
@@ -50,7 +52,8 @@ public:
 
     static QVariant variantFromJSObject(QQuickJSEngine* engine, JSContext* ctx, JSValueConst val,
                                         JSClassID qobjectClassID, JSClassID objectClassID,
-                                        JSVisitedStack& visited, int depth);
+                                        JSVisitedStack& visited, int depth,
+                                        QQuickJSValue::ObjectConversionBehavior behavior);
     static JSAtom cachedStringAtom(QQuickJSEngine* engine, JSContext* ctx, const QString& key);
     static JSValue mapToJSObject(QQuickJSEngine* engine, JSContext* ctx, const QVariantMap* mapPtr, int depth);
     static JSValue hashToJSObject(QQuickJSEngine* engine, JSContext* ctx, const QVariantHash* hashPtr, int depth);

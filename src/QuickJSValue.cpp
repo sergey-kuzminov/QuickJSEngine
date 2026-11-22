@@ -27,6 +27,14 @@ void QQuickJSValue::ensureEngineThread() const {
 QQuickJSValue QQuickJSValue::executeJsCall(QQuickJSEngine* engine, JSContext* c, JSValueConst funcVal,
                                            JSValueConst* jsArgs, int argc,
                                            const QQuickJSValue& thisObj, bool isConstructor) {
+    // QJSEngine parity: a pending exception (e.g. throwError() called from
+    // C++ between executions) preempts the call: the function is not invoked
+    // and the pending error is returned. Like QJSValue::call(), the error is
+    // only returned, never reported through uncaughtException.
+    if (JS_HasException(c)) {
+        return QQuickJSValue::fromException(engine);
+    }
+
     const bool topLevel = (engine->m_evalDepth == 0);
     if (topLevel) {
         engine->resetExecutionState();
@@ -52,6 +60,13 @@ QQuickJSValue QQuickJSValue::executeJsCall(QQuickJSEngine* engine, JSContext* c,
 
     if (engine->m_autoProcessPromises && JS_IsJobPending(engine->m_rt)) {
         engine->processPendingJobs();
+    }
+
+    // QJSEngine parity: a sticky interrupt flag yields an "Interrupted" error
+    // object for calls and constructions, even when the function body itself
+    // completed without hitting an interrupt check.
+    if (engine->isInterrupted()) {
+        return engine->newErrorObject(QQuickJSValue::GenericError, QStringLiteral("Interrupted"));
     }
 
     if (hadException) {
@@ -180,6 +195,57 @@ bool QQuickJSValue::isNull() const {
 
 bool QQuickJSValue::isUndefined() const {
     return JS_IsUndefined(m_val);
+}
+
+bool QQuickJSValue::isRegExp() const {
+    if (!ctx()) return false;
+    return JS_IsRegExp(m_val);
+}
+
+bool QQuickJSValue::isDate() const {
+    if (!ctx()) return false;
+    return JS_IsDate(m_val);
+}
+
+bool QQuickJSValue::isQObject() const {
+    JSContext* c = ctx();
+    if (!c || !JS_IsObject(m_val)) return false;
+    return JS_GetOpaque(m_val, m_engine->m_qobjectClassID) != nullptr;
+}
+
+bool QQuickJSValue::isSymbol() const {
+    return JS_IsSymbol(m_val);
+}
+
+bool QQuickJSValue::isPromise() const {
+    if (!ctx()) return false;
+    return JS_IsPromise(m_val);
+}
+
+QQuickJSValue::ErrorType QQuickJSValue::errorType() const {
+    ensureEngineThread();
+    if (!isError()) return NoError;
+
+    JSContext* c = ctx();
+    if (!c) return NoError;
+
+    ScopedJSValue nameVal(c, JS_GetProperty(c, m_val, m_engine.data()->m_atoms.name));
+    if (JS_IsException(nameVal.value())) {
+        clearPendingException(c);
+        return GenericError;
+    }
+
+    // jsToQString clears the pending exception itself on failure.
+    const QString name = QuickJSConvert::jsToQString(c, nameVal.value());
+    if (name.isNull()) return GenericError;
+
+    if (name == QLatin1String("EvalError")) return EvalError;
+    if (name == QLatin1String("RangeError")) return RangeError;
+    if (name == QLatin1String("ReferenceError")) return ReferenceError;
+    if (name == QLatin1String("SyntaxError")) return SyntaxError;
+    if (name == QLatin1String("TypeError")) return TypeError;
+    if (name == QLatin1String("URIError")) return URIError;
+    return GenericError;
 }
 
 QQuickJSValue QQuickJSValue::fromException(QQuickJSEngine* engine) {
@@ -315,6 +381,20 @@ int QQuickJSValue::toInt() const {
     return i;
 }
 
+quint32 QQuickJSValue::toUInt() const {
+    ensureEngineThread();
+    JSContext* c = ctx();
+    if (!c) return 0;
+    // ToUint32 wraps negative numbers like QJSEngine::toUInt() does.
+    if (JS_VALUE_GET_TAG(m_val) == JS_TAG_INT) return static_cast<quint32>(JS_VALUE_GET_INT(m_val));
+    uint32_t u = 0;
+    if (JS_ToUint32(c, &u, m_val) < 0) {
+        clearPendingException(c);
+        return 0;
+    }
+    return u;
+}
+
 bool QQuickJSValue::toBool() const {
     ensureEngineThread();
     JSContext* c = ctx();
@@ -401,12 +481,50 @@ QQuickJSValue QQuickJSValue::call(const QList<QQuickJSValue>& args, const QQuick
     return executeJsCall(jsEngine, c, m_val, jsArgs.data(), argc, thisObj, false);
 }
 
+QQuickJSValue QQuickJSValue::callWithInstance(const QQuickJSValue& instance, const QVariantList& args) {
+    QQuickJSEngine* jsEngine = m_engine.data();
+    if (!jsEngine) return QQuickJSValue();
+    // QJSEngine semantics: a non-object instance binds the global object as
+    // 'this' instead of the primitive value.
+    return call(args, instance.isObject() ? instance : jsEngine->globalObject());
+}
+
+QQuickJSValue QQuickJSValue::callWithInstance(const QQuickJSValue& instance, const QList<QQuickJSValue>& args) {
+    QQuickJSEngine* jsEngine = m_engine.data();
+    if (!jsEngine) return QQuickJSValue();
+    return call(args, instance.isObject() ? instance : jsEngine->globalObject());
+}
+
 QVariant QQuickJSValue::toVariant() const {
     const JSContext* c = ctx();
     if (!c) return QVariant();
     QQuickJSEngine* jsEngine = m_engine.data();
     ensureEngineThread();
     return jsEngine->toVariant(m_val);
+}
+
+QVariant QQuickJSValue::toVariant(ObjectConversionBehavior behavior) const {
+    const JSContext* c = ctx();
+    if (!c) return QVariant();
+    QQuickJSEngine* jsEngine = m_engine.data();
+    ensureEngineThread();
+    return jsEngine->toVariant(m_val, behavior);
+}
+
+QDateTime QQuickJSValue::toDateTime() const {
+    ensureEngineThread();
+    if (!isValid() || !JS_IsDate(m_val)) return QDateTime();
+    // The shared object conversion path already maps Date objects to local
+    // time QDateTime and invalid dates to an invalid QDateTime.
+    return toVariant().toDateTime();
+}
+
+QObject* QQuickJSValue::toQObject() const {
+    ensureEngineThread();
+    JSContext* c = ctx();
+    if (!c || !JS_IsObject(m_val)) return nullptr;
+    const auto* data = static_cast<const JSQObjectData*>(JS_GetOpaque(m_val, m_engine->m_qobjectClassID));
+    return data ? data->obj.data() : nullptr;
 }
 
 bool QQuickJSValue::hasProperty(const char* name) const {
@@ -510,6 +628,93 @@ bool QQuickJSValue::deleteProperty(const QString& name) {
     return res == 1;
 }
 
+bool QQuickJSValue::hasOwnProperty(const char* name) const {
+    ensureEngineThread();
+    if (!isValid() || !name) return false;
+    JSContext* c = ctx();
+
+    ScopedJSAtom atom(c, name);
+    if (!atom.isValid()) {
+        clearPendingException(c);
+        return false;
+    }
+
+    JSPropertyDescriptor desc;
+    const int res = JS_GetOwnProperty(c, &desc, m_val, atom);
+    if (res < 0) {
+        clearPendingException(c);
+        return false;
+    }
+    if (res == 0) return false;
+
+    // Accessor descriptors also carry owned getter/setter refs (they are
+    // JS_UNDEFINED for data properties); mirror the engine's js_free_desc().
+    JS_FreeValue(c, desc.value);
+    JS_FreeValue(c, desc.getter);
+    JS_FreeValue(c, desc.setter);
+    return true;
+}
+
+bool QQuickJSValue::hasOwnProperty(const QByteArray& name) const {
+    return hasOwnProperty(name.constData());
+}
+
+bool QQuickJSValue::hasOwnProperty(QStringView name) const {
+    return hasOwnProperty(name.toString());
+}
+
+bool QQuickJSValue::hasOwnProperty(const QString& name) const {
+    ensureEngineThread();
+    if (!isValid()) return false;
+    JSContext* c = ctx();
+
+    JSAtom atom = QuickJSConvert::cachedStringAtom(m_engine.data(), c, name);
+    if (atom == JS_ATOM_NULL) {
+        clearPendingException(c);
+        return false;
+    }
+
+    JSPropertyDescriptor desc;
+    const int res = JS_GetOwnProperty(c, &desc, m_val, atom);
+    JS_FreeAtom(c, atom);
+    if (res < 0) {
+        clearPendingException(c);
+        return false;
+    }
+    if (res == 0) return false;
+
+    // Accessor descriptors also carry owned getter/setter refs (they are
+    // JS_UNDEFINED for data properties); mirror the engine's js_free_desc().
+    JS_FreeValue(c, desc.value);
+    JS_FreeValue(c, desc.getter);
+    JS_FreeValue(c, desc.setter);
+    return true;
+}
+
+QQuickJSValue QQuickJSValue::prototype() const {
+    ensureEngineThread();
+    if (!isValid() || !JS_IsObject(m_val)) return QQuickJSValue();
+    JSContext* c = ctx();
+    JSValue proto = JS_GetPrototype(c, m_val);
+    if (JS_IsException(proto)) {
+        return fromException(m_engine.data());
+    }
+    return QQuickJSValue(m_engine.data(), proto, true);
+}
+
+void QQuickJSValue::setPrototype(const QQuickJSValue& prototype) {
+    ensureEngineThread();
+    if (!isValid() || !JS_IsObject(m_val)) return;
+    if (!isSameContext(prototype)) return;
+    // Only an object or JS null is a valid prototype; anything else is
+    // ignored, matching QJSEngine::setPrototype().
+    if (!JS_IsObject(prototype.m_val) && !JS_IsNull(prototype.m_val)) return;
+    JSContext* c = ctx();
+    if (JS_SetPrototype(c, m_val, prototype.m_val) < 0) {
+        clearPendingException(c);
+    }
+}
+
 QQuickJSValue QQuickJSValue::property(quint32 arrayIndex) const {
     ensureEngineThread();
     if (!isValid()) return QQuickJSValue();
@@ -601,6 +806,20 @@ void QQuickJSValue::setProperty(quint32 arrayIndex, const QVariant& value) {
         return;
     }
     setProperty(arrayIndex, QQuickJSValue(jsEngine, v, true));
+}
+
+bool QQuickJSValue::equals(const QQuickJSValue& other) const {
+    ensureEngineThread();
+    if (!isValid() || !isSameContext(other)) return false;
+    JSContext* c = ctx();
+    // ECMA-262 abstract equality: the check can run user code (valueOf)
+    // and report an exception instead of a verdict.
+    const int res = JS_IsEqual(c, m_val, other.m_val);
+    if (res < 0) {
+        clearPendingException(c);
+        return false;
+    }
+    return res != 0;
 }
 
 bool QQuickJSValue::strictlyEquals(const QQuickJSValue& other) const {

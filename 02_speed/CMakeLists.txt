@@ -2,8 +2,6 @@ cmake_minimum_required(VERSION 3.21)
 
 project(speed LANGUAGES C CXX)
 
-# A/B without the stock QJSEngine reference
-# (was: commented "DEFINES += SKIP_QT_BENCHMARK" in speed.pro)
 option(SKIP_QT_BENCHMARK "Skip the stock QJSEngine reference benchmark" OFF)
 
 if(NOT SKIP_QT_BENCHMARK)
@@ -14,12 +12,12 @@ endif()
 
 qt_standard_project_setup()
 
-# Phase D (porting guide): C++20 after qt_standard_project_setup()
+# qt_standard_project_setup() defaults to C++17; the wrapper needs C++20
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# quickjs-ng vendor C sources: C11 (gnu11) as before
+# vendored quickjs-ng requires C11
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
@@ -44,7 +42,7 @@ target_include_directories(speed PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../src
 )
 
-# Required by quickjs-ng on Linux/POSIX (was: QMAKE_CFLAGS += -D_GNU_SOURCE)
+# Required by quickjs-ng on Linux/POSIX
 target_compile_definitions(speed PRIVATE _GNU_SOURCE)
 
 if(NOT SKIP_QT_BENCHMARK)
@@ -54,18 +52,7 @@ else()
     target_link_libraries(speed PRIVATE Qt6::Core)
 endif()
 
-# -O3 in release carried over from speed.pro (explicit flag, porting guide §6.4)
-target_compile_options(speed PRIVATE
-    $<$<AND:$<CONFIG:Release>,$<COMPILE_LANG_AND_ID:C,GNU,Clang,AppleClang>>:-O3>
-    $<$<AND:$<CONFIG:Release>,$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>>:-O3>
-)
-
-# Was win32:LIBS += -lpsapi
+# main.cpp reads process memory via psapi on Windows
 if(WIN32)
     target_link_libraries(speed PRIVATE psapi)
 endif()
-
-# ASan (was a commented block in speed.pro)
-# set_target_properties(speed PROPERTIES
-#     COMPILE_OPTIONS "-fsanitize=address;-fno-omit-frame-pointer;-g")
-# target_link_options(speed PRIVATE -fsanitize=address)

@@ -99,13 +99,72 @@ static QByteArray clampedByteArray(const uint8_t* buf, size_t bufSize,
                       static_cast<qsizetype>(qMin(byteLength, span)));
 }
 
+// Non-throwing buffer conversion for the ArrayBuffer/TypedArray/
+// SharedArrayBuffer family: returns a QByteArray wrapped in a QVariant, or
+// an invalid QVariant for anything else (including detached buffers).
+// JS_GetArrayBuffer and JS_GetTypedArrayBuffer throw a TypeError on any
+// non-buffer, so the probes clear pending exceptions instead of propagating.
+static QVariant jsBufferToVariant(JSContext* ctx, JSValueConst val)
+{
+    if (JS_IsArrayBuffer(val)) {
+        size_t bufSize = 0;
+        uint8_t* buf = JS_GetArrayBuffer(ctx, &bufSize, val);
+        if (buf) return QVariant(QByteArray(reinterpret_cast<const char*>(buf), static_cast<qsizetype>(bufSize)));
+        clearPendingException(ctx);   // detached buffer: fall through
+    } else if (JS_GetTypedArrayType(val) >= 0) {
+        size_t byteOffset = 0, byteLength = 0, bytesPerElement = 0;
+        ScopedJSValue abuf(ctx, JS_GetTypedArrayBuffer(ctx, val, &byteOffset, &byteLength, &bytesPerElement));
+        if (consumeException(ctx, abuf.value())) abuf = ScopedJSValue(ctx, JS_UNDEFINED);
+        if (!JS_IsNull(abuf.value()) && !JS_IsUndefined(abuf.value())) {
+            size_t bufSize = 0;
+            uint8_t* buf = JS_GetArrayBuffer(ctx, &bufSize, abuf.value());
+            if (buf) return QVariant(clampedByteArray(buf, bufSize, byteOffset, byteLength, bytesPerElement));
+        }
+    } else {
+        // SharedArrayBuffer has no non-throwing test; the byteLength probe
+        // (one prototype-chain lookup) keeps plain maps off the throw path.
+        ScopedJSValue bl(ctx, JS_GetPropertyStr(ctx, val, "byteLength"));
+        if (JS_IsException(bl.value())) {
+            clearPendingException(ctx);
+        } else if (!JS_IsUndefined(bl.value())) {
+            size_t bufSize = 0;
+            uint8_t* buf = JS_GetArrayBuffer(ctx, &bufSize, val);
+            if (buf) return QVariant(QByteArray(reinterpret_cast<const char*>(buf), static_cast<qsizetype>(bufSize)));
+
+            clearPendingException(ctx);
+
+            size_t byteOffset = 0, byteLength = 0, bytesPerElement = 0;
+            ScopedJSValue abuf(ctx, JS_GetTypedArrayBuffer(ctx, val, &byteOffset, &byteLength, &bytesPerElement));
+            if (consumeException(ctx, abuf.value())) abuf = ScopedJSValue(ctx, JS_UNDEFINED);
+            if (!JS_IsNull(abuf.value()) && !JS_IsUndefined(abuf.value())) {
+                buf = JS_GetArrayBuffer(ctx, &bufSize, abuf.value());
+                if (buf) return QVariant(clampedByteArray(buf, bufSize, byteOffset, byteLength, bytesPerElement));
+            }
+        }
+    }
+    return QVariant();
+}
+
 QVariant QuickJSConvert::variantFromJSObject(QQuickJSEngine* engine, JSContext* ctx, JSValueConst val,
-                                             JSClassID qobjectClassID, JSClassID objectClassID,
-                                             JSVisitedStack& visited, int depth)
+                                            JSClassID qobjectClassID, JSClassID objectClassID,
+                                            JSVisitedStack& visited, int depth,
+                                            QQuickJSValue::ObjectConversionBehavior behavior)
 {
     auto data = static_cast<JSQObjectData*>(JS_GetOpaque(val, qobjectClassID));
     if (data && !data->obj.isNull()) {
         return QVariant::fromValue(data->obj.data());
+    }
+
+    if (behavior == QQuickJSValue::RetainJSObjects) {
+        // QJSEngine RetainJSObjects semantics (verified against Qt 6.12):
+        // native-mapped families still convert (QObject wrappers above, Date
+        // is handled upstream); buffers keep the QByteArray conversion; every
+        // other object, arrays included, is retained as QVariant<QQuickJSValue>.
+        if (JS_GetClassID(val) != objectClassID) {
+            const QVariant buffer = jsBufferToVariant(ctx, val);
+            if (buffer.isValid()) return buffer;
+        }
+        return QVariant::fromValue(QQuickJSValue(engine, JS_DupValue(ctx, val), true));
     }
 
     if (JS_IsArray(val)) {
@@ -132,59 +191,25 @@ QVariant QuickJSConvert::variantFromJSObject(QQuickJSEngine* engine, JSContext* 
                 clearPendingException(ctx);
                 list.append(QVariant());
             } else {
-                list.append(engine->toVariantImpl(item.value(), visited, depth));
+                list.append(engine->toVariantImpl(item.value(), visited, depth, behavior));
             }
         }
         return list;
     }
 
     if (JS_GetClassID(val) != objectClassID) {
-        // Non-throwing buffer probes: JS_GetArrayBuffer and JS_GetTypedArrayBuffer
-        // throw a TypeError on any non-buffer, which would cost two throw/catch
-        // cycles on every plain-object round-trip.
-        if (JS_IsArrayBuffer(val)) {
-            size_t bufSize = 0;
-            uint8_t* buf = JS_GetArrayBuffer(ctx, &bufSize, val);
-            if (buf) return QByteArray(reinterpret_cast<const char*>(buf), static_cast<qsizetype>(bufSize));
-            clearPendingException(ctx);   // detached buffer: fall through
-        } else if (JS_GetTypedArrayType(val) >= 0) {
-            size_t byteOffset = 0, byteLength = 0, bytesPerElement = 0;
-            ScopedJSValue abuf(ctx, JS_GetTypedArrayBuffer(ctx, val, &byteOffset, &byteLength, &bytesPerElement));
-            if (consumeException(ctx, abuf.value())) abuf = ScopedJSValue(ctx, JS_UNDEFINED);
-            if (!JS_IsNull(abuf.value()) && !JS_IsUndefined(abuf.value())) {
-                size_t bufSize = 0;
-                uint8_t* buf = JS_GetArrayBuffer(ctx, &bufSize, abuf.value());
-                if (buf) return clampedByteArray(buf, bufSize, byteOffset, byteLength, bytesPerElement);
-            }
-        } else {
-            // SharedArrayBuffer has no non-throwing test; the byteLength probe
-            // (one prototype-chain lookup) keeps plain maps off the throw path.
-            ScopedJSValue bl(ctx, JS_GetPropertyStr(ctx, val, "byteLength"));
-            if (JS_IsException(bl.value())) {
-                clearPendingException(ctx);
-            } else if (!JS_IsUndefined(bl.value())) {
-                size_t bufSize = 0;
-                uint8_t* buf = JS_GetArrayBuffer(ctx, &bufSize, val);
-                if (buf) return QByteArray(reinterpret_cast<const char*>(buf), static_cast<qsizetype>(bufSize));
+        const QVariant buffer = jsBufferToVariant(ctx, val);
+        if (buffer.isValid()) return buffer;
 
-                clearPendingException(ctx);
-
-                size_t byteOffset = 0, byteLength = 0, bytesPerElement = 0;
-                ScopedJSValue abuf(ctx, JS_GetTypedArrayBuffer(ctx, val, &byteOffset, &byteLength, &bytesPerElement));
-                if (consumeException(ctx, abuf.value())) abuf = ScopedJSValue(ctx, JS_UNDEFINED);
-                if (!JS_IsNull(abuf.value()) && !JS_IsUndefined(abuf.value())) {
-                    buf = JS_GetArrayBuffer(ctx, &bufSize, abuf.value());
-                    if (buf) return clampedByteArray(buf, bufSize, byteOffset, byteLength, bytesPerElement);
-                }
-            }
+        // QJSEngine retains function objects even in the lossy conversion
+        // (verified against Qt 6.12); the remaining exotic objects yield an
+        // invalid QVariant instead of an empty QVariantMap to avoid hidden
+        // data loss.
+        if (JS_IsFunction(ctx, val)) {
+            return QVariant::fromValue(QQuickJSValue(engine, JS_DupValue(ctx, val), true));
         }
-
-        // Explicitly refuse to convert exotic objects. Return an invalid
-        // QVariant instead of an empty QVariantMap to avoid hidden data loss.
-        // Foreign classes only: for the plain object class every check below
-        // is class-based false.
         if (JS_IsMap(val) || JS_IsSet(val) || JS_IsWeakMap(val) || JS_IsWeakSet(val) ||
-            JS_IsPromise(val) || JS_IsRegExp(val) || JS_IsDataView(val) || JS_IsFunction(ctx, val)) {
+            JS_IsPromise(val) || JS_IsRegExp(val) || JS_IsDataView(val)) {
             return QVariant();
         }
     }
@@ -218,11 +243,11 @@ QVariant QuickJSConvert::variantFromJSObject(QQuickJSEngine* engine, JSContext* 
         } else if (JS_IsObject(item.value())) {
             // Object values may recurse into atomName(); copy the key first.
             const QString key = keyStr;
-            QVariant converted = engine->toVariantImpl(item.value(), visited, depth);
+            QVariant converted = engine->toVariantImpl(item.value(), visited, depth, behavior);
             map.insert(key, converted);
         } else {
             // Scalar values perform no atom lookups; the reference stays valid.
-            map.insert(keyStr, engine->toVariantImpl(item.value(), visited, depth));
+            map.insert(keyStr, engine->toVariantImpl(item.value(), visited, depth, behavior));
         }
     }
 
