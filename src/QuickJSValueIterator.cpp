@@ -53,6 +53,11 @@ QQuickJSValue QQuickJSValueIterator::value() const {
 }
 
 QQuickJSValueIterator& QQuickJSValueIterator::operator=(const QQuickJSValue& value) {
+    // Release the previous enumeration while m_object still references the
+    // engine that allocated m_props: reset() derives its context from
+    // m_object, and the atom array of one runtime must not be freed through
+    // another one (a cross-runtime JS_FreePropertyEnum corrupts the heap).
+    reset(QQuickJSValue());
     m_object = value;
     reset(value);
     return *this;

@@ -425,25 +425,8 @@ int QuickJSConvert::adjustEnumType(int type) {
 
 // qint64 ladder: Int32 when exact, Float64 within the safe integer range,
 // BigInt beyond it (deliberate precision-preserving extension).
-JSValue QuickJSConvert::int64ToJS(JSContext* ctx, qint64 v) {
-    if (v >= std::numeric_limits<int32_t>::min() && v <= std::numeric_limits<int32_t>::max()) {
-        return JS_NewInt32(ctx, static_cast<int32_t>(v));
-    }
-    if (v >= -9007199254740991LL && v <= 9007199254740991LL) {
-        return JS_NewFloat64(ctx, static_cast<double>(v));
-    }
-    return JS_NewBigInt64(ctx, v);
-}
-
-JSValue QuickJSConvert::uint64ToJS(JSContext* ctx, quint64 v) {
-    if (v <= static_cast<quint64>(std::numeric_limits<int32_t>::max())) {
-        return JS_NewInt32(ctx, static_cast<int32_t>(v));
-    }
-    if (v <= 9007199254740991ULL) {
-        return JS_NewFloat64(ctx, static_cast<double>(v));
-    }
-    return JS_NewBigUint64(ctx, v);
-}
+// int64ToJS()/uint64ToJS() are defined inline in the header (hot path of
+// method returns and signal arguments).
 
 JSValue QuickJSConvert::dateTimeToJS(JSContext* ctx, const QDateTime& dt) {
     return JS_NewDate(ctx, static_cast<double>(dt.toMSecsSinceEpoch()));

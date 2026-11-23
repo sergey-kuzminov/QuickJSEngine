@@ -13,6 +13,7 @@
 
 #include <quickjs.h>
 
+#include <limits>
 #include <ranges>
 
 #include "QuickJSValue.h"
@@ -63,8 +64,26 @@ public:
     // Scalar fast paths shared by toJSValueImpl() and the metacall sites
     // (property/method returns, signal arguments). They must stay
     // behaviorally identical to the generic QVariant-based conversion.
-    static JSValue int64ToJS(JSContext* ctx, qint64 v);
-    static JSValue uint64ToJS(JSContext* ctx, quint64 v);
+    // int64ToJS()/uint64ToJS() are defined inline: they sit on the hot path
+    // of every method return and signal argument conversion.
+    static inline JSValue int64ToJS(JSContext* ctx, qint64 v) {
+        if (v >= std::numeric_limits<int32_t>::min() && v <= std::numeric_limits<int32_t>::max()) {
+            return JS_NewInt32(ctx, static_cast<int32_t>(v));
+        }
+        if (v >= -9007199254740991LL && v <= 9007199254740991LL) {
+            return JS_NewFloat64(ctx, static_cast<double>(v));
+        }
+        return JS_NewBigInt64(ctx, v);
+    }
+    static inline JSValue uint64ToJS(JSContext* ctx, quint64 v) {
+        if (v <= static_cast<quint64>(std::numeric_limits<int32_t>::max())) {
+            return JS_NewInt32(ctx, static_cast<int32_t>(v));
+        }
+        if (v <= 9007199254740991ULL) {
+            return JS_NewFloat64(ctx, static_cast<double>(v));
+        }
+        return JS_NewBigUint64(ctx, v);
+    }
     static JSValue dateTimeToJS(JSContext* ctx, const QDateTime& dt);
     static JSValue dateToJS(JSContext* ctx, const QDate& d);
     static JSValue timeToJS(JSContext* ctx, const QTime& t);

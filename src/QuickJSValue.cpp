@@ -228,10 +228,15 @@ bool QQuickJSValue::isPromise() const {
 
 QQuickJSValue::ErrorType QQuickJSValue::errorType() const {
     ensureEngineThread();
-    if (!isError()) return NoError;
 
+    // QJSEngine parity: only Error objects carry a class. A thrown
+    // non-Error value ("throw 42") classifies as NoError even though
+    // isError() is true for it - a deliberate wrapper divergence documented
+    // in the README. JS_IsError() inspects the value itself instead of the
+    // any-exception flag.
     JSContext* c = ctx();
     if (!c) return NoError;
+    if (!JS_IsError(m_val)) return NoError;
 
     ScopedJSValue nameVal(c, JS_GetProperty(c, m_val, m_engine.data()->m_atoms.name));
     if (JS_IsException(nameVal.value())) {

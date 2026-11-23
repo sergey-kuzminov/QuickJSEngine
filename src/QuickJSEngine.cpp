@@ -22,11 +22,185 @@
 #include <QThread>
 #include <QTime>
 
+#include <atomic>
 #include <cmath>
 #include <limits>
 #include <memory>
 #include <stdexcept>
 #include <utility>
+
+#if defined(Q_OS_WIN)
+#include <qt_windows.h>
+#elif defined(Q_OS_LINUX) || defined(Q_OS_MACOS)
+#include <pthread.h>
+#endif
+
+namespace {
+
+// Raw machine stack pointer of the calling frame. Unlike
+// __builtin_frame_address(0), which sanitizers may rebase into an ASan
+// fake-stack frame (detect_stack_use_after_return), a direct register read
+// always stays in the real stack address space.
+uintptr_t currentStackPointer()
+{
+#if defined(Q_PROCESSOR_X86_64)
+    uintptr_t sp;
+    asm volatile("mov %%rsp, %0" : "=r"(sp));
+    return sp;
+#elif defined(Q_PROCESSOR_ARM64)
+    uintptr_t sp;
+    asm volatile("mov %0, sp" : "=r"(sp));
+    return sp;
+#else
+    return reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
+#endif
+}
+
+// The lowest address the calling thread's stack can grow to (its reserve
+// bottom), or 0 when unknown. Anchoring the JS stack guard inside the real
+// thread bounds keeps runaway recursion from exhausting the process stack:
+// quickjs-ng derives its guard as "SP at runtime creation - stack_size",
+// and a fixed size that lands below the real bottom (1 MB Windows stacks,
+// sanitizer-heavy Debug builds, small worker-thread stacks) makes the guard
+// unreachable - recursion then crashes the process instead of raising a
+// catchable InternalError.
+uintptr_t threadStackFloor()
+{
+#if defined(Q_OS_WIN)
+    // Windows 8+, kernel32: [low, high) of the current thread's stack.
+    ULONG_PTR low = 0;
+    ULONG_PTR high = 0;
+    GetCurrentThreadStackLimits(&low, &high);
+    return uintptr_t(low);
+#elif defined(Q_OS_LINUX) || defined(Q_OS_MACOS)
+    pthread_attr_t attr;
+    if (pthread_getattr_np(pthread_self(), &attr) != 0)
+        return 0;
+    void* base = nullptr;
+    size_t size = 0;
+    const int rc = pthread_attr_getstack(&attr, &base, &size);
+    pthread_attr_destroy(&attr);
+    if (rc != 0 || base == nullptr || size == 0)
+        return 0;
+    return uintptr_t(base);
+#else
+    return 0;
+#endif
+}
+
+// Distance kept between the guard line and the real thread stack bottom. The
+// JS guard is checked at JS frame entries only, so one whole C frame can slip
+// below the line between two checks; fat Debug/ASan frames were measured at
+// ~28 KiB on MinGW clang Debug. The throw path must also fit below the line
+// when the guard fires. The vendored engine is built optimized and without
+// sanitizers even in Debug (QUICKJS_SLIM_VENDOR), so that throw chain is a
+// few release-sized frames; the budget below is one slipped fat frame
+// (~36 KiB, only reachable on sanitizer-heavy hosts) + the throw chain
+// (~72 KiB) with headroom. 128 KiB covers it while leaving starved stacks
+// (1 MB Windows main threads under Debug+ASan where the C++ host machinery
+// alone consumes most of the reserve) enough room for the engine to run at
+// all; the previous 256 KiB margin consumed a quarter of such stacks and
+// forced the effective budget down to a few KiB.
+constexpr size_t kSafetyMargin = 128 * 1024;
+// Smallest stack distance below the anchor the guard may watch. Below that
+// the engine cannot meaningfully run, but the guard still must not be
+// disabled: runaway JS recursion on a disabled guard exhausts the process
+// stack (hard crash - the Windows Debug starved-stack failure class). An
+// emergency budget keeps the recursion a catchable error instead; regular
+// operations on such a starved stack fail with the same catchable error
+// rather than killing the host process.
+constexpr size_t kMinimumUsableBudget = 64 * 1024;
+// Emergency guard budget for starved stacks (see kMinimumUsableBudget).
+constexpr size_t kEmergencyGuardBudget = 16 * 1024;
+// Stack reserve for the QVariant conversion recursion (toVariantImpl <->
+// variantFromJSObject): the C++ conversion chain runs outside the JS stack
+// guard, so it needs its own floor check. One conversion level costs a frame
+// pair plus the property-enumeration machinery - tens of KiB on fat
+// Debug/ASan builds, a few KiB in release. 96 KiB covers the deepest
+// legitimate single level (pair + JS_GetOwnPropertyNames + unwinding) on
+// any known build while still allowing 60+ nesting levels on healthy stacks.
+constexpr size_t kVariantStackReserve = 96 * 1024;
+// Bounds of the calibrated machinery allowance added on top of the requested
+// budget: at least 64 KiB (release builds still have ~5-8 KiB of entry chain,
+// plus variance across entry paths), at most 1 MiB (pathological fat builds
+// do not need more; larger values would swallow the JS recursion share on
+// small stacks).
+constexpr size_t kMinMachineryAllowance = 64 * 1024;
+constexpr size_t kMaxMachineryAllowance = 1024 * 1024;
+// Fallback allowance when calibration could not measure (probe failed):
+// matches the largest entry chains observed on sanitizer-heavy Debug builds.
+constexpr size_t kFallbackMachineryAllowance = 256 * 1024;
+
+// Diagnostics switch: QJS_GUARD_TRACE=1 prints every guard anchor decision
+// and the context of every caught "Maximum call stack size exceeded".
+bool guardTraceEnabled()
+{
+    static const bool enabled = qEnvironmentVariableIntValue("QJS_GUARD_TRACE") == 1;
+    return enabled;
+}
+
+// One-shot (per process) detection of an ASan fake stack: quickjs-ng's own
+// guard reads __builtin_frame_address(0) (quickjs.c js_get_stack_pointer),
+// which detect_stack_use_after_return rebases into a heap mapping, while
+// this engine's budget math reads the raw %rsp/currentStackPointer(). In
+// the same frame the two can only differ by that frame's own size (a few
+// hundred bytes plus sanitizer redzones); a drift of tens of KiB means the
+// frame address comes from a fake stack, the vendor guard would then compare
+// rebased addresses against a real-stack limit (either never firing on real
+// overflow or firing instantly), and the honest fix is on the runtime side
+// (ASAN_OPTIONS detect_stack_use_after_return=0), not in the code.
+void warnIfFakeStackActive()
+{
+    static std::atomic<bool> checked{false};
+    if (checked.exchange(true))
+        return;
+    const uintptr_t frameAddress = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
+    const uintptr_t sp = currentStackPointer();
+    const uintptr_t drift = frameAddress > sp ? frameAddress - sp : sp - frameAddress;
+    if (drift > 64 * 1024) {
+        qWarning("QQuickJSEngine: ASan fake stack detected (frame address %llx vs SP %llx, "
+                 "%llu KiB apart) - quickjs-ng's stack guard reads rebased addresses while "
+                 "this engine's budget math reads the real stack; run without "
+                 "detect_stack_use_after_return (ASAN_OPTIONS) for a meaningful guard",
+                 static_cast<unsigned long long>(frameAddress),
+                 static_cast<unsigned long long>(sp),
+                 static_cast<unsigned long long>(drift / 1024));
+    }
+}
+
+// Clamps the wanted guard budget (requested JS recursion share + measured
+// machinery allowance) so the quickjs-ng guard line (anchor SP - stack size)
+// always stays above the real thread stack bottom (plus the safety margin)
+// and never grows beyond what the thread can actually spare below the entry
+// anchor. Unknown bounds keep the request unclamped.
+size_t clampedStackBudget(size_t wanted)
+{
+    const uintptr_t floor = threadStackFloor();
+    if (floor == 0)
+        return wanted;
+    const uintptr_t sp = currentStackPointer();
+    // Sanity of the reported bounds: a floor at or above the current SP (or
+    // absurdly far away - stacks are not 64 MiB+) means the OS gave garbage
+    // (e.g. a sanitizer-relocated thread); clamping against it would disable
+    // the engine, so treat the floor as unknown.
+    if (sp <= floor || sp - floor > (64ull << 20))
+        return wanted;
+    const size_t usable = size_t(sp - floor - kSafetyMargin);
+    if (usable < kMinimumUsableBudget) {
+        // The thread is already inside (or near) the margin. There is no
+        // room for a full guard, but an emergency budget still keeps runaway
+        // recursion catchable instead of exhausting the process stack (the
+        // Windows Debug starved-stack failure class); the throw path of the
+        // overflow fits below the line of that small budget.
+        // Legitimate operations on such a starved stack throw the same
+        // catchable error - the engine is unusable there either way, the
+        // process must stay alive.
+        return kEmergencyGuardBudget;
+    }
+    return wanted < usable ? wanted : usable;
+}
+
+} // namespace
 
 QQuickJSEngine::QQuickJSEngine(QObject* parent) : QObject(parent),
     m_rt(nullptr), m_ctx(nullptr), m_globalObj(JS_UNDEFINED),
@@ -48,7 +222,22 @@ QQuickJSEngine::QQuickJSEngine(QObject* parent) : QObject(parent),
     }
 
     JS_SetMemoryLimit(m_rt, 64 * 1024 * 1024);
-    JS_SetMaxStackSize(m_rt, 512 * 1024);
+    // 512 KiB JS recursion budget, anchored to the current stack position and
+    // re-anchored at every top-level entry (see reanchorStackGuard()): the
+    // guard line must stay inside the real thread stack bounds, above the
+    // bottom (a guard below the bottom never fires and runaway recursion
+    // crashes the process - observed on Windows ASan Debug builds with 1-2 MB
+    // thread stacks) and below the engine's entry machinery. The effective
+    // budget granted to quickjs is the recursion share plus a measured
+    // machinery allowance (calibrateMachineryAllowance() below): on fat
+    // Debug/ASan builds the C chain alone descends hundreds of KiB and a bare
+    // 512 KiB guard would false-fire on every check-hitting operation.
+    reanchorStackGuard();
+    // Measure the real machinery descent once, from a constructor-depth anchor
+    // (the shallowest typical entry): the probe runs under a provisional
+    // margin-only guard and never throws to the caller.
+    calibrateMachineryAllowance();
+    reanchorStackGuard();
     JS_SetGCThreshold(m_rt, 1 * 1024 * 1024);
     // Explicit defensive default: Atomics.wait() must never block the host
     // thread in a console application. SharedArrayBuffer is not exposed
@@ -299,7 +488,189 @@ void QQuickJSEngine::setExecutionTimeoutMs(quint32 ms) {
     m_executionDeadlineMs.store(deadlineFromTimeout(ms));
 }
 void QQuickJSEngine::setMemoryLimit(size_t limit) { if (m_rt) JS_SetMemoryLimit(m_rt, limit); }
-void QQuickJSEngine::setMaxStackSize(size_t size) { if (m_rt) JS_SetMaxStackSize(m_rt, size); }
+void QQuickJSEngine::setMaxStackSize(size_t size) {
+    // 0 disables quickjs-ng's guard (a runaway recursion then exhausts the
+    // process stack). Non-zero values are the JS recursion share; the
+    // effective guard budget adds the calibrated machinery allowance on top
+    // and is re-clamped at every top-level entry; call from the engine's
+    // thread, like the other setters of this class.
+    m_stackBudgetBytes = size;
+    reanchorStackGuard();
+}
+
+void QQuickJSEngine::reanchorStackGuard()
+{
+    if (!m_rt)
+        return;
+    // Measure the budget from THIS entry point. quickjs-ng anchors the guard
+    // at the stack position of JS_NewRuntime()/JS_SetMaxStackSize() and never
+    // moves it afterwards; entering JS from deeper host frames (nested
+    // evaluate() from a slot, signal callbacks, mid-suite engine use) then
+    // leaves the guard above the actual JS frames. Re-anchoring also re-clamps
+    // against the real thread bounds, so the guard line can never end up
+    // below the bottom (unreachable guard => process crash instead of a
+    // catchable error).
+    //
+    // The effective budget is the requested JS recursion share plus the
+    // calibrated machinery allowance: on fat Debug/ASan builds the legitimate
+    // C chain below the entry (compile + JS_CallInternal + builtin/job
+    // trampolines) descends hundreds of KiB below the anchor, and a bare
+    // recursion share makes the guard fire inside that very machinery
+    // (false "Maximum call stack size exceeded" from every check-hitting
+    // operation - promise jobs, apply(), typed-array construction, async
+    // resume, module linking - while plain scripts without stack checks kept
+    // running; Windows MinGW Debug+ASan once showed 22 failures, all
+    // cascades of this one guard misfire).
+    JS_UpdateStackTop(m_rt);
+    warnIfFakeStackActive();
+    if (m_stackBudgetBytes == 0) {
+        JS_SetMaxStackSize(m_rt, 0);
+        m_guardStackSize = 0;
+        return;
+    }
+    const size_t allowance = m_allowanceCalibrated ? m_machineryAllowance
+                                                   : kFallbackMachineryAllowance;
+    const size_t wanted = m_stackBudgetBytes + allowance;
+    const size_t clamped = clampedStackBudget(wanted);
+    m_guardAnchorSp = currentStackPointer();
+    m_guardStackSize = clamped;
+    JS_SetMaxStackSize(m_rt, clamped);
+    if (Q_UNLIKELY(clamped <= kEmergencyGuardBudget) && !m_guardDisabledWarned) {
+        m_guardDisabledWarned = true;
+        qWarning("QQuickJSEngine: stack guard on emergency budget (%lld KiB) - the "
+                 "engine's thread has less than %lld KiB of stack above its bottom "
+                 "at this entry (SP=%llx); deep JS recursion and heavy scripts will "
+                 "fail with a catchable error here, the process stays alive",
+                 qint64(clamped / 1024),
+                 qint64((kSafetyMargin + kMinimumUsableBudget) / 1024),
+                 static_cast<unsigned long long>(m_guardAnchorSp));
+    }
+    // Usable-window sanity (the degenerate-window failure class): the window below the
+    // entry must exceed the calibrated machinery allowance by a real JS
+    // recursion share. When the allowance (or nearly) consumes the window,
+    // the guard line sits at the machinery's bottom: every check-hitting
+    // operation then false-fires with "Maximum call stack size exceeded"
+    // (promise jobs, combinators) and the overflow throw path runs past the
+    // real bottom (hard crash). Windows MinGW Debug+ASan measured A~440 KiB
+    // vs M~344 KiB on the 2 MiB default reserve: both symptoms at once.
+    // Degrading silently hides it; say so once, with actionable numbers.
+    const size_t jsShare = clamped > allowance ? clamped - allowance : 0;
+    if (Q_UNLIKELY(clamped > kEmergencyGuardBudget)
+            && Q_UNLIKELY(jsShare < kMinimumUsableBudget) && !m_guardDegenerateWarned) {
+        m_guardDegenerateWarned = true;
+        qWarning("QQuickJSEngine: degenerate stack guard window - the calibrated entry "
+                 "machinery (%lld KiB) plus the safety margin (%lld KiB) leaves only "
+                 "%lld KiB of JS recursion share below the entry (usable below the "
+                 "anchor: %lld KiB, requested share: %lld KiB). Legitimate operations "
+                 "(promise jobs, combinators) will throw false 'Maximum call stack "
+                 "size exceeded' and a real overflow can crash the process. Raise the "
+                 "executable's stack reserve (e.g. link with --stack,16777216) or slim "
+                 "the host entry",
+                 qint64(allowance / 1024),
+                 qint64(kSafetyMargin / 1024),
+                 qint64(jsShare / 1024),
+                 qint64(m_guardAnchorSp > threadStackFloor()
+                            ? size_t(m_guardAnchorSp - threadStackFloor()) / 1024 : 0),
+                 qint64(m_stackBudgetBytes / 1024));
+    }
+    if (guardTraceEnabled()) {
+        qWarning("QQuickJSEngine: [guard] anchor SP=%llx floor=%llx aboveFloor=%llu KiB "
+                 "requested=%zu KiB allowance=%zu KiB stackSize=%zu KiB%s",
+                 static_cast<unsigned long long>(m_guardAnchorSp),
+                 static_cast<unsigned long long>(threadStackFloor()),
+                 static_cast<unsigned long long>(m_guardAnchorSp > threadStackFloor()
+                     ? size_t(m_guardAnchorSp - threadStackFloor()) / 1024 : 0),
+                 m_stackBudgetBytes / 1024, allowance / 1024, m_guardStackSize / 1024,
+                 clamped <= kEmergencyGuardBudget ? " (emergency budget)" : "");
+    }
+}
+
+namespace {
+// Records the probe's stack position. Each engine is single-threaded
+// (ensureEngineThread), but two engines can be constructed simultaneously
+// on different host threads, hence thread_local.
+static thread_local uintptr_t s_guardProbeSp = 0;
+
+JSValue js_guardProbe(JSContext* ctx, JSValueConst, int, JSValueConst*)
+{
+    s_guardProbeSp = currentStackPointer();
+    return JS_UNDEFINED;
+}
+} // namespace
+
+void QQuickJSEngine::calibrateMachineryAllowance()
+{
+    if (!m_rt || !m_ctx || m_allowanceCalibrated)
+        return;
+    m_allowanceCalibrated = true;   // one shot, even on failure
+
+    // Provisional guard for the probe: HALF of what the thread can safely
+    // spare below this anchor, never the full amount. When the machinery
+    // descent on fat Debug/ASan builds exceeds the budget, the guard fires
+    // mid-probe and the "Maximum call stack size exceeded" throw path (plus
+    // the unwinding) runs below the line: with a full-usable budget that
+    // residual path had only the safety margin to the real stack bottom, and
+    // on Windows MinGW Debug+ASan it crossed it - a hard stack-overflow
+    // crash of the process right at engine construction (fixed by this
+    // half-budget probe plus the slim vendor build, see QUICKJS_SLIM_VENDOR
+    // in the CMakeLists). With half the budget the fire point sits at least
+    // usable/2 above the margin, so both the throw path and the unwind fit
+    // comfortably; the probe then simply reports chain=0 and the caller
+    // falls back to the conservative allowance. On healthy stacks the
+    // machinery needs far less than half the spare, the probe completes and
+    // the real chain is measured as before.
+    JS_UpdateStackTop(m_rt);
+    {
+        const uintptr_t floor = threadStackFloor();
+        const uintptr_t sp = currentStackPointer();
+        size_t provisional = kFallbackMachineryAllowance + DefaultStackBudget;
+        if (floor != 0 && sp > floor) {
+            const size_t usable = sp > floor + kSafetyMargin
+                ? size_t(sp - floor - kSafetyMargin) : 0;
+            provisional = usable > kEmergencyGuardBudget ? usable / 2 : kEmergencyGuardBudget;
+        }
+        JS_SetMaxStackSize(m_rt, provisional);
+    }
+    const uintptr_t anchor = currentStackPointer();
+
+    // Probe: nested JS calls down into a C trampoline, a shape representative
+    // of the machinery below a top-level entry (compile + JS frames + C
+    // trampolines). Runs through plain JS_Eval - no evaluate() bookkeeping, no
+    // eval-cache or global-lexicals pollution from the probe script.
+    s_guardProbeSp = 0;
+    static const char kProbeScript[] =
+        "(function c(n){ return n > 0 ? c(n - 1) : __qjsGuardCalibrate(); })(6);";
+    JSValue global = JS_GetGlobalObject(m_ctx);
+    JSValue probeFn = JS_NewCFunction(m_ctx, js_guardProbe, "__qjsGuardCalibrate", 0);
+    JS_SetPropertyStr(m_ctx, global, "__qjsGuardCalibrate", probeFn);   // consumes probeFn
+    JSValue result = JS_Eval(m_ctx, kProbeScript, sizeof(kProbeScript) - 1,
+                              "<qjs-guard-calibration>", JS_EVAL_TYPE_GLOBAL);
+    JS_FreeValue(m_ctx, result);
+    const JSAtom probeAtom = JS_NewAtom(m_ctx, "__qjsGuardCalibrate");
+    JS_DeleteProperty(m_ctx, global, probeAtom, 0);
+    JS_FreeAtom(m_ctx, probeAtom);
+    JS_FreeValue(m_ctx, global);
+    if (JS_HasException(m_ctx))
+        clearPendingException(m_ctx);
+
+    const size_t chain = (s_guardProbeSp != 0 && anchor > s_guardProbeSp)
+        ? size_t(anchor - s_guardProbeSp) : 0;
+    if (chain == 0) {
+        // Probe failed (starved stack or eval error): conservative fallback.
+        m_machineryAllowance = kFallbackMachineryAllowance;
+    } else {
+        // x2 safety: deeper entry paths (module linking, long-ish parses,
+        // signal proxies) legitimately descend more than one probe chain.
+        size_t allowance = chain * 2;
+        if (allowance < kMinMachineryAllowance) allowance = kMinMachineryAllowance;
+        if (allowance > kMaxMachineryAllowance) allowance = kMaxMachineryAllowance;
+        m_machineryAllowance = allowance;
+    }
+    if (guardTraceEnabled()) {
+        qWarning("QQuickJSEngine: [guard] calibration chain=%zu KiB allowance=%zu KiB",
+                 chain / 1024, m_machineryAllowance / 1024);
+    }
+}
 void QQuickJSEngine::setAutoProcessPromises(bool enabled) { m_autoProcessPromises = enabled; }
 
 QString QQuickJSEngine::version() {
@@ -554,18 +925,13 @@ static JSValue js_console_generic(JSContext* ctx, JSValueConst, int argc, JSValu
     }
 }
 
-// Caller stack of a console.* invocation, built from a freshly constructed
-// Error object: its "stack" property lists this console.* frame first,
-// followed by the JavaScript callers; the console frame is dropped.
 QString consoleCallerStack(JSContext* ctx) {
-    // JS_GetGlobalObject returns a new reference: scope it to free it.
-    ScopedJSValue global(ctx, JS_GetGlobalObject(ctx));
-    ScopedJSValue errorCtor(ctx, JS_GetPropertyStr(ctx, global.value(), "Error"));
-    if (!JS_IsFunction(ctx, errorCtor.value())) {
-        clearPendingException(ctx);
-        return QString();
-    }
-    ScopedJSValue err(ctx, JS_CallConstructor(ctx, errorCtor.value(), 0, nullptr));
+    // Built through JS_NewError() on the internal JS_CLASS_ERROR prototype,
+    // immune to scripts replacing globalThis.Error (the same hardening as
+    // newErrorObject()). Its "stack" property lists this console.* frame
+    // first, followed by the JavaScript callers; the console frame is
+    // dropped below.
+    ScopedJSValue err(ctx, JS_NewError(ctx));
     if (JS_IsException(err.value())) {
         clearPendingException(ctx);
         return QString();
@@ -1049,6 +1415,30 @@ void QQuickJSEngine::processAndEmitException(JSContext* ctx, JSValueConst exc) {
         errStr = QStringLiteral("Unknown exception (toString failed)");
     }
 
+    // Guard diagnostics (QJS_GUARD_TRACE=1): when a stack overflow surfaces,
+    // report the catch point relative to the anchor/line. NOTE: this SP is
+    // where the exception reached the host catch frame AFTER the interpreter
+    // unwound - the guard's fire point itself was at (or below) the line and
+    // necessarily deeper than the value printed here, so this number can only
+    // bound the fire depth from below; it cannot prove a false fire (a
+    // near-anchor catch point can be misread as "fired inside the machinery
+    // allowance" while the actual cause is a degenerate budget window, see
+    // the warning in reanchorStackGuard()).
+    if (guardTraceEnabled()
+            && errStr.contains(QLatin1String("Maximum call stack size exceeded"))) {
+        const uintptr_t sp = currentStackPointer();
+        const qint64 belowAnchor = m_guardAnchorSp > sp
+            ? qint64(m_guardAnchorSp - sp) : -qint64(sp - m_guardAnchorSp);
+        qWarning("QQuickJSEngine: [guard] stack overflow caught at SP=%llx: %lld KiB "
+                 "below the entry anchor; guard line %lld KiB below it (stackSize=%zu KiB); "
+                 "the fire point was at or below the line, deeper than the catch point",
+                 static_cast<unsigned long long>(sp),
+                 static_cast<long long>(belowAnchor / 1024),
+                 static_cast<long long>(belowAnchor / 1024
+                     - static_cast<qint64>(m_guardStackSize) / 1024),
+                 m_guardStackSize / 1024);
+    }
+
     if (receivers(SIGNAL(uncaughtException(QString,int))) == 0) {
         qWarning().noquote() << "QQuickJSEngine: Uncaught JS exception:" << errStr;
         clearPendingException(ctx);
@@ -1131,6 +1521,15 @@ QQuickJSValue QQuickJSEngine::evaluate(const QString& script, const QString& fil
     ensureEngineThread();
     if (exceptionStackTrace) exceptionStackTrace->clear();
 
+    // Anchor the stack guard (and the fresh timeout quota) before anything
+    // else: reporting a stale pending exception below also runs JS
+    // (Error.prototype.toString in the uncaught report), which must happen
+    // below a guard measured from THIS entry, not from a stale anchor.
+    const bool topLevel = (m_evalDepth == 0);
+    if (topLevel) {
+        resetExecutionState();
+    }
+
     // QJSEngine parity: a pending exception (e.g. throwError() called from C++
     // between script executions) preempts evaluation: the script is not
     // executed and the pending error is returned, reported like any other
@@ -1142,10 +1541,6 @@ QQuickJSValue QQuickJSEngine::evaluate(const QString& script, const QString& fil
         return errVal;
     }
 
-    const bool topLevel = (m_evalDepth == 0);
-    if (topLevel) {
-        resetExecutionState();
-    }
     EvalDepthGuard depthGuard(m_evalDepth);
     // Declared after depthGuard so the flush (which may run user JS via reason
     // toString) happens while the depth guard is still held. Top-level calls
@@ -1865,6 +2260,22 @@ QVariant QQuickJSEngine::toVariantImpl(JSValueConst val, JSVisitedStack& visited
             return QVariant();
         }
 
+        // C++ recursion guard: the toVariantImpl <-> variantFromJSObject
+        // chain recurses per nesting level OUTSIDE the JS stack guard, and
+        // on fat Debug/ASan builds (Windows MinGW Debug, ~22-36 KiB per
+        // frame pair) a deep variant graph exhausts the real thread stack -
+        // a hard crash (reproduced with ASan in JS_GetOwnPropertyNamesInternal
+        // while converting a 64-level object). The depth cap above cannot
+        // know the frame fatness; bail out with an invalid QVariant, exactly
+        // like a cycle, once the remaining stack distance to the thread
+        // floor drops below the conversion reserve.
+        {
+            const uintptr_t floor = threadStackFloor();
+            const uintptr_t sp = currentStackPointer();
+            if (Q_UNLIKELY(floor != 0 && sp < floor + kVariantStackReserve))
+                return QVariant();
+        }
+
         visited.push(ptr);
 
         QVariant result;
@@ -1914,11 +2325,18 @@ JSValue QQuickJSEngine::toJSValueFromVoid(void* data, int metaType) {
     if (metaType == QMetaType::UnknownType || metaType == QMetaType::Void) return JS_UNDEFINED;
 
     // Same scalar fast paths as toJSValueImpl(): metacall argument storage
-    // points at a value of exactly the declared type.
-    if (metaType == QMetaType::LongLong || metaType == QMetaType::Long)
+    // points at a value of exactly the declared type. Every case reads the
+    // exact C++ width: `long`/`unsigned long` are 4 bytes on LLP64 (Windows)
+    // and 32-bit targets, and a full qint64/quint64 read there would go
+    // past the end of the caller's storage.
+    if (metaType == QMetaType::LongLong)
         return QuickJSConvert::int64ToJS(m_ctx, *static_cast<qint64*>(data));
-    if (metaType == QMetaType::ULongLong || metaType == QMetaType::ULong)
+    if (metaType == QMetaType::Long)
+        return QuickJSConvert::int64ToJS(m_ctx, static_cast<qint64>(*static_cast<long*>(data)));
+    if (metaType == QMetaType::ULongLong)
         return QuickJSConvert::uint64ToJS(m_ctx, *static_cast<quint64*>(data));
+    if (metaType == QMetaType::ULong)
+        return QuickJSConvert::uint64ToJS(m_ctx, static_cast<quint64>(*static_cast<unsigned long*>(data)));
     if (metaType == QMetaType::UInt) return QuickJSConvert::uint64ToJS(m_ctx, *static_cast<uint*>(data));
     if (metaType == QMetaType::UShort) return JS_NewInt32(m_ctx, *static_cast<ushort*>(data));
     if (metaType == QMetaType::UChar) return JS_NewInt32(m_ctx, *static_cast<uchar*>(data));

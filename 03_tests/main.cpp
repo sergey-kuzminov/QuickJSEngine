@@ -54,11 +54,22 @@ class TestObject : public QObject {
     Q_PROPERTY(uint uintProp READ getUintProp WRITE setUintProp)
     Q_PROPERTY(UnregisteredType uProp READ getUProp)
     Q_PROPERTY(UnregisteredType uPropW WRITE setUPropW)
+    // Narrow scalar properties with negative values: regression coverage
+    // for the exact-width metacall reads (a char read through a short
+    // buffer turns -1 into 255; a 4-byte LLP64 long read through a qint64
+    // buffer loses the sign).
+    Q_PROPERTY(char charProp READ getCharProp CONSTANT)
+    Q_PROPERTY(signed char scharProp READ getSCharProp CONSTANT)
+    Q_PROPERTY(short shortProp READ getShortProp CONSTANT)
+    Q_PROPERTY(long longProp READ getLongProp CONSTANT)
+    Q_PROPERTY(unsigned long ulongProp READ getULongProp CONSTANT)
+    Q_PROPERTY(short shortPropW READ getShortPropW WRITE setShortPropW)
 
 signals:
     void valueChanged(int newValue);
     void nameChanged(const QString& newName);
     void multiArgSignal(int a, const QString& b, double c);
+    void narrowSignal(char c, long l, unsigned long ul);
 
 private slots:
     void secretSlot() { ++m_secretCalls; }
@@ -78,6 +89,12 @@ public:
     Q_INVOKABLE qint64 echoBigInt(qint64 v) { return v; }
     Q_INVOKABLE float echoFloat(float v) { return v; }
     Q_INVOKABLE uint echoUint(uint v) { return v; }
+    Q_INVOKABLE char getChar() { return -1; }
+    Q_INVOKABLE signed char getSChar() { return -2; }
+    Q_INVOKABLE short getShort() { return -3; }
+    Q_INVOKABLE long getLong() { return -4; }
+    Q_INVOKABLE unsigned long getULong() { return 5; }
+    Q_INVOKABLE void emitNarrowSignal() { emit narrowSignal(-1, -2, 5); }
     Q_INVOKABLE void emitMultiArg() { emit multiArgSignal(42, QStringLiteral("test"), 3.14); }
     Q_INVOKABLE void throwCxxExceptionInSignal() { throw std::runtime_error("C++ Signal Exception"); }
     Q_INVOKABLE void throwUnknownException() { throw 42; }   // not a std::exception -> uncatchable InternalError policy
@@ -106,6 +123,14 @@ public:
     void setFloatProp(float v) { m_floatProp = v; }
     uint getUintProp() const { return m_uintProp; }
     void setUintProp(uint v) { m_uintProp = v; }
+
+    char getCharProp() const { return -1; }
+    signed char getSCharProp() const { return -2; }
+    short getShortProp() const { return -3; }
+    long getLongProp() const { return -4; }
+    unsigned long getULongProp() const { return 5; }
+    short getShortPropW() const { return m_shortPropW; }
+    void setShortPropW(short v) { m_shortPropW = v; }
 
     Q_INVOKABLE TestObject* getChild() const { return m_child; }
     Q_INVOKABLE TestObject* getNull() const { return nullptr; }
@@ -148,6 +173,7 @@ private:
     qint64 m_bigProp = 0;
     float m_floatProp = 0.0f;
     uint m_uintProp = 0;
+    short m_shortPropW = 0;
     int m_secretCalls = 0;
     int m_unregArgs = 0;
     QQuickJSEngine* m_jsEngine = nullptr;
@@ -278,6 +304,19 @@ public:
             qjsEngine->evaluate(QStringLiteral(
                 "function deep(n) { if (n === 0) throw new Error('inner boom'); return deep(n - 1); }\n"
                 "deep(1);"), QStringLiteral("inner.js"), 1, &innerStack);
+        }
+    }
+
+    // Nested evaluate() with runaway recursion from inside a slot: the stack
+    // guard must keep it a catchable error (Windows MinGW Debug+ASan crash
+    // class: a tight budget anchored at engine creation made every script
+    // throw on entry, and the recursion could exhaust the process stack).
+    bool innerCaught = false;
+    Q_INVOKABLE void runDeepEval() {
+        innerCaught = false;
+        if (qjsEngine) {
+            innerCaught = qjsEngine->evaluate(
+                QStringLiteral("function f(){f();} f();")).isError();
         }
     }
 
@@ -461,6 +500,21 @@ static int moduleFailureClass(const QJSValue& v)
     }
     return static_cast<int>(QJSValue::NoError);
 }
+
+// A QThread with a deliberately small stack hosting an engine that runs an
+// unbounded recursion: the default recursion budget is clamped to the real
+// thread bounds, so the guard must fire (a catchable error) instead of the
+// OS stack limit being hit (a hard process crash).
+class StackProbeThread : public QThread {
+public:
+    enum Outcome { NotRun = 0, GuardFired = 1, ReturnedOther = 2 };
+    Outcome result = NotRun;
+    void run() override {
+        QQuickJSEngine eng;
+        const QQuickJSValue res = eng.evaluate(QStringLiteral("function f(){f();} f();"));
+        result = res.isError() ? GuardFired : ReturnedOther;
+    }
+};
 
 // Runs the full test suite
 static void runAllTests(const bool runDangerous) {
@@ -731,6 +785,37 @@ static void runAllTests(const bool runDangerous) {
                     "container fast cases broken");
     }
 
+    // Narrow scalar types must keep their sign through the metacall fast
+    // paths: moc writes exactly sizeof(declared type) bytes into the return
+    // slot, so a char return read through a short buffer turns -1 into 255,
+    // and a 4-byte LLP64 long read through a qint64 buffer loses the sign.
+    // Live parity: the same object is exposed to both engines.
+    {
+        TestObject* obj = new TestObject();
+        compareQObjectEngines("QObject: narrow signed method returns", obj,
+                              "String(testObj.getChar()) + ' ' + String(testObj.getSChar()) + ' ' + String(testObj.getShort()) + ' ' + String(testObj.getLong()) + ' ' + String(testObj.getULong())");
+        compareQObjectEngines("QObject: narrow property reads", obj,
+                              "String(testObj.charProp) + ' ' + String(testObj.scharProp) + ' ' + String(testObj.shortProp) + ' ' + String(testObj.longProp) + ' ' + String(testObj.ulongProp)");
+        compareQObjectEngines("QObject: narrow property write", obj, "testObj.shortPropW = -7; String(testObj.shortPropW)");
+        delete obj;
+    }
+
+    // Signal arguments take the toJSValueFromVoid() fast path: an LLP64 long
+    // argument read as a full qint64 would also go out of bounds of the
+    // caller's storage; the sign must survive on every ABI.
+    {
+        QQuickJSEngine qEng;
+        TestObject* obj = new TestObject();
+        qEng.globalObject().setProperty("testObj", qEng.newQObject(obj));
+        qEng.evaluate("testObj.narrowSignal.connect(function(c, l, ul){ globalThis.narrow = [c, l, ul]; });");
+        obj->emitNarrowSignal();
+        TEST_RESULT("Types: narrow signal arguments keep the sign",
+                    qEng.evaluate("globalThis.narrow[0] === -1 && globalThis.narrow[1] === -2"
+                                  " && globalThis.narrow[2] === 5").toBool(),
+                    "a narrow signal argument lost its sign");
+        delete obj;
+    }
+
     // 7. QObject Proxy
     {
         TestObject* obj = new TestObject();
@@ -873,6 +958,129 @@ static void runAllTests(const bool runDangerous) {
 
         QQuickJSEngine stackEng;
         TEST_RESULT("Limit: Stack Overflow", stackEng.evaluate("function f(){f();} f();").isError(), "Stack overflow not caught");
+
+        // A tight budget must catch runaway recursion and leave the engine usable.
+        // (The requested budget is the JS recursion share; the effective guard
+        // adds the calibrated entry-machinery allowance on top, see
+        // QQuickJSEngine::setMaxStackSize and calibrateMachineryAllowance().)
+        QQuickJSEngine budgetEng;
+        budgetEng.setMaxStackSize(64 * 1024);
+        TEST_RESULT("Limit: setMaxStackSize tightens the recursion budget",
+                    budgetEng.evaluate("function f(){f();} f();").isError()
+                        && budgetEng.evaluate("1+1").toInt() == 2,
+                    "a custom stack budget did not catch recursion");
+
+        // Regression (Windows MinGW Debug+ASan): runaway recursion in a nested
+        // evaluate() called from a slot under a tight budget must stay a
+        // catchable error, and both the outer script and the engine must stay
+        // usable afterwards.
+        {
+            QQuickJSEngine deepEng;
+            deepEng.setMaxStackSize(64 * 1024);
+            ThrowProbeObject deepProbe;
+            deepProbe.qjsEngine = &deepEng;
+            deepEng.globalObject().setProperty(QStringLiteral("obj"), deepEng.newQObject(&deepProbe));
+            QQuickJSValue outer = deepEng.evaluate(QStringLiteral("obj.runDeepEval(); 40 + 2;"));
+            TEST_RESULT("Limit: nested runaway recursion stays catchable",
+                        outer.toInt() == 42 && deepProbe.innerCaught
+                            && deepEng.evaluate("1+1").toInt() == 2,
+                        "nested recursion under a tight budget did not stay catchable");
+        }
+
+        // A small worker-thread stack: the default budget must be clamped to
+        // the real thread bounds, so the guard fires instead of the process
+        // stack being exhausted (Windows ASan Debug crash class).
+        {
+            StackProbeThread thread;
+            thread.setStackSize(512 * 1024);
+            thread.start();
+            thread.wait();
+            TEST_RESULT("Limit: stack guard fires on a small thread stack",
+                        thread.result == StackProbeThread::GuardFired,
+                        QStringLiteral("small-stack thread outcome=%1").arg(int(thread.result)));
+        }
+
+        // The guard must fire at real recursion depth, not on entry: count
+        // the frames actually reached before the catchable RangeError. A
+        // depth of 0-2 means the guard fired inside the entry machinery (the
+        // degenerate-window failure class seen on Windows Debug+ASan: the
+        // calibrated machinery allowance alone consumed the whole usable
+        // window below the entry).
+        {
+            QQuickJSEngine depthEng;
+            const QQuickJSValue depthRes = depthEng.evaluate(QStringLiteral(
+                "globalThis.depth = 0; function f(){ globalThis.depth++; f(); } f();"));
+            const int depth = depthEng.globalObject().property(QStringLiteral("depth")).toInt();
+            TEST_RESULT("Limit: guard fires at real recursion depth",
+                        depthRes.isError() && depth >= 5,
+                        QStringLiteral("depth=%1 (0-2 means the guard fired inside the entry machinery)")
+                            .arg(depth));
+            TEST_RESULT("Limit: engine usable after a stack overflow",
+                        depthEng.evaluate(QStringLiteral("1+1")).toInt() == 2,
+                        "engine damaged after a stack overflow");
+        }
+
+        // Repeated runaway recursion must stay catchable every time (the
+        // throw/unwind/backtrace cycle must not corrupt guard or engine
+        // state); the engine must remain usable after the whole series.
+        {
+            QQuickJSEngine repeatEng;
+            int firstNotCaught = -1;
+            for (int i = 0; i < 10; ++i) {
+                if (!repeatEng.evaluate(QStringLiteral("function f(){f();} f();")).isError()) {
+                    firstNotCaught = i;
+                    break;
+                }
+            }
+            TEST_RESULT("Limit: repeated stack overflows stay catchable",
+                        firstNotCaught < 0 && repeatEng.evaluate(QStringLiteral("1+1")).toInt() == 2,
+                        QStringLiteral("run %1 returned a non-error").arg(firstNotCaught));
+        }
+
+        // Runaway recursion inside a promise job - the deepest legitimate
+        // entry (evaluate -> job drain -> JS_ExecutePendingJob ->
+        // JS_CallInternal) - must surface as a reported uncaught exception
+        // for that job, never as a process crash; the job body before the
+        // recursion point must have run.
+        {
+            QQuickJSEngine jobEng;
+            int reports = 0;
+            QObject::connect(&jobEng, &QQuickJSEngine::uncaughtException,
+                             [&](const QString&, int) { reports++; });
+            const QQuickJSValue setup = jobEng.evaluate(QStringLiteral(
+                "globalThis.res = 'pending'; Promise.resolve().then(function(){ "
+                "globalThis.res = 'job ran'; function f(){ f(); } f(); });"));
+            TEST_RESULT("Limit: recursion in a promise job stays catchable",
+                        !setup.isError()
+                            && jobEng.globalObject().property(QStringLiteral("res")).toString() == QLatin1String("job ran")
+                            && reports == 1
+                            && jobEng.evaluate(QStringLiteral("1+1")).toInt() == 2,
+                        QStringLiteral("reports=%1 res=%2 - job recursion did not stay catchable")
+                            .arg(reports)
+                            .arg(jobEng.globalObject().property(QStringLiteral("res")).toString()));
+        }
+
+        // The guard's usable window must not be degenerate on this
+        // configuration: a fresh engine on the main thread must not emit the
+        // "degenerate stack guard window" warning (machinery allowance
+        // eating the whole usable window - the Windows Debug+ASan failure
+        // class: false RangeErrors from promise machinery plus a hard crash
+        // on the overflow test). The capture scope must end before TEST_RESULT:
+        // the installed handler swallows every message type, including the
+        // qInfo() of the result line itself.
+        bool degenerate = false;
+        {
+            WarningCaptureGuard capture;
+            QQuickJSEngine saneEng;
+            saneEng.evaluate(QStringLiteral("1+1"));
+            for (const QString& w : g_capturedWarnings) {
+                if (w.contains(QLatin1String("degenerate stack guard window"))) degenerate = true;
+            }
+        }
+        TEST_RESULT("Limit: guard budget window not degenerate",
+                    !degenerate,
+                    "the calibrated machinery allowance ate the whole usable window - "
+                    "raise the executable stack reserve (link with --stack,16777216)");
 
         QQuickJSEngine memEng;
         memEng.setMemoryLimit(1 * 1024 * 1024);
@@ -1041,6 +1249,36 @@ static void runAllTests(const bool runDangerous) {
                         QStringLiteral("QJSEngine=%1, QuickJS=%2")
                             .arg(static_cast<int>(qtErr.errorType())).arg(static_cast<int>(qErr.errorType())));
             TEST_RESULT("API: errorType (NoError)", qEng.evaluate("'str'").errorType() == QQuickJSValue::NoError, "non-error must be NoError");
+
+            // A thrown non-Error value carries no error class: NoError, like
+            // QJSEngine (isError() stays true for such values - a deliberate
+            // documented divergence).
+            {
+                QJSEngine qtPrim;
+                TEST_RESULT("API: errorType of thrown primitives is NoError (parity)",
+                            qEng.evaluate("throw 42").errorType() == QQuickJSValue::NoError
+                                && qEng.evaluate("throw 'str'").errorType() == QQuickJSValue::NoError
+                                && qEng.evaluate("throw {}").errorType() == QQuickJSValue::NoError
+                                && qtPrim.evaluate("throw 42").errorType() == QJSValue::NoError,
+                            "a thrown non-Error value must classify as NoError");
+            }
+
+            // A primitive this follows JS call semantics in both engines (a
+            // sloppy callee boxes it); callWithInstance() binds the global
+            // object for non-object instances (QJSEngine semantics).
+            {
+                QJSEngine qtCall;
+                const QString src = QStringLiteral("function f(){ return typeof this; } f;");
+                QQuickJSValue qf = qEng.evaluate(src);
+                const QJSValue qtf = qtCall.evaluate(src);
+                const QString primThis = qf.call(QVariantList{}, qEng.evaluate("42")).toString();
+                const QString oursInstance = qf.callWithInstance(qEng.evaluate("42"), QVariantList{}).toString();
+                const QString theirsInstance = qtf.callWithInstance(qtCall.evaluate("42")).toString();
+                TEST_RESULT("API: callWithInstance with a primitive instance (parity)",
+                            primThis == QLatin1String("object") && oursInstance == theirsInstance,
+                            QStringLiteral("call(prim-this)=%1 callWithInstance(prim)=%2 QJSEngine=%3")
+                                .arg(primThis, oursInstance, theirsInstance));
+            }
             QQuickJSValue evalErr = qEng.newErrorObject(QQuickJSValue::EvalError, "eval fail");
             TEST_RESULT("API: newErrorObject(EvalError)",
                         evalErr.isError() && evalErr.property("name").toString() == QStringLiteral("EvalError")
@@ -2154,6 +2392,44 @@ static void runAllTests(const bool runDangerous) {
                                 && !invalid.hasNext() && !invalid.next() && !invalid.value().isValid(),
                             "a non-object value produced a working iterator");
             }
+
+            // Cross-engine assignment: the enumeration array belongs to the
+            // runtime that allocated it; operator= must release it through the
+            // previous engine before rebinding (a cross-runtime free would
+            // corrupt the heap; ASan would catch it when it was wrong).
+            {
+                QQuickJSEngine engA;
+                QQuickJSEngine engB;
+                QQuickJSValueIterator it(engA.evaluate("({a: 1, b: 2})"));
+                TEST_RESULT("Iterator: cross-engine assignment setup",
+                            it.hasNext() && it.next() && it.name() == QLatin1String("a"),
+                            "initial enumeration failed");
+                it = engB.evaluate("({x: 10, y: 20, z: 30})");
+                QStringList names;
+                while (it.hasNext()) { it.next(); names << it.name(); }
+                TEST_RESULT("Iterator: assignment across engines rebinds safely",
+                            names == QStringList({QStringLiteral("x"), QStringLiteral("y"), QStringLiteral("z")}),
+                            QStringLiteral("names=%1").arg(names.join(QLatin1String(","))));
+            }
+
+            // Non-enumerable own string properties stay enumerated, matching
+            // QJSValueIterator (V4) - JS_GPN_STRING_MASK without ENUM_ONLY.
+            {
+                const QString script = QStringLiteral(
+                    "(function(){ var o = {a: 1};"
+                    "Object.defineProperty(o, 'ne', {value: 2, enumerable: false});"
+                    "return o; })()");
+                QQuickJSEngine qEng2;
+                QJSEngine qtEng2;
+                QQuickJSValueIterator oursIt(qEng2.evaluate(script));
+                QJSValueIterator theirsIt(qtEng2.evaluate(script));
+                QStringList ours, theirs;
+                while (oursIt.hasNext()) { oursIt.next(); ours << oursIt.name(); }
+                while (theirsIt.hasNext()) { theirsIt.next(); theirs << theirsIt.name(); }
+                TEST_RESULT("Iterator: non-enumerable own properties parity with QJSValueIterator",
+                            ours == theirs,
+                            QStringLiteral("ours=[%1] QJSEngine=[%2]").arg(ours.join(','), theirs.join(',')));
+            }
         }
 
         // --- toVariant(ObjectConversionBehavior) ---
@@ -2320,6 +2596,21 @@ static void runAllTests(const bool runDangerous) {
             TEST_RESULT("Console: symbol arguments do not throw",
                         qEng.evaluate("console.log(Symbol('s')); console.count(Symbol('k'))").isUndefined(),
                         "a symbol argument broke console output");
+
+            // console.* caller stacks are built on the internal Error class:
+            // replacing globalThis.Error must not corrupt console output.
+            bool consoleTampered = false;
+            {
+                QQuickJSEngine qEng3;
+                qEng3.installExtensions(QQuickJSEngine::ConsoleExtension);
+                MessageCaptureGuard capture;
+                qEng3.evaluate("globalThis.Error = function(){ return {stack: 'HACKED'}; }; console.trace();");
+                for (const QString& m : std::as_const(g_capturedMessages)) {
+                    if (m.contains(QLatin1String("HACKED"))) consoleTampered = true;
+                }
+            }
+            TEST_RESULT("Console: caller stack immune to globalThis.Error tampering",
+                        !consoleTampered, "a replaced global Error leaked into console caller stacks");
 
             // Output formats follow V4's console: timeEnd prints "label: Nms",
             // count prints "label: N" (keyed by the printed label - a documented
@@ -3237,6 +3528,24 @@ static void runAllTests(const bool runDangerous) {
             TEST_RESULT("Module: top-level await (spec semantics, beyond Qt)",
                         !tla.isError() && tla.property(QStringLiteral("x")).toInt() == 42,
                         QStringLiteral("result: %1").arg(tla.toString()));
+
+            // A top-level-await rejection is handed to the C++ importer and
+            // must not surface a second time through uncaughtException: the
+            // buffered rejection of the module evaluation promise is
+            // retracted by importModule().
+            writeModule(QStringLiteral("tlarej.mjs"),
+                "export const boom = await Promise.reject(new Error('TLA rejection boom'));\n");
+            {
+                int uncaught = 0;
+                const auto conn = QObject::connect(&qEng4, &QQuickJSEngine::uncaughtException,
+                                                   [&uncaught](const QString&, int) { ++uncaught; });
+                const QQuickJSValue rej = qEng4.importModule(moduleDir.filePath(QStringLiteral("tlarej.mjs")));
+                TEST_RESULT("Module: TLA rejection reaches C++ without a duplicate uncaughtException",
+                            rej.isError() && rej.toString().contains(QLatin1String("TLA rejection boom")) && uncaught == 0,
+                            QStringLiteral("isError=%1 text=%2 uncaught=%3")
+                                .arg(rej.isError()).arg(rej.toString()).arg(uncaught));
+                QObject::disconnect(conn);
+            }
 
             // Dynamic import() works inside evaluate() scripts (a SyntaxError
             // on QJSEngine - documented beyond-parity extra); both file

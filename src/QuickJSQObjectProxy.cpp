@@ -67,15 +67,29 @@ JSValue QuickJSQObjectProxy::invokeAndConvertReturn(QQuickJSEngine* engine, JSCo
         return metacallReturn<QStringList>(ctx, obj, methodIdx, args, [engine, ctx](QStringList v) { return QuickJSConvert::stringListToJSArray(engine, ctx, &v); });
     case QMetaType::QVariantList:
         return metacallReturn<QVariantList>(ctx, obj, methodIdx, args, [engine, ctx](QVariantList v) { return QuickJSConvert::listToJSArray(engine, ctx, &v, 0); });
-    case QMetaType::Short: case QMetaType::Char: case QMetaType::SChar:
+    // Narrow scalars: moc writes exactly sizeof(declared type) bytes into
+    // the return slot, so each case must read its exact C++ type. A char
+    // return read through a short buffer loses the sign (-1 becomes 255);
+    // a 4-byte LLP64 long read through a qint64 buffer does the same and a
+    // qint64 write would overflow it.
+    case QMetaType::Short:
         return metacallReturn<short>(ctx, obj, methodIdx, args, [ctx](short v) { return JS_NewInt32(ctx, v); });
+    case QMetaType::Char:
+        return metacallReturn<char>(ctx, obj, methodIdx, args, [ctx](char v) { return JS_NewInt32(ctx, v); });
+    case QMetaType::SChar:
+        return metacallReturn<signed char>(ctx, obj, methodIdx, args, [ctx](signed char v) { return JS_NewInt32(ctx, v); });
     case QMetaType::UShort: case QMetaType::UChar:
+        // Unsigned narrow types zero-extend correctly in a ushort buffer.
         return metacallReturn<ushort>(ctx, obj, methodIdx, args, [ctx](ushort v) { return JS_NewInt32(ctx, v); });
     case QMetaType::UInt:
         return metacallReturn<uint>(ctx, obj, methodIdx, args, [ctx](uint v) { return QuickJSConvert::uint64ToJS(ctx, v); });
-    case QMetaType::Long: case QMetaType::LongLong:
+    case QMetaType::Long:
+        return metacallReturn<long>(ctx, obj, methodIdx, args, [ctx](long v) { return QuickJSConvert::int64ToJS(ctx, v); });
+    case QMetaType::LongLong:
         return metacallReturn<qint64>(ctx, obj, methodIdx, args, [ctx](qint64 v) { return QuickJSConvert::int64ToJS(ctx, v); });
-    case QMetaType::ULong: case QMetaType::ULongLong:
+    case QMetaType::ULong:
+        return metacallReturn<unsigned long>(ctx, obj, methodIdx, args, [ctx](unsigned long v) { return QuickJSConvert::uint64ToJS(ctx, v); });
+    case QMetaType::ULongLong:
         return metacallReturn<quint64>(ctx, obj, methodIdx, args, [ctx](quint64 v) { return QuickJSConvert::uint64ToJS(ctx, v); });
     case QMetaType::QDateTime:
         return metacallReturn<QDateTime>(ctx, obj, methodIdx, args, [ctx](QDateTime v) { return QuickJSConvert::dateTimeToJS(ctx, v); });
@@ -149,15 +163,25 @@ JSValue QuickJSQObjectProxy::getMetaProperty(QQuickJSEngine* engine, JSContext* 
         return readMetaProperty<QStringList>(ctx, obj, entry.index, [engine, ctx](QStringList v) { return QuickJSConvert::stringListToJSArray(engine, ctx, &v); });
     case QMetaType::QVariantList:
         return readMetaProperty<QVariantList>(ctx, obj, entry.index, [engine, ctx](QVariantList v) { return QuickJSConvert::listToJSArray(engine, ctx, &v, 0); });
-    case QMetaType::Short: case QMetaType::Char: case QMetaType::SChar:
+    // Narrow scalars: each case reads its exact C++ type (see the matching
+    // comment in invokeAndConvertReturn()).
+    case QMetaType::Short:
         return readMetaProperty<short>(ctx, obj, entry.index, [ctx](short v) { return JS_NewInt32(ctx, v); });
+    case QMetaType::Char:
+        return readMetaProperty<char>(ctx, obj, entry.index, [ctx](char v) { return JS_NewInt32(ctx, v); });
+    case QMetaType::SChar:
+        return readMetaProperty<signed char>(ctx, obj, entry.index, [ctx](signed char v) { return JS_NewInt32(ctx, v); });
     case QMetaType::UShort: case QMetaType::UChar:
         return readMetaProperty<ushort>(ctx, obj, entry.index, [ctx](ushort v) { return JS_NewInt32(ctx, v); });
     case QMetaType::UInt:
         return readMetaProperty<uint>(ctx, obj, entry.index, [ctx](uint v) { return QuickJSConvert::uint64ToJS(ctx, v); });
-    case QMetaType::Long: case QMetaType::LongLong:
+    case QMetaType::Long:
+        return readMetaProperty<long>(ctx, obj, entry.index, [ctx](long v) { return QuickJSConvert::int64ToJS(ctx, v); });
+    case QMetaType::LongLong:
         return readMetaProperty<qint64>(ctx, obj, entry.index, [ctx](qint64 v) { return QuickJSConvert::int64ToJS(ctx, v); });
-    case QMetaType::ULong: case QMetaType::ULongLong:
+    case QMetaType::ULong:
+        return readMetaProperty<unsigned long>(ctx, obj, entry.index, [ctx](unsigned long v) { return QuickJSConvert::uint64ToJS(ctx, v); });
+    case QMetaType::ULongLong:
         return readMetaProperty<quint64>(ctx, obj, entry.index, [ctx](quint64 v) { return QuickJSConvert::uint64ToJS(ctx, v); });
     case QMetaType::QDateTime:
         return readMetaProperty<QDateTime>(ctx, obj, entry.index, [ctx](QDateTime v) { return QuickJSConvert::dateTimeToJS(ctx, v); });
