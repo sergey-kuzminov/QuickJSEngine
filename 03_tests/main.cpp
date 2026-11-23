@@ -50,6 +50,8 @@ class TestObject : public QObject {
     Q_PROPERTY(QVariant variantProp READ getVariantProp WRITE setVariantProp)
     Q_PROPERTY(QDate dateProp READ getDateProp WRITE setDateProp)
     Q_PROPERTY(qint64 bigProp READ getBigProp WRITE setBigProp)
+    Q_PROPERTY(float floatProp READ getFloatProp WRITE setFloatProp)
+    Q_PROPERTY(uint uintProp READ getUintProp WRITE setUintProp)
     Q_PROPERTY(UnregisteredType uProp READ getUProp)
     Q_PROPERTY(UnregisteredType uPropW WRITE setUPropW)
 
@@ -74,6 +76,8 @@ public:
     Q_INVOKABLE void throwCxxException() { throw std::runtime_error("C++ Exception in TestObject"); }
     Q_INVOKABLE QString getName() const { return m_name; }
     Q_INVOKABLE qint64 echoBigInt(qint64 v) { return v; }
+    Q_INVOKABLE float echoFloat(float v) { return v; }
+    Q_INVOKABLE uint echoUint(uint v) { return v; }
     Q_INVOKABLE void emitMultiArg() { emit multiArgSignal(42, QStringLiteral("test"), 3.14); }
     Q_INVOKABLE void throwCxxExceptionInSignal() { throw std::runtime_error("C++ Signal Exception"); }
     Q_INVOKABLE void throwUnknownException() { throw 42; }   // not a std::exception -> uncatchable InternalError policy
@@ -97,6 +101,11 @@ public:
 
     qint64 getBigProp() const { return m_bigProp; }
     void setBigProp(qint64 v) { m_bigProp = v; }
+
+    float getFloatProp() const { return m_floatProp; }
+    void setFloatProp(float v) { m_floatProp = v; }
+    uint getUintProp() const { return m_uintProp; }
+    void setUintProp(uint v) { m_uintProp = v; }
 
     Q_INVOKABLE TestObject* getChild() const { return m_child; }
     Q_INVOKABLE TestObject* getNull() const { return nullptr; }
@@ -137,6 +146,8 @@ private:
     QVariant m_variantProp;
     QDate m_dateProp;
     qint64 m_bigProp = 0;
+    float m_floatProp = 0.0f;
+    uint m_uintProp = 0;
     int m_secretCalls = 0;
     int m_unregArgs = 0;
     QQuickJSEngine* m_jsEngine = nullptr;
@@ -257,6 +268,18 @@ public:
         if (qjsEngine) { qjsEngine->throwError(QStringLiteral("record boom")); sawError = qjsEngine->hasError(); }
     }
     Q_INVOKABLE void emitPing() { emit ping(); }
+
+    // Inner evaluate() from inside a slot: used by the nested-stack test —
+    // the stack of the inner error must keep the outer script frames.
+    QStringList innerStack;
+    Q_INVOKABLE void runInnerEval() {
+        innerStack.clear();
+        if (qjsEngine) {
+            qjsEngine->evaluate(QStringLiteral(
+                "function deep(n) { if (n === 0) throw new Error('inner boom'); return deep(n - 1); }\n"
+                "deep(1);"), QStringLiteral("inner.js"), 1, &innerStack);
+        }
+    }
 
     int getThrowingProp() const {
         if (qtEngine) qtEngine->throwError(QStringLiteral("getter boom"));
@@ -1023,6 +1046,29 @@ static void runAllTests(const bool runDangerous) {
                         evalErr.isError() && evalErr.property("name").toString() == QStringLiteral("EvalError")
                             && evalErr.errorType() == QQuickJSValue::EvalError,
                         "EvalError creation failed");
+
+            // Engine-created errors use the built-in prototypes: scripts
+            // replacing globalThis.TypeError cannot affect them (QJSEngine
+            // parity — live V4 probe, tools/probe-qt-apiaudit.cpp).
+            {
+                QJSEngine qtEng;
+                QQuickJSEngine qEng2;
+                const QString sabotage = QStringLiteral(
+                    "globalThis.TypeError = function(m) { this.name = 'Replaced'; this.message = m; };");
+                qtEng.evaluate(sabotage);
+                qEng2.evaluate(sabotage);
+                QJSValue qtErr2 = qtEng.newErrorObject(QJSValue::TypeError, QStringLiteral("proto boom"));
+                QQuickJSValue qErr2 = qEng2.newErrorObject(QQuickJSValue::TypeError, QStringLiteral("proto boom"));
+                TEST_RESULT("API: error prototype immune to constructor override",
+                            qtErr2.isError() && qErr2.isError()
+                                && qtErr2.property(QStringLiteral("name")).toString() == qErr2.property(QStringLiteral("name")).toString()
+                                && qErr2.property(QStringLiteral("name")).toString() == QStringLiteral("TypeError")
+                                && qErr2.property(QStringLiteral("message")).toString() == QStringLiteral("proto boom"),
+                            QStringLiteral("qt name=%1, q name=%2, q msg=%3")
+                                .arg(qtErr2.property(QStringLiteral("name")).toString(),
+                                     qErr2.property(QStringLiteral("name")).toString(),
+                                     qErr2.property(QStringLiteral("message")).toString()));
+            }
         }
 
         qEng.setAutoProcessPromises(false);
@@ -1094,6 +1140,31 @@ static void runAllTests(const bool runDangerous) {
         TEST_RESULT("API: call(QVariantList, thisObj)", func.call({QVariant(1), QVariant(2), QVariant(3)}).toInt() == 6, "call with QVariantList failed");
         TEST_RESULT("API: call() default args", qEng.evaluate("(function() { return 7; })").call().toInt() == 7, "call with default args failed");
         TEST_RESULT("API: call (exception)", qEng.evaluate("(function() { throw new Error('CallErr'); })").call().toString().contains("CallErr"), "Exception in call not captured");
+
+        // call() with no thisObject binds the engine global object, even for
+        // strict callees (QJSEngine parity — live V4 probe, tools/probe-qt-apiaudit.cpp).
+        {
+            QJSEngine qtEng;
+            QQuickJSEngine qEng2;
+            QJSValue qtStrict = qtEng.evaluate(QStringLiteral("(function() { 'use strict'; return this === globalThis; })"));
+            QQuickJSValue qStrict = qEng2.evaluate(QStringLiteral("(function() { 'use strict'; return this === globalThis; })"));
+            const bool qtOk = qtStrict.call().toBool();
+            const bool qOk = qStrict.call().toBool();
+            TEST_RESULT("API: call() default this is the global object (strict)",
+                        qtOk && qOk, QStringLiteral("qt=%1, q=%2").arg(qtOk).arg(qOk));
+            QJSValue qtSloppy = qtEng.evaluate(QStringLiteral("(function() { return this === globalThis; })"));
+            QQuickJSValue qSloppy = qEng2.evaluate(QStringLiteral("(function() { return this === globalThis; })"));
+            TEST_RESULT("API: call() default this is the global object (sloppy)",
+                        qtSloppy.call().toBool() && qSloppy.call().toBool(),
+                        QStringLiteral("qt=%1, q=%2").arg(qtSloppy.call().toBool()).arg(qSloppy.call().toBool()));
+        }
+
+        // Deliberate documented divergence from QJSEngine: our isError() is
+        // true for ANY thrown value (V4 reports Error objects only; live probe
+        // tools/probe-qt-apiaudit.cpp — Qt: throw 42 -> isError false).
+        TEST_RESULT("QQuickJSValue: isError covers thrown primitives (deliberate)",
+                    qEng.evaluate(QStringLiteral("(function(){ throw 42; })()")).isError(),
+                    "thrown primitive must be flagged as an error here");
 
         QQuickJSEngine otherEng;
         QQuickJSValue v1 = qEng.evaluate("42");
@@ -1423,6 +1494,41 @@ static void runAllTests(const bool runDangerous) {
         QQuickJSValue res2 = qEng.evaluate("testObj.echoBigInt(9007199254740993n)");
         TEST_RESULT("QObject: BigInt Property/Method", !res1.isError() && obj->getBigProp() == 9007199254740993LL && !res2.isError() && res2.toVariant().toLongLong() == 9007199254740993LL, "BigInt interop through QObject failed");
         delete obj;
+    }
+
+    // 15b. Typed fast-path roundtrips: property/method conversions for the
+    // types the metacall sites convert directly (D-42). Dual-engine: V4
+    // matches for the shared domain; the BigInt case below is engine-specific
+    // (V4 rounds qint64 beyond 2^53 to a Number, we keep BigInt precision).
+    {
+        QJSEngine qtEng;
+        QQuickJSEngine qEng;
+        TestObject* qtObj = new TestObject();
+        TestObject* qObj = new TestObject();
+        QJSEngine::setObjectOwnership(qtObj, QJSEngine::CppOwnership);
+        qtEng.globalObject().setProperty(QStringLiteral("testObj"), qtEng.newQObject(qtObj));
+        qEng.globalObject().setProperty(QStringLiteral("testObj"), qEng.newQObject(qObj));
+        auto parity = [&qtEng, &qEng](const char* name, const char* js) {
+            QJSValue qtRes = qtEng.evaluate(QString::fromUtf8(js));
+            QQuickJSValue qRes = qEng.evaluate(QString::fromUtf8(js));
+            TEST_RESULT(name, !qRes.isError() && !qtRes.isError() && qtRes.toString() == qRes.toString(),
+                        QStringLiteral("QJSEngine='%1', QuickJS='%2'").arg(qtRes.toString(), qRes.toString()));
+        };
+        parity("FastPath: float property write+read", "testObj.floatProp = 2.5; String(testObj.floatProp)");
+        parity("FastPath: float property exact value", "testObj.floatProp = 1.25; testObj.floatProp === 1.25");
+        parity("FastPath: uint property write+read", "testObj.uintProp = 3000000000; testObj.uintProp === 3000000000");
+        parity("FastPath: qint64 property within double", "testObj.bigProp = 42; testObj.bigProp === 42");
+        parity("FastPath: double coercion of qint64 matches (rounds)", "testObj.bigProp = 3.9; String(testObj.bigProp)");
+        parity("FastPath: float method arg+return", "testObj.echoFloat(1.25) === 1.25");
+        parity("FastPath: qint64 method arg+return", "testObj.echoBigInt(41) + 1 === 42");
+        parity("FastPath: uint method arg+return", "testObj.echoUint(3000000000) === 3000000000");
+        parity("FastPath: QDate property is a Date", "Object.prototype.toString.call(testObj.dateProp) === '[object Date]'");
+        parity("FastPath: string -> float keeps generic coercion", "testObj.floatProp = '2.5'; testObj.floatProp === 2.5");
+        QQuickJSValue bigRes = qEng.evaluate(QStringLiteral("testObj.bigProp = 9007199254740993n; testObj.bigProp === 9007199254740993n"));
+        TEST_RESULT("FastPath: qint64 property keeps BigInt precision (engine-specific)",
+                    bigRes.toBool(), QStringLiteral("res=%1").arg(bigRes.toString()));
+        delete qtObj;
+        delete qObj;
     }
 
     // 16. Advanced Engine API
@@ -2340,6 +2446,31 @@ static void runAllTests(const bool runDangerous) {
             TEST_RESULT("StackTrace: empty without an exception",
                         qEng.evaluate("1 + 1", QString(), 1, &clean).toInt() == 2 && clean.isEmpty(),
                         "non-empty stack without an exception");
+
+            // Nested evaluate() called from a Q_INVOKABLE (itself called from
+            // the outer script): the inner error stack keeps the OUTER script
+            // frames, matching live QJSEngine (V4 includes them — probe in
+            // tools/probe-qt-apiaudit.cpp). Regression guard against adding
+            // JS_EVAL_FLAG_BACKTRACE_BARRIER, which would strip the outer frames.
+            {
+                ThrowProbeObject probe;
+                probe.qjsEngine = &qEng;
+                qEng.globalObject().setProperty(QStringLiteral("obj"), qEng.newQObject(&probe));
+                QQuickJSValue r = qEng.evaluate(
+                    QStringLiteral("function outer() { return obj.runInnerEval(); }\nouter();"),
+                    QStringLiteral("outer.js"));
+                const bool hasInner = probe.innerStack.isEmpty()
+                    ? false
+                    : std::any_of(probe.innerStack.cbegin(), probe.innerStack.cend(),
+                                  [](const QString& f) { return f.endsWith(QLatin1String("inner.js")); });
+                const bool hasOuter = probe.innerStack.isEmpty()
+                    ? false
+                    : std::any_of(probe.innerStack.cbegin(), probe.innerStack.cend(),
+                                  [](const QString& f) { return f.endsWith(QLatin1String("outer.js")); });
+                TEST_RESULT("StackTrace: nested evaluate keeps outer frames",
+                            !r.isError() && hasInner && hasOuter,
+                            QStringLiteral("stack=[%1]").arg(probe.innerStack.join(u' ')));
+            }
 
             {
                 QJSEngine qtEng;

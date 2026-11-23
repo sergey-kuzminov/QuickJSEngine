@@ -38,7 +38,10 @@ The core is **quickjs-ng** (ng — next generation) — a fork of the original Q
 * **`newSymbol()` description:** QuickJSEngine follows ECMA-262 (`Symbol('x').description === 'x'`); V4's `newSymbol()` leaves the description undefined even though `String()` still shows the name.
 * **`console.count()` keying:** counters are keyed by the printed label (Node.js semantics), not by script and line number like V4 — quickjs-ng exposes no call-site information to C callbacks. The printed format (`label: N`) is identical.
 * **`qsTr()` context:** the translation context is fixed (`"QQuickJSEngine"`); V4 derives it from the calling script's URL, which is not visible to C callbacks in quickjs-ng.
-* **`exceptionStackTrace` frames:** parsed from the quickjs-ng `Error.stack` property into the V4 frame format `function:line:column:file`; native frames carry `-1/-1` and an empty file, like V4. A thrown non-Error value (e.g. `throw 'str'`) yields an empty list, since quickjs-ng attaches no stack to it.
+* **`exceptionStackTrace` frames:** parsed from the quickjs-ng `Error.stack` property into the V4 frame format `function:line:column:file`; native frames carry `-1/-1` and an empty file, like V4. A thrown non-Error value (e.g. `throw 'str'`) yields an empty list, since quickjs-ng attaches no stack to it. A nested `evaluate()` called from a C++ slot keeps the outer script frames in the inner error's stack, matching V4.
+* **`isError()` for thrown primitives:** `isError()` is true for ANY thrown value — `throw 42` returns an error-flagged value holding 42 — while QJSEngine's `isError()` is true only for Error objects. This keeps C++ handling branch-free (everything reported by `evaluate()`/`call()` as an error IS one); `toString()` still returns the raw value.
+* **Engine-created errors:** `newErrorObject()` / `throwError()` build on the built-in prototypes, immune to scripts replacing `globalThis.TypeError` and friends (like V4). For `EvalError`/`URIError` the global constructor is still resolved: quickjs-ng 0.18 provides C helpers for the other five classes only.
+* **`call()` default `this`:** an omitted thisObject binds the engine global object, even for strict callees (QJSEngine parity).
 
 </details>
 

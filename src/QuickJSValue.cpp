@@ -46,9 +46,13 @@ QQuickJSValue QQuickJSValue::executeJsCall(QQuickJSEngine* engine, JSContext* c,
     // only: nested calls must not report the enclosing tick.
     auto rejectionFlush = qScopeGuard([engine, topLevel]() { if (topLevel) engine->flushUnhandledRejections(); });
 
+    // QJSEngine parity: an omitted thisObject binds the engine global object,
+    // even for strict callees (which would otherwise see `this === undefined`).
+    JSValueConst thisVal = thisObj.m_engine ? thisObj.jsVal() : engine->m_globalObj;
+
     JSValue ret = isConstructor
                       ? JS_CallConstructor(c, funcVal, argc, jsArgs)
-                      : JS_Call(c, funcVal, thisObj.jsVal(), argc, jsArgs);
+                      : JS_Call(c, funcVal, thisVal, argc, jsArgs);
 
     ScopedJSValue retScoped(c, ret);
 

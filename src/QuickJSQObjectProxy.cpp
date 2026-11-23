@@ -8,6 +8,7 @@
 #include "QuickJSQObjectProxy.h"
 #include "QuickJSConvert.h"
 
+#include <cmath>
 #include <utility>
 #include <memory>
 
@@ -54,6 +55,8 @@ JSValue QuickJSQObjectProxy::invokeAndConvertReturn(QQuickJSEngine* engine, JSCo
         return metacallReturn<bool>(ctx, obj, methodIdx, args, [ctx](bool v) { return JS_NewBool(ctx, v); });
     case QMetaType::Double:
         return metacallReturn<double>(ctx, obj, methodIdx, args, [ctx](double v) { return JS_NewFloat64(ctx, v); });
+    case QMetaType::Float:
+        return metacallReturn<float>(ctx, obj, methodIdx, args, [ctx](float v) { return JS_NewFloat64(ctx, v); });
     case QMetaType::QString:
         return metacallReturn<QString>(ctx, obj, methodIdx, args, [ctx](QString v) { return qStringToJS(ctx, v); });
     case QMetaType::QObjectStar:
@@ -64,11 +67,39 @@ JSValue QuickJSQObjectProxy::invokeAndConvertReturn(QQuickJSEngine* engine, JSCo
         return metacallReturn<QStringList>(ctx, obj, methodIdx, args, [engine, ctx](QStringList v) { return QuickJSConvert::stringListToJSArray(engine, ctx, &v); });
     case QMetaType::QVariantList:
         return metacallReturn<QVariantList>(ctx, obj, methodIdx, args, [engine, ctx](QVariantList v) { return QuickJSConvert::listToJSArray(engine, ctx, &v, 0); });
+    case QMetaType::Short: case QMetaType::Char: case QMetaType::SChar:
+        return metacallReturn<short>(ctx, obj, methodIdx, args, [ctx](short v) { return JS_NewInt32(ctx, v); });
+    case QMetaType::UShort: case QMetaType::UChar:
+        return metacallReturn<ushort>(ctx, obj, methodIdx, args, [ctx](ushort v) { return JS_NewInt32(ctx, v); });
+    case QMetaType::UInt:
+        return metacallReturn<uint>(ctx, obj, methodIdx, args, [ctx](uint v) { return QuickJSConvert::uint64ToJS(ctx, v); });
+    case QMetaType::Long: case QMetaType::LongLong:
+        return metacallReturn<qint64>(ctx, obj, methodIdx, args, [ctx](qint64 v) { return QuickJSConvert::int64ToJS(ctx, v); });
+    case QMetaType::ULong: case QMetaType::ULongLong:
+        return metacallReturn<quint64>(ctx, obj, methodIdx, args, [ctx](quint64 v) { return QuickJSConvert::uint64ToJS(ctx, v); });
+    case QMetaType::QDateTime:
+        return metacallReturn<QDateTime>(ctx, obj, methodIdx, args, [ctx](QDateTime v) { return QuickJSConvert::dateTimeToJS(ctx, v); });
+    case QMetaType::QDate:
+        return metacallReturn<QDate>(ctx, obj, methodIdx, args, [ctx](QDate v) { return QuickJSConvert::dateToJS(ctx, v); });
+    case QMetaType::QTime:
+        return metacallReturn<QTime>(ctx, obj, methodIdx, args, [ctx](QTime v) { return QuickJSConvert::timeToJS(ctx, v); });
+    case QMetaType::QByteArray:
+        return metacallReturn<QByteArray>(ctx, obj, methodIdx, args, [ctx](QByteArray v) { return QuickJSConvert::byteArrayToJS(ctx, v); });
     default: break;
     }
 
     if (retType == qMetaTypeId<QVariantMap>()) {
         return metacallReturn<QVariantMap>(ctx, obj, methodIdx, args, [engine, ctx](QVariantMap v) { return QuickJSConvert::mapToJSObject(engine, ctx, &v, 0); });
+    }
+    if (retType == qMetaTypeId<QVariantHash>()) {
+        return metacallReturn<QVariantHash>(ctx, obj, methodIdx, args, [engine, ctx](QVariantHash v) { return QuickJSConvert::hashToJSObject(engine, ctx, &v, 0); });
+    }
+    {
+        // int-backed enums read as int32, like the generic QVariant path;
+        // other enum widths keep the generic conversion below.
+        const QMetaType mt(retType);
+        if ((mt.flags() & QMetaType::IsEnumeration) && mt.sizeOf() == sizeof(int))
+            return metacallReturn<int>(ctx, obj, methodIdx, args, [ctx](int v) { return JS_NewInt32(ctx, v); });
     }
 
     QVariant val = makeDefaultVariant(retType);
@@ -106,6 +137,8 @@ JSValue QuickJSQObjectProxy::getMetaProperty(QQuickJSEngine* engine, JSContext* 
         return readMetaProperty<bool>(ctx, obj, entry.index, [ctx](bool v) { return JS_NewBool(ctx, v); });
     case QMetaType::Double:
         return readMetaProperty<double>(ctx, obj, entry.index, [ctx](double v) { return JS_NewFloat64(ctx, v); });
+    case QMetaType::Float:
+        return readMetaProperty<float>(ctx, obj, entry.index, [ctx](float v) { return JS_NewFloat64(ctx, v); });
     case QMetaType::QString:
         return readMetaProperty<QString>(ctx, obj, entry.index, [ctx](QString v) { return qStringToJS(ctx, v); });
     case QMetaType::QObjectStar:
@@ -116,11 +149,39 @@ JSValue QuickJSQObjectProxy::getMetaProperty(QQuickJSEngine* engine, JSContext* 
         return readMetaProperty<QStringList>(ctx, obj, entry.index, [engine, ctx](QStringList v) { return QuickJSConvert::stringListToJSArray(engine, ctx, &v); });
     case QMetaType::QVariantList:
         return readMetaProperty<QVariantList>(ctx, obj, entry.index, [engine, ctx](QVariantList v) { return QuickJSConvert::listToJSArray(engine, ctx, &v, 0); });
+    case QMetaType::Short: case QMetaType::Char: case QMetaType::SChar:
+        return readMetaProperty<short>(ctx, obj, entry.index, [ctx](short v) { return JS_NewInt32(ctx, v); });
+    case QMetaType::UShort: case QMetaType::UChar:
+        return readMetaProperty<ushort>(ctx, obj, entry.index, [ctx](ushort v) { return JS_NewInt32(ctx, v); });
+    case QMetaType::UInt:
+        return readMetaProperty<uint>(ctx, obj, entry.index, [ctx](uint v) { return QuickJSConvert::uint64ToJS(ctx, v); });
+    case QMetaType::Long: case QMetaType::LongLong:
+        return readMetaProperty<qint64>(ctx, obj, entry.index, [ctx](qint64 v) { return QuickJSConvert::int64ToJS(ctx, v); });
+    case QMetaType::ULong: case QMetaType::ULongLong:
+        return readMetaProperty<quint64>(ctx, obj, entry.index, [ctx](quint64 v) { return QuickJSConvert::uint64ToJS(ctx, v); });
+    case QMetaType::QDateTime:
+        return readMetaProperty<QDateTime>(ctx, obj, entry.index, [ctx](QDateTime v) { return QuickJSConvert::dateTimeToJS(ctx, v); });
+    case QMetaType::QDate:
+        return readMetaProperty<QDate>(ctx, obj, entry.index, [ctx](QDate v) { return QuickJSConvert::dateToJS(ctx, v); });
+    case QMetaType::QTime:
+        return readMetaProperty<QTime>(ctx, obj, entry.index, [ctx](QTime v) { return QuickJSConvert::timeToJS(ctx, v); });
+    case QMetaType::QByteArray:
+        return readMetaProperty<QByteArray>(ctx, obj, entry.index, [ctx](QByteArray v) { return QuickJSConvert::byteArrayToJS(ctx, v); });
     default: break;
     }
 
     if (metaType == qMetaTypeId<QVariantMap>()) {
         return readMetaProperty<QVariantMap>(ctx, obj, entry.index, [engine, ctx](QVariantMap v) { return QuickJSConvert::mapToJSObject(engine, ctx, &v, 0); });
+    }
+    if (metaType == qMetaTypeId<QVariantHash>()) {
+        return readMetaProperty<QVariantHash>(ctx, obj, entry.index, [engine, ctx](QVariantHash v) { return QuickJSConvert::hashToJSObject(engine, ctx, &v, 0); });
+    }
+    {
+        // int-backed enums read as int32, like the generic QVariant path;
+        // other enum widths keep the generic conversion below.
+        const QMetaType mt(metaType);
+        if ((mt.flags() & QMetaType::IsEnumeration) && mt.sizeOf() == sizeof(int))
+            return readMetaProperty<int>(ctx, obj, entry.index, [ctx](int v) { return JS_NewInt32(ctx, v); });
     }
 
     QVariant val = makeDefaultVariant(metaType);
@@ -446,6 +507,60 @@ int QuickJSQObjectProxy::qobject_set_property(JSContext* ctx, JSValueConst this_
                 void* a[1] = { &v };
                 if (!safeMetacall(ctx, obj, QMetaObject::WriteProperty, entry.index, a)) return -1;
                 return 1;
+            } else if (metaType == QMetaType::Float) {
+                // Exact numeric tags only: other shapes keep the generic
+                // toVariant()+convert() route below (its coercion for
+                // strings/objects is not a plain cast).
+                const int tag = JS_VALUE_GET_TAG(val);
+                if (tag == JS_TAG_INT || JS_TAG_IS_FLOAT64(tag)) {
+                    const double num = (tag == JS_TAG_INT)
+                                           ? static_cast<double>(JS_VALUE_GET_INT(val))
+                                           : JS_VALUE_GET_FLOAT64(val);
+                    float v = static_cast<float>(num);
+                    void* a[1] = { &v };
+                    if (!safeMetacall(ctx, obj, QMetaObject::WriteProperty, entry.index, a)) return -1;
+                    return 1;
+                }
+            } else if (metaType == QMetaType::LongLong) {
+                // Integral int/float64 tags only: QVariant::convert rounds
+                // fractional doubles (3.5 -> 4), so those keep the generic path.
+                const int tag = JS_VALUE_GET_TAG(val);
+                qint64 v = 0;
+                bool exact = false;
+                if (tag == JS_TAG_INT) {
+                    v = JS_VALUE_GET_INT(val);
+                    exact = true;
+                } else if (JS_TAG_IS_FLOAT64(tag)) {
+                    const double d = JS_VALUE_GET_FLOAT64(val);
+                    if (std::isfinite(d) && d >= -9223372036854775808.0 && d < 9223372036854775808.0 && d == std::trunc(d)) {
+                        v = static_cast<qint64>(d);
+                        exact = true;
+                    }
+                }
+                if (exact) {
+                    void* a[1] = { &v };
+                    if (!safeMetacall(ctx, obj, QMetaObject::WriteProperty, entry.index, a)) return -1;
+                    return 1;
+                }
+            } else if (metaType == QMetaType::UInt) {
+                const int tag = JS_VALUE_GET_TAG(val);
+                quint32 v = 0;
+                bool exact = false;
+                if (tag == JS_TAG_INT && JS_VALUE_GET_INT(val) >= 0) {
+                    v = static_cast<quint32>(JS_VALUE_GET_INT(val));
+                    exact = true;
+                } else if (JS_TAG_IS_FLOAT64(tag)) {
+                    const double d = JS_VALUE_GET_FLOAT64(val);
+                    if (std::isfinite(d) && d >= 0.0 && d <= 4294967295.0 && d == std::trunc(d)) {
+                        v = static_cast<quint32>(d);
+                        exact = true;
+                    }
+                }
+                if (exact) {
+                    void* a[1] = { &v };
+                    if (!safeMetacall(ctx, obj, QMetaObject::WriteProperty, entry.index, a)) return -1;
+                    return 1;
+                }
             }
 
             QVariant convertedVar = engine->toVariant(val);
@@ -532,10 +647,15 @@ JSValue QuickJSQObjectProxy::js_method_invoke(JSContext* ctx, JSValueConst func_
     QQuickJSEngine* engine = static_cast<QQuickJSEngine*>(JS_GetContextOpaque(ctx));
 
     return invokeSafe(ctx, "method invoke", [&]() -> JSValue {
-        auto data = static_cast<JSMethodProxyData*>(JS_GetOpaque(func_obj, engine->m_methodClassID));
-        if (!data) data = static_cast<JSMethodProxyData*>(JS_GetOpaque(func_obj, engine->m_signalClassID));
-
-        if (!data || data->obj.isNull()) return JS_ThrowTypeError(ctx, "C++ object has been deleted");
+        // One probe covers both proxy flavors: method and signal proxies
+        // share the JSMethodProxyData layout; the class-id check rejects any
+        // other class (e.g. QObject wrappers).
+        JSClassID proxyClassId = 0;
+        auto data = static_cast<JSMethodProxyData*>(JS_GetAnyOpaque(func_obj, &proxyClassId));
+        if (!data || (proxyClassId != engine->m_methodClassID && proxyClassId != engine->m_signalClassID)
+                || data->obj.isNull()) {
+            return JS_ThrowTypeError(ctx, "C++ object has been deleted");
+        }
 
         QObject* obj = data->obj.data();
         const int paramCount = data->paramCount;
@@ -544,7 +664,7 @@ JSValue QuickJSQObjectProxy::js_method_invoke(JSContext* ctx, JSValueConst func_
         args[0] = nullptr;
 
         struct NativeArgHolder {
-            int i; bool b; double d; QString str; QObject* obj;
+            int i; bool b; double d; float f; qint64 i64; quint32 u32; QString str; QObject* obj;
         };
         QVarLengthArray<NativeArgHolder, 10> nativeArgs(paramCount);
         QVarLengthArray<QVariant, 10> varArgs(paramCount);
@@ -564,6 +684,44 @@ JSValue QuickJSQObjectProxy::js_method_invoke(JSContext* ctx, JSValueConst func_
                 } else if (expectedType == QMetaType::Double) {
                     if (JS_ToFloat64(ctx, &nativeArgs[i].d, argv[i]) == 0) { args[i+1] = &nativeArgs[i].d; converted = true; }
                     else clearPendingException(ctx);
+                } else if (expectedType == QMetaType::Float) {
+                    // Exact numeric tags only: other shapes (strings, objects,
+                    // BigInt) keep the generic toVariant()+convert() route
+                    // below, whose coercion is not a plain cast.
+                    const int tag = JS_VALUE_GET_TAG(argv[i]);
+                    if (tag == JS_TAG_INT) {
+                        nativeArgs[i].f = static_cast<float>(JS_VALUE_GET_INT(argv[i]));
+                        args[i+1] = &nativeArgs[i].f; converted = true;
+                    } else if (JS_TAG_IS_FLOAT64(tag)) {
+                        nativeArgs[i].f = static_cast<float>(JS_VALUE_GET_FLOAT64(argv[i]));
+                        args[i+1] = &nativeArgs[i].f; converted = true;
+                    }
+                } else if (expectedType == QMetaType::LongLong) {
+                    // Integral int/float64 tags only: QVariant::convert
+                    // rounds fractional doubles, so those keep the generic path.
+                    const int tag = JS_VALUE_GET_TAG(argv[i]);
+                    if (tag == JS_TAG_INT) {
+                        nativeArgs[i].i64 = JS_VALUE_GET_INT(argv[i]);
+                        args[i+1] = &nativeArgs[i].i64; converted = true;
+                    } else if (JS_TAG_IS_FLOAT64(tag)) {
+                        const double d = JS_VALUE_GET_FLOAT64(argv[i]);
+                        if (std::isfinite(d) && d >= -9223372036854775808.0 && d < 9223372036854775808.0 && d == std::trunc(d)) {
+                            nativeArgs[i].i64 = static_cast<qint64>(d);
+                            args[i+1] = &nativeArgs[i].i64; converted = true;
+                        }
+                    }
+                } else if (expectedType == QMetaType::UInt) {
+                    const int tag = JS_VALUE_GET_TAG(argv[i]);
+                    if (tag == JS_TAG_INT && JS_VALUE_GET_INT(argv[i]) >= 0) {
+                        nativeArgs[i].u32 = static_cast<quint32>(JS_VALUE_GET_INT(argv[i]));
+                        args[i+1] = &nativeArgs[i].u32; converted = true;
+                    } else if (JS_TAG_IS_FLOAT64(tag)) {
+                        const double d = JS_VALUE_GET_FLOAT64(argv[i]);
+                        if (std::isfinite(d) && d >= 0.0 && d <= 4294967295.0 && d == std::trunc(d)) {
+                            nativeArgs[i].u32 = static_cast<quint32>(d);
+                            args[i+1] = &nativeArgs[i].u32; converted = true;
+                        }
+                    }
                 } else if (expectedType == QMetaType::QString) {
                     ScopedJSValue strVal(ctx, JS_ToString(ctx, argv[i]));
                     if (JS_IsException(strVal.value())) {

@@ -60,6 +60,16 @@ public:
     static JSValue listToJSArray(QQuickJSEngine* engine, JSContext* ctx, const QVariantList* listPtr, int depth);
     static JSValue stringListToJSArray(QQuickJSEngine* engine, JSContext* ctx, const QStringList* listPtr);
 
+    // Scalar fast paths shared by toJSValueImpl() and the metacall sites
+    // (property/method returns, signal arguments). They must stay
+    // behaviorally identical to the generic QVariant-based conversion.
+    static JSValue int64ToJS(JSContext* ctx, qint64 v);
+    static JSValue uint64ToJS(JSContext* ctx, quint64 v);
+    static JSValue dateTimeToJS(JSContext* ctx, const QDateTime& dt);
+    static JSValue dateToJS(JSContext* ctx, const QDate& d);
+    static JSValue timeToJS(JSContext* ctx, const QTime& t);
+    static JSValue byteArrayToJS(JSContext* ctx, const QByteArray& ba);
+
     static int adjustEnumType(int type);
 };
 

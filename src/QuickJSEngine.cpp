@@ -50,6 +50,11 @@ QQuickJSEngine::QQuickJSEngine(QObject* parent) : QObject(parent),
     JS_SetMemoryLimit(m_rt, 64 * 1024 * 1024);
     JS_SetMaxStackSize(m_rt, 512 * 1024);
     JS_SetGCThreshold(m_rt, 1 * 1024 * 1024);
+    // Explicit defensive default: Atomics.wait() must never block the host
+    // thread in a console application. SharedArrayBuffer is not exposed
+    // either (no JS_SetSharedArrayBufferFunctions call); the flag guards
+    // against future intrinsic changes.
+    JS_SetCanBlock(m_rt, false);
 
     JS_SetContextOpaque(m_ctx, this);
     JS_SetRuntimeOpaque(m_rt, this);
@@ -127,11 +132,9 @@ QQuickJSEngine::QQuickJSEngine(QObject* parent) : QObject(parent),
         throw std::runtime_error("QQuickJSEngine: Failed to create QObject class");
     }
 
-    JSValue global = JS_GetGlobalObject(m_ctx);
-    JSValue funcCtor = JS_GetPropertyStr(m_ctx, global, "Function");
-    JSValue funcProto = JS_GetPropertyStr(m_ctx, funcCtor, "prototype");
-    JS_FreeValue(m_ctx, funcCtor);
-    JS_FreeValue(m_ctx, global);
+    // Single C call instead of the global -> Function -> prototype lookup
+    // chain; returns a new reference.
+    JSValue funcProto = JS_GetFunctionProto(m_ctx);
 
     if (!JS_IsObject(funcProto)) {
         clearPendingException(m_ctx);
@@ -243,8 +246,7 @@ QQuickJSEngine::~QQuickJSEngine() {
     // Buffered unhandled rejections are freed without reporting: emitting
     // signals from the destructor would be unsafe for subscribers.
     for (const PendingRejection& e : m_pendingRejections) {
-        JS_FreeValue(m_ctx, e.promise);
-        JS_FreeValue(m_ctx, e.reason);
+        JS_FreeValues(m_ctx, e.promise, e.reason);
     }
     m_pendingRejections.clear();
 
@@ -281,12 +283,8 @@ QQuickJSEngine::~QQuickJSEngine() {
     }
     m_stringAtomCache.clear();
 
-    JS_FreeAtom(m_ctx, m_atoms.length);
-    JS_FreeAtom(m_ctx, m_atoms.getTime);
-    JS_FreeAtom(m_ctx, m_atoms.stack);
-    JS_FreeAtom(m_ctx, m_atoms.lineNumber);
-    JS_FreeAtom(m_ctx, m_atoms.line);
-    JS_FreeAtom(m_ctx, m_atoms.name);
+    JS_FreeAtoms(m_ctx, m_atoms.length, m_atoms.getTime, m_atoms.stack,
+                 m_atoms.lineNumber, m_atoms.line, m_atoms.name);
 
     JS_FreeValue(m_ctx, m_globalObj);
     JS_FreeContext(m_ctx);
@@ -353,6 +351,31 @@ QQuickJSValue QQuickJSEngine::newErrorObject(QQuickJSValue::ErrorType errorType,
         // QJSEngine parity: NoError yields an undefined value, not an Error.
         return QQuickJSValue();
     }
+
+    // quickjs-ng provides C constructors with the built-in prototypes for
+    // these five classes: engine-created errors stay immune to scripts
+    // replacing globalThis.TypeError etc. (QJSEngine parity — V4 also uses
+    // its internal prototypes). EvalError/URIError have no C helpers in
+    // quickjs-ng 0.18 and keep the global-constructor fallback below.
+    if (errorType != QQuickJSValue::EvalError && errorType != QQuickJSValue::URIError) {
+        // "%s" stops at an embedded NUL; error messages are not expected
+        // to contain one.
+        const QByteArray utf8 = message.toString().toUtf8();
+        JSValue err = JS_EXCEPTION;
+        switch (errorType) {
+        case QQuickJSValue::GenericError: err = JS_NewPlainError(m_ctx, "%s", utf8.constData()); break;
+        case QQuickJSValue::RangeError: err = JS_NewRangeError(m_ctx, "%s", utf8.constData()); break;
+        case QQuickJSValue::ReferenceError: err = JS_NewReferenceError(m_ctx, "%s", utf8.constData()); break;
+        case QQuickJSValue::SyntaxError: err = JS_NewSyntaxError(m_ctx, "%s", utf8.constData()); break;
+        case QQuickJSValue::TypeError: err = JS_NewTypeError(m_ctx, "%s", utf8.constData()); break;
+        default: break;   // unreachable: the remaining types are handled above
+        }
+        if (JS_IsException(err)) return QQuickJSValue::fromException(this);
+        QQuickJSValue result(this, err, true);
+        result.m_isError = true;
+        return result;
+    }
+
     const char* ctorName = "Error";
     switch (errorType) {
     case QQuickJSValue::EvalError: ctorName = "EvalError"; break;
@@ -498,6 +521,37 @@ QString joinConsoleArgs(JSContext* ctx, int argc, JSValueConst* argv, int start)
         parts.append(consoleArgToString(ctx, argv[i]));
     }
     return parts.join(u' ');
+}
+
+// Generic console method body for log/info/debug/warn/error: the severity
+// arrives in the magic argument. Installed through the static function-list
+// table in installExtensions() instead of a per-method creation loop.
+static JSValue js_console_generic(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv, int magic) {
+    try {
+        QStringList msgParts;
+        for (int i = 0; i < argc; i++) {
+            msgParts.append(consoleArgToString(ctx, argv[i]));
+        }
+
+        switch (static_cast<QtMsgType>(magic)) {
+        case QtWarningMsg:
+            qWarning().noquote() << "[JS console]" << msgParts.join(u' ');
+            break;
+        case QtCriticalMsg:
+            qCritical().noquote() << "[JS console]" << msgParts.join(u' ');
+            break;
+        default:
+            qDebug().noquote() << "[JS console]" << msgParts.join(u' ');
+            break;
+        }
+        return JS_UNDEFINED;
+    } catch (const std::exception& e) {
+        try { JS_ThrowPlainError(ctx, "console: %s", e.what()); } catch (...) {}
+        return JS_EXCEPTION;
+    } catch (...) {
+        try { JS_ThrowInternalError(ctx, "console: unknown C++ exception"); } catch (...) {}
+        return JS_EXCEPTION;
+    }
 }
 
 // Caller stack of a console.* invocation, built from a freshly constructed
@@ -769,49 +823,20 @@ void QQuickJSEngine::installExtensions(QQuickJSEngine::Extensions extensions, co
         if (JS_IsException(console.value())) {
             clearPendingException(m_ctx);
         } else {
-            auto addConsoleMethod = [this](JSValue obj, const char* name, QtMsgType msgType) {
-                JSValue func = JS_NewCFunctionMagic(
-                    m_ctx,
-                    [](JSContext* ctx, JSValueConst, int argc, JSValueConst* argv, int magic) -> JSValue {
-                        try {
-                            QStringList msgParts;
-                            for (int i = 0; i < argc; i++) {
-                                msgParts.append(consoleArgToString(ctx, argv[i]));
-                            }
-
-                            switch (static_cast<QtMsgType>(magic)) {
-                            case QtWarningMsg:
-                                qWarning().noquote() << "[JS console]" << msgParts.join(u' ');
-                                break;
-                            case QtCriticalMsg:
-                                qCritical().noquote() << "[JS console]" << msgParts.join(u' ');
-                                break;
-                            default:
-                                qDebug().noquote() << "[JS console]" << msgParts.join(u' ');
-                                break;
-                            }
-                            return JS_UNDEFINED;
-                        } catch (const std::exception& e) {
-                            try { JS_ThrowPlainError(ctx, "console: %s", e.what()); } catch (...) {}
-                            return JS_EXCEPTION;
-                        } catch (...) {
-                            try { JS_ThrowInternalError(ctx, "console: unknown C++ exception"); } catch (...) {}
-                            return JS_EXCEPTION;
-                        }
-                    },
-                    name, 1, JS_CFUNC_generic_magic, static_cast<int>(msgType)
-                    );
-
-                if (JS_SetPropertyStr(m_ctx, obj, name, func) < 0) {
-                    clearPendingException(m_ctx);
-                }
+            // log/info/debug/warn/error share one generic C function with a
+            // severity magic; the static table installs all five methods in
+            // one JS_SetPropertyFunctionList() pass.
+            static constexpr JSCFunctionListEntry kConsoleMethods[] = {
+                JS_CFUNC_MAGIC_DEF("log", 1, js_console_generic, QtDebugMsg),
+                JS_CFUNC_MAGIC_DEF("info", 1, js_console_generic, QtDebugMsg),
+                JS_CFUNC_MAGIC_DEF("debug", 1, js_console_generic, QtDebugMsg),
+                JS_CFUNC_MAGIC_DEF("warn", 1, js_console_generic, QtWarningMsg),
+                JS_CFUNC_MAGIC_DEF("error", 1, js_console_generic, QtCriticalMsg),
             };
-
-            addConsoleMethod(console.value(), "log", QtDebugMsg);
-            addConsoleMethod(console.value(), "info", QtDebugMsg);
-            addConsoleMethod(console.value(), "debug", QtDebugMsg);
-            addConsoleMethod(console.value(), "warn", QtWarningMsg);
-            addConsoleMethod(console.value(), "error", QtCriticalMsg);
+            if (JS_SetPropertyFunctionList(m_ctx, console.value(), kConsoleMethods,
+                                            static_cast<int>(sizeof(kConsoleMethods) / sizeof(kConsoleMethods[0]))) < 0) {
+                clearPendingException(m_ctx);
+            }
 
             // QJSEngine ConsoleExtension parity: assert, count, time, timeEnd,
             // trace, exception. Timers and counters live on the engine (V4
@@ -1039,8 +1064,7 @@ void QQuickJSEngine::queueUnhandledRejection(JSContext* ctx, JSValueConst promis
         m_pendingRejections.append(entry);
     } catch (...) {
         // Cannot buffer (OOM): free the duplicates and report immediately.
-        JS_FreeValue(ctx, entry.promise);
-        JS_FreeValue(ctx, entry.reason);
+        JS_FreeValues(ctx, entry.promise, entry.reason);
         processAndEmitException(ctx, reason);
     }
 }
@@ -1705,31 +1729,15 @@ JSValue QQuickJSEngine::toJSValueImpl(const QVariant& var, int depth) {
     case QMetaType::Bool: return JS_NewBool(m_ctx, var.toBool());
     case QMetaType::Int: case QMetaType::Short: case QMetaType::SChar: case QMetaType::Char:
         return JS_NewInt32(m_ctx, var.toInt());
-    case QMetaType::Long: case QMetaType::LongLong: {
-        qint64 val = var.toLongLong();
-        if (val >= std::numeric_limits<int32_t>::min() && val <= std::numeric_limits<int32_t>::max()) {
-            return JS_NewInt32(m_ctx, static_cast<int32_t>(val));
-        }
-        if (val >= -9007199254740991LL && val <= 9007199254740991LL) {
-            return JS_NewFloat64(m_ctx, static_cast<double>(val));
-        }
-        return JS_NewBigInt64(m_ctx, val);
-    }
+    case QMetaType::Long: case QMetaType::LongLong:
+        return QuickJSConvert::int64ToJS(m_ctx, var.toLongLong());
     case QMetaType::UInt: case QMetaType::UShort: case QMetaType::UChar: {
         quint32 val = var.toUInt();
         if (val <= static_cast<quint32>(std::numeric_limits<int32_t>::max())) return JS_NewInt32(m_ctx, static_cast<int32_t>(val));
         return JS_NewFloat64(m_ctx, static_cast<double>(val));
     }
-    case QMetaType::ULong: case QMetaType::ULongLong: {
-        quint64 val = var.toULongLong();
-        if (val <= static_cast<quint64>(std::numeric_limits<int32_t>::max())) {
-            return JS_NewInt32(m_ctx, static_cast<int32_t>(val));
-        }
-        if (val <= 9007199254740991ULL) {
-            return JS_NewFloat64(m_ctx, static_cast<double>(val));
-        }
-        return JS_NewBigUint64(m_ctx, val);
-    }
+    case QMetaType::ULong: case QMetaType::ULongLong:
+        return QuickJSConvert::uint64ToJS(m_ctx, var.toULongLong());
     case QMetaType::Double: case QMetaType::Float: return JS_NewFloat64(m_ctx, var.toDouble());
     case QMetaType::QStringList:
         return QuickJSConvert::stringListToJSArray(this, m_ctx, static_cast<const QStringList*>(var.constData()));
@@ -1754,22 +1762,14 @@ JSValue QQuickJSEngine::toJSValueImpl(const QVariant& var, int depth) {
     switch (var.userType()) {
     case QMetaType::QString: return qStringToJS(m_ctx, var.toString());
     case QMetaType::QChar: return qStringToJS(m_ctx, QString(var.toChar()));
-    case QMetaType::QByteArray: {
-        const QByteArray ba = var.toByteArray();
-        return JS_NewArrayBufferCopy(m_ctx, reinterpret_cast<const uint8_t*>(ba.constData()), static_cast<size_t>(ba.size()));
-    }
-    case QMetaType::QDateTime: {
-        qint64 msecs = var.toDateTime().toMSecsSinceEpoch();
-        return JS_NewDate(m_ctx, static_cast<double>(msecs));
-    }
-    case QMetaType::QDate: {
-        QDateTime dt(var.toDate(), QTime(0,0));
-        qint64 msecs = dt.toMSecsSinceEpoch();
-        return JS_NewDate(m_ctx, static_cast<double>(msecs));
-    }
-    case QMetaType::QTime: {
-        return qStringToJS(m_ctx, var.toTime().toString(Qt::ISODate));
-    }
+    case QMetaType::QByteArray:
+        return QuickJSConvert::byteArrayToJS(m_ctx, var.toByteArray());
+    case QMetaType::QDateTime:
+        return QuickJSConvert::dateTimeToJS(m_ctx, var.toDateTime());
+    case QMetaType::QDate:
+        return QuickJSConvert::dateToJS(m_ctx, var.toDate());
+    case QMetaType::QTime:
+        return QuickJSConvert::timeToJS(m_ctx, var.toTime());
     default: break;
     }
 
@@ -1907,10 +1907,37 @@ JSValue QQuickJSEngine::toJSValueFromVoid(void* data, int metaType) {
     if (metaType == QMetaType::Int) return JS_NewInt32(m_ctx, *static_cast<int*>(data));
     if (metaType == QMetaType::Bool) return JS_NewBool(m_ctx, *static_cast<bool*>(data));
     if (metaType == QMetaType::Double) return JS_NewFloat64(m_ctx, *static_cast<double*>(data));
+    if (metaType == QMetaType::Float) return JS_NewFloat64(m_ctx, *static_cast<float*>(data));
     if (metaType == QMetaType::QString) return qStringToJS(m_ctx, *static_cast<QString*>(data));
     if (metaType == QMetaType::QObjectStar) return wrapQObject(*static_cast<QObject**>(data));
     if (metaType == QMetaType::QVariant) return toJSValue(*static_cast<QVariant*>(data));
     if (metaType == QMetaType::UnknownType || metaType == QMetaType::Void) return JS_UNDEFINED;
+
+    // Same scalar fast paths as toJSValueImpl(): metacall argument storage
+    // points at a value of exactly the declared type.
+    if (metaType == QMetaType::LongLong || metaType == QMetaType::Long)
+        return QuickJSConvert::int64ToJS(m_ctx, *static_cast<qint64*>(data));
+    if (metaType == QMetaType::ULongLong || metaType == QMetaType::ULong)
+        return QuickJSConvert::uint64ToJS(m_ctx, *static_cast<quint64*>(data));
+    if (metaType == QMetaType::UInt) return QuickJSConvert::uint64ToJS(m_ctx, *static_cast<uint*>(data));
+    if (metaType == QMetaType::UShort) return JS_NewInt32(m_ctx, *static_cast<ushort*>(data));
+    if (metaType == QMetaType::UChar) return JS_NewInt32(m_ctx, *static_cast<uchar*>(data));
+    if (metaType == QMetaType::Short) return JS_NewInt32(m_ctx, *static_cast<short*>(data));
+    if (metaType == QMetaType::Char) return JS_NewInt32(m_ctx, *static_cast<char*>(data));
+    if (metaType == QMetaType::SChar) return JS_NewInt32(m_ctx, *static_cast<signed char*>(data));
+    if (metaType == QMetaType::QDateTime) return QuickJSConvert::dateTimeToJS(m_ctx, *static_cast<QDateTime*>(data));
+    if (metaType == QMetaType::QDate) return QuickJSConvert::dateToJS(m_ctx, *static_cast<QDate*>(data));
+    if (metaType == QMetaType::QTime) return QuickJSConvert::timeToJS(m_ctx, *static_cast<QTime*>(data));
+    if (metaType == QMetaType::QByteArray) return QuickJSConvert::byteArrayToJS(m_ctx, *static_cast<QByteArray*>(data));
+    if (metaType == qMetaTypeId<QVariantHash>())
+        return QuickJSConvert::hashToJSObject(this, m_ctx, static_cast<const QVariantHash*>(data), 0);
+    if (metaType == qMetaTypeId<QStringList>())
+        return QuickJSConvert::stringListToJSArray(this, m_ctx, static_cast<const QStringList*>(data));
+    {
+        const QMetaType mt(metaType);
+        if ((mt.flags() & QMetaType::IsEnumeration) && mt.sizeOf() == sizeof(int))
+            return JS_NewInt32(m_ctx, *static_cast<int*>(data));
+    }
 
     QVariant var(QMetaType(metaType), data);
     return toJSValue(var);
