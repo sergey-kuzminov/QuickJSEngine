@@ -501,6 +501,18 @@ static int moduleFailureClass(const QJSValue& v)
     return static_cast<int>(QJSValue::NoError);
 }
 
+// The guard's error shape: quickjs-ng raises its stack overflow (and this
+// engine's starved-entry refusal deliberately mirrors it) as a RangeError
+// whose message mentions the stack. isError() alone passes for ANY error
+// (e.g. a TypeError from an unrelated engine failure) and would mask a
+// real regression - assert the shape instead.
+static bool isStackGuardError(const QQuickJSValue& v)
+{
+    return v.isError()
+        && v.errorType() == QQuickJSValue::RangeError
+        && v.toString().contains(QLatin1String("stack"));
+}
+
 // A QThread with a deliberately small stack hosting an engine that runs an
 // unbounded recursion: the default recursion budget is clamped to the real
 // thread bounds, so the guard must fire (a catchable error) instead of the
@@ -512,7 +524,43 @@ public:
     void run() override {
         QQuickJSEngine eng;
         const QQuickJSValue res = eng.evaluate(QStringLiteral("function f(){f();} f();"));
-        result = res.isError() ? GuardFired : ReturnedOther;
+        result = isStackGuardError(res) ? GuardFired : ReturnedOther;
+    }
+};
+
+// A QThread whose whole stack (128 KiB) is SMALLER than the guard's safety
+// margin (also 128 KiB): the entry anchor necessarily sits inside the
+// margin, i.e. above = SP - floor < kSafetyMargin. Regression test for the
+// unsigned underflow in the budget clamp: sp - floor - kSafetyMargin used to
+// wrap around ~2^64, sail past the minimum-usable check and install the FULL
+// unclamped budget (hundreds of KiB) on a 128 KiB stack - a guard line far
+// below the real bottom, unreachable, so runaway recursion ran straight
+// into the guard page and killed the whole process. The fixed clamp must
+// recognize the starved window and refuse script entries with a catchable
+// error instead (see QQuickJSEngine::evaluate, m_stackStarved); a hard
+// crash in this test would have killed the suite itself, not just a check.
+class StarvedStackThread : public QThread {
+public:
+    enum Outcome { NotRun = 0, Refused = 1, ReturnedOther = 2, Completed = 3 };
+    Outcome result = NotRun;
+    Outcome trivial = NotRun;   // second entry ("1+1"): refused, or legitimately run
+    // The registerModule hole probed on the same starved anchor: its snapshot
+    // reads user getters, so the entry refusal must apply there too. The
+    // registration result (bool) and the follow-up importModule() - which
+    // surfaces the pending RangeError of the refused registration - pin
+    // both halves of the refusal contract.
+    bool registered = true;
+    Outcome imported = NotRun;
+    void run() override {
+        QQuickJSEngine eng;
+        const QQuickJSValue res = eng.evaluate(QStringLiteral("function f(){f();} f();"));
+        result = isStackGuardError(res) ? Refused : ReturnedOther;
+        const QQuickJSValue res2 = eng.evaluate(QStringLiteral("1 + 1"));
+        trivial = res2.isError() ? Refused : ReturnedOther;
+        registered = eng.registerModule(QStringLiteral("m"), eng.newObject());
+        const QQuickJSValue imp = eng.importModule(QStringLiteral("m"));
+        imported = isStackGuardError(imp) ? Refused
+            : (imp.isError() ? ReturnedOther : Completed);
     }
 };
 
@@ -957,7 +1005,7 @@ static void runAllTests(const bool runDangerous) {
         TEST_RESULT("Limit: Timeout (while(true))", timeoutRes.isError() && t.elapsed() < 2000, "Timeout failed");
 
         QQuickJSEngine stackEng;
-        TEST_RESULT("Limit: Stack Overflow", stackEng.evaluate("function f(){f();} f();").isError(), "Stack overflow not caught");
+        TEST_RESULT("Limit: Stack Overflow", isStackGuardError(stackEng.evaluate("function f(){f();} f();")), "Stack overflow not caught");
 
         // A tight budget must catch runaway recursion and leave the engine usable.
         // (The requested budget is the JS recursion share; the effective guard
@@ -966,7 +1014,7 @@ static void runAllTests(const bool runDangerous) {
         QQuickJSEngine budgetEng;
         budgetEng.setMaxStackSize(64 * 1024);
         TEST_RESULT("Limit: setMaxStackSize tightens the recursion budget",
-                    budgetEng.evaluate("function f(){f();} f();").isError()
+                    isStackGuardError(budgetEng.evaluate("function f(){f();} f();"))
                         && budgetEng.evaluate("1+1").toInt() == 2,
                     "a custom stack budget did not catch recursion");
 
@@ -989,16 +1037,17 @@ static void runAllTests(const bool runDangerous) {
 
         // A small worker-thread stack: the default budget must be clamped to
         // the real thread bounds, so the guard fires instead of the process
-        // stack being exhausted (Windows ASan Debug crash class).
-        {
-            StackProbeThread thread;
-            thread.setStackSize(512 * 1024);
-            thread.start();
-            thread.wait();
-            TEST_RESULT("Limit: stack guard fires on a small thread stack",
-                        thread.result == StackProbeThread::GuardFired,
-                        QStringLiteral("small-stack thread outcome=%1").arg(int(thread.result)));
-        }
+        // stack being exhausted (Windows ASan Debug crash class). Moved to
+        // the dangerous regression section: on unpatched code the misclamped
+        // guard line kills the whole process, which must not mask the safe
+        // tests' results (see runDangerous).
+
+        // Starved stack, the underflow regression: the whole thread stack
+        // (128 KiB) is below the safety margin, so the anchor sits INSIDE the
+        // margin - the exact case where the old clamp arithmetic underflowed
+        // and installed an unreachable guard line (hard process crash on the
+        // first runaway recursion). Also moved to the dangerous section:
+        // pre-fix code never gets this far (SIGSEGV at the first entry).
 
         // The guard must fire at real recursion depth, not on entry: count
         // the frames actually reached before the catchable RangeError. A
@@ -1012,7 +1061,7 @@ static void runAllTests(const bool runDangerous) {
                 "globalThis.depth = 0; function f(){ globalThis.depth++; f(); } f();"));
             const int depth = depthEng.globalObject().property(QStringLiteral("depth")).toInt();
             TEST_RESULT("Limit: guard fires at real recursion depth",
-                        depthRes.isError() && depth >= 5,
+                        isStackGuardError(depthRes) && depth >= 5,
                         QStringLiteral("depth=%1 (0-2 means the guard fired inside the entry machinery)")
                             .arg(depth));
             TEST_RESULT("Limit: engine usable after a stack overflow",
@@ -1027,7 +1076,8 @@ static void runAllTests(const bool runDangerous) {
             QQuickJSEngine repeatEng;
             int firstNotCaught = -1;
             for (int i = 0; i < 10; ++i) {
-                if (!repeatEng.evaluate(QStringLiteral("function f(){f();} f();")).isError()) {
+                const QQuickJSValue r = repeatEng.evaluate(QStringLiteral("function f(){f();} f();"));
+                if (!isStackGuardError(r)) {
                     firstNotCaught = i;
                     break;
                 }
@@ -2171,6 +2221,72 @@ static void runAllTests(const bool runDangerous) {
         // Note: The "Zombie value" test was removed because it violates QuickJS's fundamental
         // C-API contract: all JSValues MUST be freed before JS_FreeRuntime is called.
         // Testing this scenario causes an unavoidable assertion failure in QuickJS debug builds.
+
+        // Stack-guard regression threads. These are crash-capable on unpatched
+        // code (a misclamped guard line turns runaway recursion into SIGSEGV),
+        // which is exactly why they live HERE: a crash must not mask the safe
+        // tests' results printed above.
+        {
+            StackProbeThread thread;
+            thread.setStackSize(512 * 1024);
+            thread.start();
+            thread.wait();
+            TEST_RESULT("Limit: stack guard fires on a small thread stack",
+                        thread.result == StackProbeThread::GuardFired,
+                        QStringLiteral("small-stack thread outcome=%1").arg(int(thread.result)));
+        }
+
+        // Starved stack, the underflow regression: the whole thread stack
+        // (128 KiB) is below the safety margin, so the anchor sits INSIDE
+        // the margin - the exact case where the old clamp arithmetic
+        // underflowed and installed an unreachable guard line (hard process
+        // crash on the first runaway recursion). The engine must keep every
+        // script entry a catchable error (or a normal value) and the process
+        // alive. "1+1" is only guaranteed to be refused when the OS really
+        // delivered the full starved window: a benign environment variance
+        // (thread placement, sanitizer thread bootstrap) can leave the thread
+        // a slightly larger usable window than requested, in which case the
+        // trivial entry legitimately runs under a properly clamped budget.
+        // Pre-fix code never gets this far: the underflowed budget kills the
+        // whole process at the first entry (SIGSEGV), which is exactly what
+        // this regression test pins.
+        {
+            StarvedStackThread thread;
+            thread.setStackSize(128 * 1024);
+            thread.start();
+            thread.wait();
+            TEST_RESULT("Limit: starved-stack entry refused, no underflow",
+                        thread.result == StarvedStackThread::Refused
+                            && thread.trivial != StarvedStackThread::NotRun,
+                        QStringLiteral("starved thread outcome=%1 trivial=%2 - the process "
+                                       "survived; pre-fix code died here with SIGSEGV")
+                            .arg(int(thread.result))
+                            .arg(int(thread.trivial)));
+            // The registerModule hole (same starved anchor): registration is
+            // refused (false) with a pending RangeError, and the follow-up
+            // importModule() surfaces that pending error instead of loading.
+            // Both halves are only guaranteed on the window that also
+            // refused the trivial entry. In the benign-variance case (the
+            // trivial entry ran; a Windows/ASan thread bootstrap can leave
+            // the requested 128 KiB thread a larger usable window) the
+            // registration must succeed, and importModule() must not return
+            // a stack refusal: it resolves no registered bare name (Qt 6.12
+            // parity, see "RegModule: invisible to global object and
+            // importModule"), so the documented outcome is the plain
+            // "could not load module filename" error, and a "Maximum call
+            // stack size exceeded" here would be a false fire in a window
+            // the guard itself measured as usable.
+            TEST_RESULT("Limit: starved registerModule refused, import surfaces the refusal",
+                        thread.trivial == StarvedStackThread::Refused
+                            ? (!thread.registered
+                               && thread.imported == StarvedStackThread::Refused)
+                            : (thread.registered
+                               && thread.imported != StarvedStackThread::Refused),
+                        QStringLiteral("registered=%1 imported=%2 trivial=%3")
+                            .arg(thread.registered)
+                            .arg(int(thread.imported))
+                            .arg(int(thread.trivial)));
+        }
 
         // Foreign engine value should be rejected by setProperty
         {

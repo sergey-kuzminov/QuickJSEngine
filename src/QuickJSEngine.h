@@ -291,16 +291,17 @@ public:
      * The budget is measured downwards from the current stack position at
      * every top-level entry point (evaluate(), QQuickJSValue::call() and other
      * engine entries re-anchor the guard), so nested or unusually deep host
-     * calls do not silently eat the budget. Values are clamped into
-     * [256 KiB, usable stack of the thread]: the lower bound keeps the guard
-     * below the engine's own C++ entry machinery (evaluate -> compile ->
-     * first JS frame), which is a few KiB in release builds but can exceed
-     * 64 KiB in Debug/ASan builds - a budget inside that machinery makes every
-     * script throw a stack overflow on entry. The upper bound keeps the guard
-     * line above the real stack bottom: a guard below the bottom never fires
-     * and runaway recursion then crashes the process instead of raising a
-     * catchable error. Call from the engine's thread, like the other setters
-     * of this class.
+     * calls do not silently eat the budget. The effective guard budget is
+     * this requested JS recursion share plus a calibrated machinery
+     * allowance (the C entry chain down to the first JS frame), clamped to
+     * the stack the engine's thread can actually spare: never below the
+     * safety margin above the real stack bottom (an unreachable guard turns
+     * runaway recursion into a hard process crash), and never above the
+     * usable window below the entry. When the entry itself arrives deeper
+     * than safety margin + 64 KiB above the bottom, a fixed emergency
+     * budget keeps the engine-internal JS catchable and script entries are
+     * refused with a catchable RangeError instead of entering JS at all.
+     * Call from the engine's thread, like the other setters of this class.
      */
     void setMaxStackSize(size_t size);
     void collectGarbage();
@@ -377,28 +378,6 @@ public:
         resetExecutionTimer();
         reanchorStackGuard();
     }
-    // Re-measures the JS stack guard from the current stack position and
-    // re-clamps it against the real bounds of the engine's thread. Called at
-    // every top-level engine entry (through resetExecutionState()) and from
-    // setMaxStackSize(): a guard anchored only at engine creation misses the
-    // C++ machinery below deeper entry points. The effective budget always
-    // includes the calibrated machinery allowance (see
-    // calibrateMachineryAllowance()), so on Debug/ASan builds with fat C
-    // frames the guard line stays below the legitimate entry chain and only
-    // runaway JS recursion crosses it (Windows MinGW Debug+ASan measured
-    // ~22 KiB per JS_CallInternal frame: a bare 512 KiB budget anchored at
-    // the entry made every check-hitting operation - promise jobs, typed
-    // array construction, apply(), async resume, module linking - throw a
-    // false "Maximum call stack size exceeded" while plain bytecode scripts
-    // without stack checks kept running - the Windows MinGW Debug+ASan
-    // failure class).
-    void reanchorStackGuard();
-    // One-shot (per engine) measurement of the real C machinery descent below
-    // a top-level entry: evaluates a nested-call probe script through a
-    // hidden C function that records its own stack pointer, then derives the
-    // machinery allowance (x2 safety) used by reanchorStackGuard(). Runs in
-    // the constructor under a provisional margin-only guard.
-    void calibrateMachineryAllowance();
     JSValue toJSValueFromVoid(void* data, int metaType);
 
 private:
@@ -412,23 +391,29 @@ private:
     // Requested JS recursion budget (0 = guard disabled); the effective value
     // is re-clamped at every top-level entry, see reanchorStackGuard().
     size_t m_stackBudgetBytes = DefaultStackBudget;
-    // Measured C machinery descent below a top-level entry (parser + nested
-    // JS frames + C trampolines), in bytes, granted on top of the requested
-    // budget at every reanchor; calibrated once by
+    // Measured C machinery descent below a top-level entry (compile + eval +
+    // first JS_CallInternal + C trampolines), in bytes, granted on top of the
+    // requested budget at every reanchor; calibrated once by
     // calibrateMachineryAllowance() (m_allowanceCalibrated gates the probe).
     size_t m_machineryAllowance = 0;
     bool m_allowanceCalibrated = false;
+    // Set by reanchorStackGuard() when the entry anchor sits deeper than
+    // safety margin + 64 KiB above the real thread stack bottom: the stack
+    // is too starved to enter JS safely (even the throw path may not fit),
+    // so every top-level entry (evaluate(), executeJsCall(), signal
+    // callbacks) refuses with a catchable RangeError before running any
+    // script; engine-internal JS stays under the emergency guard budget.
+    bool m_stackStarved = false;
     // Diagnostics (QJS_GUARD_TRACE=1): last anchor SP and effective stack
     // size, logged at the entry and at a caught stack overflow.
     uintptr_t m_guardAnchorSp = 0;
     size_t m_guardStackSize = 0;
-    // One-shot warning flag for the "guard disabled: thread stack nearly
-    // exhausted" case.
-    bool m_guardDisabledWarned = false;
-    // One-shot warning flag for the degenerate-budget case: the calibrated
-    // machinery allowance plus the safety margin eats (nearly) the whole
-    // usable window below the entry, leaving no real JS recursion share.
-    bool m_guardDegenerateWarned = false;
+    // SP of the depth-0 QVariant conversion entry (both directions): the
+    // descent bound for the conversion floor checks when the real thread
+    // floor is unknown (see kUnknownFloorAssumedUsable in the .cpp). A
+    // depth-0 entry resets it to its own frame; a strictly-nested chain
+    // inherits the outer anchor, which only ever errs conservative.
+    uintptr_t m_conversionAnchorSp = 0;
 
     JSRuntime* m_rt;
     JSContext* m_ctx;
@@ -476,6 +461,32 @@ private:
     JSCommonAtoms m_atoms;
 
     static int interruptHandler(JSContext * ctx, void* opaque);
+
+    // Re-measures the JS stack guard from the current stack position and
+    // re-clamps it against the real bounds of the engine's thread. Called at
+    // every top-level engine entry (through resetExecutionState()) and from
+    // setMaxStackSize(): a guard anchored only at engine creation misses the
+    // C++ machinery below deeper entry points. The effective budget always
+    // includes the calibrated machinery allowance (see
+    // calibrateMachineryAllowance()), so on Debug/ASan builds with fat C
+    // frames the guard line stays below the legitimate entry chain and only
+    // runaway JS recursion crosses it (Windows MinGW Debug+ASan measured
+    // ~22 KiB per JS_CallInternal frame: a bare 512 KiB budget anchored at
+    // the entry made every check-hitting operation - promise jobs, typed
+    // array construction, apply(), async resume, module linking - throw a
+    // false "Maximum call stack size exceeded" while plain bytecode scripts
+    // without stack checks kept running - the Windows MinGW Debug+ASan
+    // failure class). Refuses to re-anchor from inside running JS
+    // (m_evalDepth != 0): the next top-level entry re-measures.
+    void reanchorStackGuard();
+    // One-shot (per engine) measurement of the real C machinery descent
+    // below a top-level entry: evaluates a single-JS-frame probe script
+    // through a hidden C function that records its own stack pointer, then
+    // derives the machinery allowance (x1.5 headroom for deeper entry paths
+    // such as module linking and promise jobs) used by reanchorStackGuard().
+    // Runs at the end of the constructor, on the fully initialized engine,
+    // under a provisional margin-only guard.
+    void calibrateMachineryAllowance();
 
     // ES-module callbacks installed on the runtime; see the definitions in
     // the .cpp (name resolution, file loading and registered-module init).

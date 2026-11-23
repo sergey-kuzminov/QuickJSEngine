@@ -38,6 +38,13 @@ QQuickJSValue QQuickJSValue::executeJsCall(QQuickJSEngine* engine, JSContext* c,
     const bool topLevel = (engine->m_evalDepth == 0);
     if (topLevel) {
         engine->resetExecutionState();
+        // Starved entry (see QQuickJSEngine::evaluate()): the window below
+        // this anchor is inside the guard's safety margin; refuse with the
+        // same catchable RangeError before entering JS_Call.
+        if (Q_UNLIKELY(engine->m_stackStarved)) {
+            return engine->newErrorObject(QQuickJSValue::RangeError,
+                                           QStringLiteral("Maximum call stack size exceeded"));
+        }
     }
 
     EvalDepthGuard depthGuard(engine->m_evalDepth);

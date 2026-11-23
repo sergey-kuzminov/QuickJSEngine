@@ -110,6 +110,19 @@ JSValue QuickJSSignalProxy::js_signal_connect(JSContext* ctx, JSValueConst this_
                 const bool topLevel = (eng->m_evalDepth == 0);
                 if (topLevel) {
                     eng->resetExecutionState();
+                    // Starved entry (see QQuickJSEngine::evaluate()): the
+                    // window below this anchor is inside the guard's safety
+                    // margin; refuse with a catchable RangeError instead of
+                    // calling into JS on a stack that cannot fit the throw
+                    // path, and report it like any callback exception.
+                    if (eng->m_stackStarved) {
+                        try { JS_ThrowRangeError(ctx, "Maximum call stack size exceeded"); } catch (...) {}
+                        if (JS_HasException(ctx)) {
+                            ScopedJSValue exc(ctx, JS_GetException(ctx));
+                            eng->processAndEmitException(ctx, exc.value());
+                        }
+                        return;
+                    }
                 }
                 EvalDepthGuard depthGuard(eng->m_evalDepth);
 
