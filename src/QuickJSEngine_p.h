@@ -26,6 +26,23 @@
 template <typename F>
 concept NonBoolInvocable = std::invocable<F&> && !std::same_as<std::invoke_result_t<F&>, bool>;
 
+// JS_GetOpaque vs JS_GetOpaque2 (vendored quickjs.c:12140-12147): the "2"
+// variant throws a generic TypeError ("<ClassName> object expected") and
+// returns NULL on a class mismatch. Every opaque-pointer site in this
+// codebase deliberately uses plain JS_GetOpaque with an explicit null check
+// instead, because:
+//  - several dispatches probe TWO classes on the same value (a signal proxy
+//    or a method proxy: js_signal_connect / js_signal_disconnect) and the
+//    first probe must not leave a pending exception before the second gets
+//    its chance;
+//  - the error text is part of the wrapper's contract ("QObject method is
+//    not a signal", "C++ object has been deleted" for a wrapper whose
+//    QPointer died - note the opaque is still present there, only the C++
+//    side is gone), not the vendor's class-name message;
+//  - the remaining sites are non-throwing predicates and walkers
+//    (isQObject, gc_mark, the conversion ladders) where a pending exception
+//    left behind by a lookup would corrupt the caller's control flow.
+
 template <NonBoolInvocable F>
 static auto invokeSafe(JSContext* ctx, const char* contextName, F&& func) {
     // Exception policy, uniform with safeMetacall: a known std::exception becomes

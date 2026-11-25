@@ -6,6 +6,15 @@
 //
 
 /**
+ * Naming: the project is "QuickJSEngine" (repository, README, tarball);
+ * public Qt classes carry the Q prefix per Qt convention, cf. QQmlEngine
+ * for the QtQml module: QQuickJSEngine, QQuickJSValue,
+ * QQuickJSValueIterator. Headers are named after the project module
+ * (QuickJSEngine.h, QuickJSValue.h), not after the classes. Helpers
+ * without the prefix (QuickJSConvert, QuickJSQObjectProxy,
+ * QuickJSSignalProxy, JsErrorTranslator) are internal implementation
+ * details, not public API.
+ *
  * @note JavaScript does not support C++ method overloading by type.
  * If a QObject has overloaded Q_INVOKABLE methods or signals,
  * only the first one encountered will be exposed to JavaScript.
@@ -78,11 +87,24 @@ struct FileModuleEntry {
 
 struct JSCommonAtoms {
     JSAtom length = JS_ATOM_NULL;
-    JSAtom getTime = JS_ATOM_NULL;
     JSAtom stack = JS_ATOM_NULL;
     JSAtom lineNumber = JS_ATOM_NULL;
     JSAtom line = JS_ATOM_NULL;
     JSAtom name = JS_ATOM_NULL;
+};
+
+// Intrinsics captured in the constructor, before any script runs: the error
+// constructors' prototypes and Date.prototype.getTime. Scripts can replace
+// global constructors, mutate a thrown error's 'name' property or override
+// d.getTime AFTER construction; classification and conversion that compare
+// against (or call) the CAPTURED references stay immune - matching QJSEngine,
+// which branches on the internal error class and reads the internal date
+// slot instead of the visible properties. errorProtos is indexed:
+// 0 Error, 1 EvalError, 2 RangeError, 3 ReferenceError, 4 SyntaxError,
+// 5 TypeError, 6 URIError.
+struct JSIntrinsics {
+    JSValue errorProtos[7];
+    JSValue dateGetTime = JS_UNDEFINED;
 };
 
 // A promise rejection reported by the engine tracker as unhandled. Buffered
@@ -188,10 +210,11 @@ public:
     QQuickJSValue newArray(uint length = 0);
     QQuickJSValue newFunction(JSCFunction* func, const char* name, int argc);
 
+    // Raw-value conversion entry: the only raw JSValue API kept public - a
+    // meaningful low-level conversion for hosts that already hold JSValues
+    // (benchmarks, FFI-style glue). Everything else that shuffles raw
+    // JSValues is private machinery, reachable by the friend proxies.
     JSValue toJSValue(const QVariant& var);
-    JSValue toJSValueImpl(const QVariant& var, int depth);
-    QVariant toVariant(JSValueConst val);
-    QVariant toVariant(JSValueConst val, QQuickJSValue::ObjectConversionBehavior behavior);
 
     // QJSEngine-compatible conversion entry points. toScriptValue wraps any
     // registered metatype into a script value; fromScriptValue converts back
@@ -267,16 +290,56 @@ public:
      * Thread-safe: the deadline is stored atomically. Enabling the timeout
      * while a script is already running (e.g. from a watchdog thread or a
      * C++ slot invoked by the script) grants a fresh full quota immediately;
-     * a stale deadline from a previous run is never used.
+     * a stale deadline from a previous run is never used. The quota covers
+     * the whole run: the script plus the promise jobs drained at its end.
      *
-     * @note This timeout is cooperative. It triggers between bytecode instructions
-     * and during regex evaluation. If a JavaScript function calls a long-blocking
-     * C++ method (via Q_INVOKABLE or signals), the timeout cannot interrupt it
-     * until the C++ method returns control to the JS engine. To keep the engine
-     * responsive, avoid long-blocking operations in exposed C++ methods or check
-     * QQuickJSEngine::isInterrupted() periodically inside your C++ loops.
+     * @note This timeout is cooperative and polled, not preemptive. The
+     * engine's interrupt heartbeat reaches the interpreter (checked every
+     * 10000 branch opcodes and function entries) and the regex engine
+     * (every 10000 backtracking steps), so on those paths the deadline
+     * fires within microseconds of passing. Work that does not poll cannot
+     * be interrupted: bulk C-level operations on large strings and
+     * TypedArrays, JSON.parse/stringify, GC pauses, and long-blocking C++
+     * methods invoked from JS (via Q_INVOKABLE or signals). Keep those
+     * bounded, or check QQuickJSEngine::isInterrupted() periodically inside
+     * your C++ loops.
      */
     void setExecutionTimeoutMs(quint32 ms);
+
+    /**
+     * @brief Sets the per-run budget of executed engine steps.
+     * @param maxSteps Maximum number of steps; 0 disables the budget
+     * (the default).
+     *
+     * A deterministic complement to setExecutionTimeoutMs(): the wall-clock
+     * timeout depends on machine speed, the step budget does not. One
+     * "step" is one counted operation of the engine's interrupt heartbeat:
+     * an executed interpreter branch or function entry, a polled builtin
+     * loop iteration (array iteration, prototype-chain walks), or a regex
+     * backtracking step. The budget is charged one full poll interval
+     * (10000 steps) at a time, so a run is interrupted only after at least
+     * @p maxSteps steps have actually executed; use multiples of 10000 for
+     * exact boundaries in tests. Two deterministic guarantees follow: a run
+     * whose step total stays below the budget always completes, and a run
+     * that would execute steps without bound (an infinite loop, a
+     * catastrophic-backtracking regex) is interrupted after at most the
+     * budget plus one poll interval - no timing involved.
+     *
+     * Like the execution timeout this is a per-run quota: every top-level
+     * entry (evaluate(), QQuickJSValue::call(), signal callbacks, imports)
+     * starts with a fresh quota, and the quota covers the script plus the
+     * promise jobs drained at its end. Enabling the budget mid-run applies
+     * to the current run from the next poll on (the steps executed before
+     * the call were not counted and do not count against it). When
+     * exceeded, the run aborts with the same uncatchable InternalError
+     * "interrupted" as the execution timeout. Thread-safe (atomic state).
+     *
+     * @note The same poll model as setExecutionTimeoutMs() applies: bulk
+     * C-level string/TypedArray operations, JSON.parse/stringify and GC
+     * pauses consume no steps and cannot be interrupted by this budget;
+     * C++ methods invoked from JS are only bounded by their own code.
+     */
+    void setStepBudget(quint64 maxSteps);
 
     /**
      * @warning These setters must be called from the engine's thread or
@@ -309,6 +372,14 @@ public:
 
     static QString version();
     JSMemoryUsage memoryUsage() const;
+
+    /**
+     * @brief Sets the initial GC trigger threshold, in bytes. quickjs-ng
+     * re-seeds the threshold after every automatically triggered collection
+     * (to 1.5x the bytes allocated at that point), so this value governs
+     * the first cycles rather than pinning a permanent limit;
+     * collectGarbage() runs a full collection regardless of it.
+     */
     void setGCThreshold(size_t threshold);
 
     /**
@@ -357,7 +428,21 @@ public:
      */
     QQuickJSValue catchError();
 
-    // Exposed for proxies
+private:
+    // ---------------------------------------------------------------------
+    // Internal machinery (raw JSValues, exception processing, guard/timer
+    // resets). Private on purpose: the friend classes (QQuickJSValue,
+    // QQuickJSValueIterator, the proxies, QuickJSConvert) are exactly the
+    // in-library callers; a public resetExecutionState()/resetExecutionTimer()
+    // would let a host slot invoked by a running script reset the execution
+    // quota mid-script or re-anchor the guard from a deep frame - the states
+    // these entry points deliberately own. The friend list is the internal
+    // API surface; adding an in-library consumer means adding a friend, a
+    // visible reviewable change.
+    // ---------------------------------------------------------------------
+    JSValue toJSValueImpl(const QVariant& var, int depth);
+    QVariant toVariant(JSValueConst val);
+    QVariant toVariant(JSValueConst val, QQuickJSValue::ObjectConversionBehavior behavior);
     JSValue wrapQObject(QObject* obj);
     void processAndEmitException(JSContext* ctx, JSValueConst exc);
     void processPendingJobs();
@@ -376,11 +461,13 @@ public:
     void resetExecutionState() {
         ensureEngineThread();
         resetExecutionTimer();
+        // Fresh step-budget quota for the run starting here (same lifecycle
+        // as the timeout deadline above).
+        m_stepsUsed.store(0, std::memory_order_relaxed);
         reanchorStackGuard();
     }
     JSValue toJSValueFromVoid(void* data, int metaType);
 
-private:
     JSClassExoticMethods m_qobjectExotic{};
     // Deadline in ms since the steady_clock epoch; 0 = no deadline. Atomic so
     // that setExecutionTimeoutMs() from a watchdog thread is race-free.
@@ -455,10 +542,18 @@ private:
 
     std::atomic<quint32> m_executionTimeoutMs;
     std::atomic<bool> m_interrupted;
+    // Step budget (setStepBudget): 0 = off (default). m_stepsUsed is charged
+    // kStepPollInterval steps per interrupt-handler invocation while a
+    // budget is set and re-armed at every top-level entry
+    // (resetExecutionState()). Atomics for the same reason as the deadline:
+    // the setter may run on a watchdog thread.
+    std::atomic<quint64> m_stepBudget;
+    std::atomic<quint64> m_stepsUsed;
     bool m_autoProcessPromises;
     Extensions m_installedExtensions = Extensions(0);
 
     JSCommonAtoms m_atoms;
+    JSIntrinsics m_intrinsics;
 
     static int interruptHandler(JSContext * ctx, void* opaque);
 

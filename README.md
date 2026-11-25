@@ -34,15 +34,18 @@ The core is **quickjs-ng** (ng — next generation) — a fork of the original Q
 
 * **ES modules, exact list:** `importModule()` / `registerModule()` are implemented with QJSEngine semantics: a singleton cache keyed by the canonical file path, registered modules matched by the bare specifier, the registered value itself as the default export, a snapshot of enumerable own properties at registration time, `":/..."` Qt resource paths, and a module that threw at top level is not re-executed on the next import. Beyond that, each of the following is a SyntaxError in QJSEngine but works here: circular imports (allowed by the ECMAScript specification), `import.meta` (a plain object per the specification), top-level `await` (ES2022), dynamic `import()` inside `evaluate()` scripts (which can request registered modules too), registered names without a `.mjs` suffix, and a bare specifier that is not a registered module resolving as a file relative to the current working directory. All module-loading failures are `SyntaxError` objects like in QJSEngine, with our own message texts (a missing file is named in the message instead of V4's cryptic `Invalid null URL`). `importModule()` pumps the microtask queue by default (`setAutoProcessPromises(false)` disables it), so modules with a top-level `await` complete synchronously.
 * **Error delivery:** exceptions of JS signal handlers are reported (the `uncaughtException` signal, or a `qWarning` when nobody listens) and the signal emission continues, exactly like QJSEngine; `Object.keys()` on a QObject whose C++ getter throws (via `throwError()`) fails with that error, where QJSEngine never invokes getters during key enumeration at all.
+* **Unhandled promise rejections:** reported once, at the end of the tick, through the same `uncaughtException` channel (Node.js-like; QJSEngine/V4 has no rejection tracker at all). A rejection handled by a late `.catch()` in the same tick is retracted and never reported. The pending-rejection buffer is capped at 1024 entries: with `setAutoProcessPromises(false)` and a never-drained job queue it would otherwise grow without bound (each entry pins the promise and its reason on the JS heap — a leak invisible to the script). Past the cap the OLDEST buffered rejection is reported immediately to make room, so every rejection is still reported exactly once — the report just arrives earlier than end-of-tick for overflow entries.
 * **Lossy `toVariant()` refusals:** in the default (ConvertJSObjects) mode, Map/Set/WeakMap/WeakSet/Promise/RegExp/DataView yield an *invalid* QVariant, where QJSEngine yields an empty `QVariantMap` (Map/Set/Promise) or a `QRegularExpression` (RegExp). Symbols also yield an invalid QVariant, where QJSEngine yields the descriptive `"Symbol(name)"` string. This is deliberate: a string-shaped variant would silently coerce in metacall conversions (e.g. a nullptr written into a `QObject*` property) instead of throwing a TypeError. Use `toVariant(RetainJSObjects)` for a lossless `QVariant<QQuickJSValue>` wrap (function objects are retained in both modes, like in Qt 6.12).
+* **Detached buffers:** `toVariant()` of a detached `ArrayBuffer` (or a TypedArray over one) yields an empty `QByteArray`, like QJSEngine. A view past the end of a live resizable `ArrayBuffer` instead fails the conversion — also V4 parity; quickjs-ng throws the same `TypeError` for both cases, so the buffer is probed through its getter to tell them apart.
 * **`newSymbol()` description:** QuickJSEngine follows ECMA-262 (`Symbol('x').description === 'x'`); V4's `newSymbol()` leaves the description undefined even though `String()` still shows the name.
-* **`console.count()` keying:** counters are keyed by the printed label (Node.js semantics), not by script and line number like V4 — quickjs-ng exposes no call-site information to C callbacks. The printed format (`label: N`) is identical.
+* **`console.count()` keying:** counters are keyed by the printed label (Node.js semantics), not by script and line number like V4 — quickjs-ng exposes no call-site information to C callbacks. The printed format (`label: N`) is identical. The label tables of `console.count()` / `console.time()` are capped at 1024 entries: a new label beyond the cap is counted/timed but not stored (the tables would otherwise grow without bound on dynamic labels, and that C++-side memory is invisible to `memoryUsage()`); the first overflow prints a one-shot warning.
 * **`qsTr()` context:** the translation context is fixed (`"QQuickJSEngine"`); V4 derives it from the calling script's URL, which is not visible to C callbacks in quickjs-ng.
 * **`exceptionStackTrace` frames:** parsed from the quickjs-ng `Error.stack` property into the V4 frame format `function:line:column:file`; native frames carry `-1/-1` and an empty file, like V4. A thrown non-Error value (e.g. `throw 'str'`) yields an empty list, since quickjs-ng attaches no stack to it. A nested `evaluate()` called from a C++ slot keeps the outer script frames in the inner error's stack, matching V4.
 * **`isError()` for thrown primitives:** `isError()` is true for ANY thrown value — `throw 42` returns an error-flagged value holding 42 — while QJSEngine's `isError()` is true only for Error objects. This keeps C++ handling branch-free (everything reported by `evaluate()`/`call()` as an error IS one); `toString()` still returns the raw value. `errorType()` of such a value is `NoError`, exactly like QJSEngine: only real Error objects carry a class.
-* **Engine-created errors:** `newErrorObject()` / `throwError()` build on the built-in prototypes, immune to scripts replacing `globalThis.TypeError` and friends (like V4). For `EvalError`/`URIError` the global constructor is still resolved: quickjs-ng 0.18 provides C helpers for the other five classes only. The caller stacks printed by `console.trace()`/`console.assert()`/`console.exception()` are built the same way (`JS_NewError()`), so a replaced `globalThis.Error` cannot corrupt console output either.
+* **Engine-created errors:** `newErrorObject()` / `throwError()` build on the built-in prototypes, immune to scripts replacing `globalThis.TypeError` and friends (like V4). For `EvalError`/`URIError` the global constructor is still resolved: quickjs-ng 0.18 provides C helpers for the other five classes only. Messages containing an embedded NUL survive whole (the C `"%s"` constructors stop at the first NUL; the full payload is restored through a plain property write). The caller stacks printed by `console.trace()`/`console.assert()`/`console.exception()` are built the same way (`JS_NewError()`), so a replaced `globalThis.Error` cannot corrupt console output either.
+* **`errorType()` classification:** the class is found by walking the prototype chain and comparing pointer identity with the built-in error prototypes captured in the engine constructor (before any script runs). Rewriting `e.name`, replacing the global constructors after the fact, or subclassing (`class MyRE extends RangeError`) cannot change the answer — a subclass reports its base class. Divergence: `Object.setPrototypeOf(err, RangeError.prototype)` reclassifies the value as `RangeError` here, while V4 keeps the class the object was constructed with. A Proxy trap met while walking the chain clears the pending exception and reports `GenericError`.
+* **Dead QObject wrappers:** after the wrapped C++ object is deleted, the JS wrapper survives and `isQObject()` stays `true` (QJSEngine parity: the classification does not branch on the pointer being alive), while `toQObject()` returns `nullptr`.
 * **`call()` default `this`:** an omitted thisObject binds the engine global object, even for strict callees (QJSEngine parity). With an explicit primitive thisObject, the primitive follows regular JS call semantics (a sloppy callee boxes it, a strict one keeps it). `callWithInstance()` instead binds the global object for non-object instances, exactly like QJSEngine's method of the same name — the two APIs intentionally mirror their Qt counterparts.
-* **`isQObject()` of a deleted object:** after the wrapped QObject is destroyed in C++, `isQObject()` returns `false` (the dead wrapper reads as a plain empty object), while the QJSValue documentation keeps `true`. The JS wrapper survives deletion safely — property access yields `undefined` and methods throw `TypeError`.
 * **Module re-registration:** `registerModule()` with the same name twice replaces the module for new imports; the previous internal module record stays alive until the engine is destroyed (quickjs-ng keeps module defs in a runtime-owned list with no public free API). Re-registering in a loop grows that unreachable list — avoid unbounded re-registration cycles.
 
 </details>
@@ -51,7 +54,7 @@ The core is **quickjs-ng** (ng — next generation) — a fork of the original Q
 
 Since QuickJSEngine was created for console applications, it includes performance and safety management functions that QJSEngine does not have:
 
-* **Limits management:** `setExecutionTimeoutMs()`, `setMemoryLimit()`, `setMaxStackSize()`. Protection against malicious scripts (DoS) and hangs.
+* **Limits management:** `setExecutionTimeoutMs()` (wall-clock, per run), `setStepBudget()` (deterministic per-run budget of executed engine steps — the testing-friendly complement to the timeout: no timing, a run under the budget always completes, a runaway loop or catastrophic-backtracking regex is interrupted after at most the budget plus one poll interval), `setMemoryLimit()`, `setMaxStackSize()`. Protection against malicious scripts (DoS) and hangs.
 * **Bytecode cache management:** `setEvalCacheEnabled()`, `setEvalCacheLimit()`, `clearEvalCache()`. Fine-tuning of memory consumption for frequent `evaluate()` calls with dynamically generated strings.
 * **Monitoring:** `version()` (the quickjs-ng version), `memoryUsage()` (memory statistics), `setGCThreshold()` (manual tuning of the garbage collector threshold).
 * **Extended evaluate:** support for passing a starting line number, `evaluate(script, fileName, lineNumber)`, for precise integration of JS errors into C++ logs.
@@ -85,141 +88,124 @@ The **QuickJSEngine** wrapper itself is distributed under the terms of [The Unli
 
 ## Performance tests
 
-Performance strongly depends on the processor architecture. V4's advantage comes from JIT compilation, which requires fast cores and large caches, whereas the QuickJSEngine interpreter scales equally with clock frequency on all architectures.
+The benchmark suite (02_speed) is built around the embedding scenario: a C++ application running monitoring scripts, passing QObjects and QVariants across the bridge, re-evaluating scripts, creating and destroying engines. The weighted score therefore measures "host bridge + mixed scripting", not "faster JavaScript engine": in pure compute V4's JIT keeps the crown on several workloads (Math loop 1.20x, Object creation 2.03x, and decisively RegExp 14.5x), while the interpreter takes others (Fibonacci 0.74x, function calls 0.77x, JSON.parse 0.57x, string munging 0.48x). Performance also depends on the processor architecture: V4's JIT advantage grows on fast cores with large caches, while the interpreter scales more uniformly.
 
-On Orange Pi Zero (not Zero 3) (ARMv7, 512 MB RAM) QJSEngine could not finish the test suite: the OOM-killer terminates the process on the Promise test (the engine holds ~420 MB of memory that is not released until the engine is recreated). QuickJSEngine finished all 24 tests with a peak consumption of 88 MB and zero memory retention after garbage collection.
+On Orange Pi Zero (not Zero 3) (ARMv7, 512 MB RAM) QJSEngine could not finish the test suite (measured on the earlier 24-case set): the OOM-killer terminates the process on the Promise test (the engine holds ~420 MB of memory that is not released until the engine is recreated). QuickJSEngine finished the whole suite with a peak consumption of 88 MB and zero memory retention after garbage collection.
 
 ```text
-=====================================================================================
-AMD Ryzen 7 7700 8-Core Processor, 64-bit, Calculate Linux Desktop KDE, Qt 6.11.2
-=====================================================================================
-Test                           |      Qt V4 |    QuickJS |   Ratio | Weight | Winner
--------------------------------------------------------------------------------------
-Math loop                      |    17.8 ns |    26.0 ns |   1.46x |     15 | Qt V4
-Function call overhead         |    43.4 ns |    43.3 ns |   1.00x |      5 | QuickJS
-Fibonacci (fib 30)             |  106.90 ms |   89.48 ms |   0.84x |      5 | QuickJS
-Object creation                |    65.7 ns |   104.5 ns |   1.59x |     10 | Qt V4
-Array access                   |    75.3 ns |    68.4 ns |   0.91x |      5 | QuickJS
-C++ -> JS call                 |    27.6 ns |    46.3 ns |   1.68x |     15 | Qt V4
-JS -> C++ method               |    97.7 ns |    67.9 ns |   0.69x |     15 | QuickJS
-Wrapper cache (newQObject)     |    18.5 ns |    14.5 ns |   0.78x |      5 | QuickJS
-Identity (getChild)            |    47.1 ns |    62.1 ns |   1.32x |      5 | Qt V4
-Signal emit, no listeners      |     6.3 ns |     6.3 ns |   1.00x |      2 | QuickJS
-Signal emit, 1 JS callback     |    67.6 ns |    40.2 ns |   0.60x |      5 | QuickJS
-Signal emit, 3 JS callbacks    |   190.3 ns |   100.0 ns |   0.53x |      5 | QuickJS
-Promise microtasks             |    2.42 us |    1.18 us |   0.49x |      5 | QuickJS
-QVariant: Map                  |   213.4 ns |   605.7 ns |   2.84x |      5 | Qt V4
-QVariant: Map long keys        |   213.5 ns |   580.5 ns |   2.72x |      5 | Qt V4
-QVariant: String               |   141.0 ns |   147.0 ns |   1.04x |     10 | Qt V4
-QVariant: List                 |   371.4 ns |   412.9 ns |   1.11x |      5 | Qt V4
-QVariant: List 32 C++ -> JS    |    1.49 us |   506.7 ns |   0.34x |      5 | QuickJS
-QVariant: StringList 16 C++ -> |   303.8 ns |   307.0 ns |   1.01x |      5 | Qt V4
-Method cache                   |    80.4 ns |    63.7 ns |   0.79x |     10 | QuickJS
-Property cache                 |    61.7 ns |    52.5 ns |   0.85x |     10 | QuickJS
-Negative cache                 |    45.4 ns |    40.2 ns |   0.89x |      5 | QuickJS
-Eval cache (same scripts)      |    6.45 us |   178.0 ns |   0.03x |      5 | QuickJS
-Wrapper churn (create/delete)  |    1.68 us |    1.72 us |   1.02x |      5 | Qt V4
-UTF property                   |    97.8 ns |    66.9 ns |   0.68x |      5 | QuickJS
-Heavy object (property reads)  |    60.5 ns |    52.5 ns |   0.87x |     10 | QuickJS
-Heavy object (method calls)    |    69.9 ns |    54.8 ns |   0.78x |     10 | QuickJS
--------------------------------------------------------------------------------------
-Relative score (out of 192):
-  QJSEngine (Qt V4) : 92.99
-  QQuickJSEngine    : 99.01
+======================================================================================
+AMD Ryzen 7 7700 8-Core Processor, 64-bit, Calculate Linux Desktop KDE, Qt 6.11.3
+======================================================================================
+Test                                       |      Qt V4 |    QuickJS |   Ratio | Weight | Winner  
+--------------------------------------------------------------------------------------------------
+Math loop                                  |    17.0 ns |    24.2 ns |   1.43x |     15 | Qt V4   
+Function call overhead                     |    43.7 ns |    39.4 ns |   0.90x |      5 | QuickJS 
+Fibonacci (fib 30)                         |  109.89 ms |   83.90 ms |   0.76x |      5 | QuickJS 
+Object creation                            |    65.0 ns |    97.4 ns |   1.50x |     10 | Qt V4   
+Array access                               |    73.8 ns |    64.4 ns |   0.87x |      5 | QuickJS 
+Regex (log-line match)                     |    1.07 us |    1.33 us |   1.25x |      5 | Qt V4   
+JSON.parse (small)                         |    1.44 us |   866.8 ns |   0.60x |      5 | QuickJS 
+JSON.stringify (small)                     |    1.78 us |    1.77 us |   0.99x |      5 | QuickJS 
+String ops (split+join)                    |    1.92 us |    1.14 us |   0.60x |      5 | QuickJS 
+C++ -> JS call                             |    26.9 ns |    53.6 ns |   1.99x |     15 | Qt V4   
+JS -> C++ method (hoisted)                 |   102.8 ns |    67.9 ns |   0.66x |     15 | QuickJS 
+JS -> C++ method (inline)                  |   332.8 ns |    88.5 ns |   0.27x |     10 | QuickJS 
+Wrapper cache (newQObject)                 |    18.0 ns |    14.4 ns |   0.80x |      5 | QuickJS 
+Identity (getChild)                        |    46.9 ns |    64.2 ns |   1.37x |      5 | Qt V4   
+Signal emit, no listeners                  |     6.6 ns |     6.6 ns |   1.00x |      2 | QuickJS 
+Signal emit, 1 JS callback                 |    63.9 ns |    45.6 ns |   0.71x |      5 | QuickJS 
+Signal emit, 3 JS callbacks                |   178.6 ns |   114.5 ns |   0.64x |      5 | QuickJS 
+Promise microtasks                         |    2.29 us |    1.17 us |   0.51x |      5 | QuickJS 
+QVariant: String JS->C++                   |    92.5 ns |    99.3 ns |   1.07x |      5 | Qt V4   
+QVariant: Map JS->C++                      |   132.2 ns |   413.6 ns |   3.13x |      5 | Qt V4   
+QVariant: List JS->C++                     |   172.2 ns |   285.9 ns |   1.66x |      5 | Qt V4   
+QVariant: String C++->JS                   |    97.6 ns |    92.5 ns |   0.95x |      5 | QuickJS 
+QVariant: Map C++->JS                      |   612.9 ns |   321.1 ns |   0.52x |      5 | QuickJS 
+QVariant: List C++->JS                     |   439.8 ns |   155.4 ns |   0.35x |      5 | QuickJS 
+QVariant: List 32 C++ -> JS                |    1.51 us |   541.9 ns |   0.36x |      5 | QuickJS 
+QVariant: StringList 16 C++ -> JS (wrap)   |   298.4 ns |   341.2 ns |   1.14x |      0 | Qt V4   
+QVariant: StringList 16 C++ -> JS consume  |    3.10 us |   921.0 ns |   0.30x |      5 | QuickJS 
+QVariant: StringList 16 JS->C++            |   308.8 ns |    1.05 us |   3.39x |      5 | Qt V4   
+Property cache                             |    60.2 ns |    51.6 ns |   0.86x |     10 | QuickJS 
+Property write (int)                       |    61.1 ns |    49.7 ns |   0.81x |      5 | QuickJS 
+Property write (UTF string)                |    82.8 ns |    75.0 ns |   0.91x |      5 | QuickJS 
+Negative cache                             |    41.7 ns |    35.8 ns |   0.86x |      5 | QuickJS 
+Eval warm (cache hit)                      |    6.35 us |   198.1 ns |   0.03x |      5 | QuickJS 
+Eval cold (compile)                        |    6.34 us |    2.29 us |   0.36x |      5 | QuickJS 
+Eval thrash (limit vs unique)              |    5.99 us |    6.46 us |   1.08x |      0 | Qt V4   
+Wrapper churn (create/delete)              |    2.37 us |    2.37 us |   1.00x |      5 | QuickJS 
+UTF property                               |    99.7 ns |    61.2 ns |   0.61x |      5 | QuickJS 
+Heavy object (property reads)              |    61.0 ns |    51.0 ns |   0.84x |     10 | QuickJS 
+Heavy object (method calls)                |    72.1 ns |    55.0 ns |   0.76x |     10 | QuickJS 
+Engine ctor+dtor                           |  440.84 us |   69.91 us |   0.16x |      0 | QuickJS 
+--------------------------------------------------------------------------------------
+Relative score (out of 237):
+  QJSEngine (Qt V4) : 108.16
+  QQuickJSEngine    : 128.84
   (relative score requires both engines; single-engine run)
-  Winner: QQuickJSEngine (6.48% faster)
+  (3 weight-0 row(s): informational, excluded from both aggregates)
+  Winner: QQuickJSEngine (19.11% faster)
 
 Throughput index (geometric mean of ops/sec, higher = faster):
-  QJSEngine (Qt V4) : 4920447.75
-  QQuickJSEngine    : 5889233.38
+  QJSEngine (Qt V4) : 3456173.89
+  QQuickJSEngine    : 4535991.99
 ```
 
 ```text
-=====================================================================================
-Intel(R) Core(TM) i3-7100 CPU @ 3.90GHz, 64-bit, Windows 10 Version 22H2, Qt 6.11.2
-=====================================================================================
-Test                           |      Qt V4 |    QuickJS |   Ratio | Weight | Winner
--------------------------------------------------------------------------------------
-Math loop                      |    44.2 ns |    52.1 ns |   1.18x |     15 | Qt V4
-Function call overhead         |   117.4 ns |    80.5 ns |   0.69x |      5 | QuickJS
-Fibonacci (fib 30)             |  213.94 ms |  177.80 ms |   0.83x |      5 | QuickJS
-Object creation                |    75.4 ns |   183.4 ns |   2.43x |     10 | Qt V4
-Array access                   |   128.1 ns |   136.9 ns |   1.07x |      5 | Qt V4
-C++ -> JS call                 |    69.1 ns |    80.8 ns |   1.17x |     15 | Qt V4
-JS -> C++ method               |   227.1 ns |   126.6 ns |   0.56x |     15 | QuickJS
-Wrapper cache (newQObject)     |    36.3 ns |    28.9 ns |   0.80x |      5 | QuickJS
-Identity (getChild)            |    98.2 ns |    91.0 ns |   0.93x |      5 | QuickJS
-Signal emit, no listeners      |    15.7 ns |    14.2 ns |   0.90x |      2 | QuickJS
-Signal emit, 1 JS callback     |   121.4 ns |    80.4 ns |   0.66x |      5 | QuickJS
-Signal emit, 3 JS callbacks    |   318.6 ns |   194.7 ns |   0.61x |      5 | QuickJS
-Promise microtasks             |    2.12 us |    1.55 us |   0.73x |      5 | QuickJS
-QVariant: Map                  |   417.6 ns |    1.16 us |   2.78x |      5 | Qt V4
-QVariant: Map long keys        |   407.2 ns |    1.17 us |   2.88x |      5 | Qt V4
-QVariant: String               |   286.2 ns |   345.0 ns |   1.21x |     10 | Qt V4
-QVariant: List                 |   588.7 ns |   806.2 ns |   1.37x |      5 | Qt V4
-QVariant: List 32 C++ -> JS    |    1.73 us |    1.20 us |   0.70x |      5 | QuickJS
-QVariant: StringList 16 C++ -> |   390.0 ns |   672.3 ns |   1.72x |      5 | Qt V4
-Method cache                   |   219.7 ns |   119.9 ns |   0.55x |     10 | QuickJS
-Property cache                 |   157.4 ns |   125.8 ns |   0.80x |     10 | QuickJS
-Negative cache                 |   117.9 ns |    81.5 ns |   0.69x |      5 | QuickJS
-Eval cache (same scripts)      |   14.15 us |   337.0 ns |   0.02x |      5 | QuickJS
-Wrapper churn (create/delete)  |    3.53 us |    4.01 us |   1.14x |      5 | Qt V4
-UTF property                   |   215.2 ns |   148.6 ns |   0.69x |      5 | QuickJS
-Heavy object (property reads)  |   161.6 ns |   123.3 ns |   0.76x |     10 | QuickJS
-Heavy object (method calls)    |   195.0 ns |   100.6 ns |   0.52x |     10 | QuickJS
--------------------------------------------------------------------------------------
-Relative score (out of 192):
-  QJSEngine (Qt V4) : 90.64
-  QQuickJSEngine    : 101.36
+==================================================================================================
+Intel(R) Xeon(R) Processor, 64-bit, Debian GNU/Linux 13 (trixie), Qt 6.12.0
+==================================================================================================
+Test                                       |      Qt V4 |    QuickJS |   Ratio | Weight | Winner  
+--------------------------------------------------------------------------------------------------
+Math loop                                  |    21.5 ns |    25.5 ns |   1.18x |     15 | Qt V4   
+Function call overhead                     |    65.0 ns |    50.0 ns |   0.77x |      5 | QuickJS 
+Fibonacci (fib 30)                         |  154.76 ms |  114.99 ms |   0.74x |      5 | QuickJS 
+Object creation                            |    85.4 ns |   170.1 ns |   1.99x |     10 | Qt V4   
+Array access                               |   104.7 ns |    84.0 ns |   0.80x |      5 | QuickJS 
+Regex (log-line match)                     |    1.30 us |    1.84 us |   1.42x |      5 | Qt V4   
+JSON.parse (small)                         |    2.38 us |    1.29 us |   0.54x |      5 | QuickJS 
+JSON.stringify (small)                     |    2.13 us |    2.18 us |   1.02x |      5 | Qt V4   
+String ops (split+join)                    |    3.29 us |    1.56 us |   0.47x |      5 | QuickJS 
+C++ -> JS call                             |    31.6 ns |    62.3 ns |   1.97x |     15 | Qt V4   
+JS -> C++ method (hoisted)                 |   110.2 ns |    66.0 ns |   0.60x |     15 | QuickJS 
+JS -> C++ method (inline)                  |   303.0 ns |    88.6 ns |   0.29x |     10 | QuickJS 
+Wrapper cache (newQObject)                 |    26.1 ns |    37.6 ns |   1.44x |      5 | Qt V4   
+Identity (getChild)                        |    58.5 ns |    72.5 ns |   1.24x |      5 | Qt V4   
+Signal emit, no listeners                  |     6.7 ns |     6.8 ns |   1.01x |      2 | Qt V4   
+Signal emit, 1 JS callback                 |    84.8 ns |    66.2 ns |   0.78x |      5 | QuickJS 
+Signal emit, 3 JS callbacks                |   225.1 ns |   171.3 ns |   0.76x |      5 | QuickJS 
+Promise microtasks                         |    2.41 us |    1.65 us |   0.68x |      5 | QuickJS 
+QVariant: String JS->C++                   |   112.8 ns |   111.0 ns |   0.98x |      5 | QuickJS 
+QVariant: Map JS->C++                      |   619.3 ns |   458.0 ns |   0.74x |      5 | QuickJS 
+QVariant: List JS->C++                     |   683.2 ns |   261.8 ns |   0.38x |      5 | QuickJS 
+QVariant: String C++->JS                   |   100.9 ns |    93.9 ns |   0.93x |      5 | QuickJS 
+QVariant: Map C++->JS                      |   712.5 ns |   502.4 ns |   0.71x |      5 | QuickJS 
+QVariant: List C++->JS                     |   474.9 ns |   185.8 ns |   0.39x |      5 | QuickJS 
+QVariant: List 32 C++ -> JS                |    1.55 us |   578.5 ns |   0.37x |      5 | QuickJS 
+QVariant: StringList 16 C++ -> JS (wrap)   |   326.1 ns |   661.3 ns |   2.03x |      0 | Qt V4   
+QVariant: StringList 16 C++ -> JS consume  |    3.32 us |    1.38 us |   0.42x |      5 | QuickJS 
+QVariant: StringList 16 JS->C++            |   611.9 ns |    1.74 us |   2.85x |      5 | Qt V4   
+Property cache                             |    76.9 ns |    51.4 ns |   0.67x |     10 | QuickJS 
+Property write (int)                       |    79.6 ns |    46.9 ns |   0.59x |      5 | QuickJS 
+Property write (UTF string)                |   105.1 ns |    84.7 ns |   0.81x |      5 | QuickJS 
+Negative cache                             |    65.1 ns |    39.9 ns |   0.61x |      5 | QuickJS 
+Eval warm (cache hit)                      |    6.98 us |   247.9 ns |   0.04x |      5 | QuickJS 
+Eval cold (compile)                        |    6.98 us |    2.65 us |   0.38x |      5 | QuickJS 
+Eval thrash (limit vs unique)              |    6.98 us |    5.52 us |   0.79x |      0 | QuickJS 
+Wrapper churn (create/delete)              |    2.40 us |    2.38 us |   0.99x |      5 | QuickJS 
+UTF property                               |   122.4 ns |    77.4 ns |   0.63x |      5 | QuickJS 
+Heavy object (property reads)              |    75.6 ns |    51.3 ns |   0.68x |     10 | QuickJS 
+Heavy object (method calls)                |    85.9 ns |    52.6 ns |   0.61x |     10 | QuickJS 
+Engine ctor+dtor                           |  408.98 us |  120.14 us |   0.29x |      0 | QuickJS 
+--------------------------------------------------------------------------------------
+Relative score (out of 237):
+  QJSEngine (Qt V4) : 103.29
+  QQuickJSEngine    : 133.71
   (relative score requires both engines; single-engine run)
-  Winner: QQuickJSEngine (11.83% faster)
+  (3 weight-0 row(s): informational, excluded from both aggregates)
+  Winner: QQuickJSEngine (29.46% faster)
 
 Throughput index (geometric mean of ops/sec, higher = faster):
-  QJSEngine (Qt V4) : 2487938.68
-  QQuickJSEngine    : 2976681.45
-```
-
-```text
-=====================================================================================
-arm64, 64-bit, Buildroot 2026.11-git, Qt 6.11.3 (Orange Pi Zero 3)
-=====================================================================================
-Test                           |      Qt V4 |    QuickJS |   Ratio | Weight | Winner
--------------------------------------------------------------------------------------
-Math loop                      |   223.3 ns |   284.8 ns |   1.28x |     15 | Qt V4
-Function call overhead         |   739.8 ns |   500.5 ns |   0.68x |      5 | QuickJS
-Fibonacci (fib 30)             |     1.61 s |     1.07 s |   0.66x |      5 | QuickJS
-Object creation                |   762.6 ns |    1.54 us |   2.01x |     10 | Qt V4
-Array access                   |    1.01 us |   902.4 ns |   0.90x |      5 | QuickJS
-C++ -> JS call                 |   513.1 ns |   573.8 ns |   1.12x |     15 | Qt V4
-JS -> C++ method               |    1.50 us |   885.0 ns |   0.59x |     15 | QuickJS
-Wrapper cache (newQObject)     |   320.0 ns |   231.6 ns |   0.72x |      5 | QuickJS
-Identity (getChild)            |   770.1 ns |   725.4 ns |   0.94x |      5 | QuickJS
-Signal emit, no listeners      |   121.5 ns |   121.7 ns |   1.00x |      2 | Qt V4
-Signal emit, 1 JS callback     |    1.25 us |   673.2 ns |   0.54x |      5 | QuickJS
-Signal emit, 3 JS callbacks    |    3.25 us |    1.57 us |   0.48x |      5 | QuickJS
-Promise microtasks             |   17.38 us |   14.81 us |   0.85x |      5 | QuickJS
-QVariant: Map                  |    3.53 us |    8.92 us |   2.53x |      5 | Qt V4
-QVariant: Map long keys        |    3.52 us |    9.25 us |   2.63x |      5 | Qt V4
-QVariant: String               |    2.41 us |    2.34 us |   0.97x |     10 | QuickJS
-QVariant: List                 |    5.51 us |    5.67 us |   1.03x |      5 | Qt V4
-QVariant: List 32 C++ -> JS    |   19.20 us |    7.14 us |   0.37x |      5 | QuickJS
-QVariant: StringList 16 C++ -> |    4.03 us |    5.22 us |   1.29x |      5 | Qt V4
-Method cache                   |    1.44 us |   832.4 ns |   0.58x |     10 | QuickJS
-Property cache                 |    1.25 us |   711.3 ns |   0.57x |     10 | QuickJS
-Negative cache                 |    1.06 us |   607.6 ns |   0.57x |      5 | QuickJS
-Eval cache (same scripts)      |  110.82 us |    3.00 us |   0.03x |      5 | QuickJS
-Wrapper churn (create/delete)  |   21.48 us |   21.48 us |   1.00x |      5 | QuickJS
-UTF property                   |    1.80 us |    1.03 us |   0.57x |      5 | QuickJS
-Heavy object (property reads)  |    1.26 us |   707.5 ns |   0.56x |     10 | QuickJS
-Heavy object (method calls)    |    1.23 us |   754.9 ns |   0.61x |     10 | QuickJS
--------------------------------------------------------------------------------------
-Relative score (out of 192):
-  QJSEngine (Qt V4) : 85.94
-  QQuickJSEngine    : 106.06
-  (relative score requires both engines; single-engine run)
-  Winner: QQuickJSEngine (23.41% faster)
-
-Throughput index (geometric mean of ops/sec, higher = faster):
-  QJSEngine (Qt V4) : 309962.53
-  QQuickJSEngine    : 417176.62
+  QJSEngine (Qt V4) : 2604119.27
+  QQuickJSEngine    : 3703728.22
 ```

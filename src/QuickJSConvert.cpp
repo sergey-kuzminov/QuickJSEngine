@@ -104,28 +104,52 @@ static QByteArray clampedByteArray(const uint8_t* buf, size_t bufSize,
 
 // Non-throwing buffer conversion for the ArrayBuffer/TypedArray/
 // SharedArrayBuffer family: returns a QByteArray wrapped in a QVariant, or
-// an invalid QVariant for anything else (including detached buffers).
-// JS_GetArrayBuffer and JS_GetTypedArrayBuffer throw a TypeError on any
-// non-buffer, so the probes clear pending exceptions instead of propagating.
+// an invalid QVariant for anything else. JS_GetArrayBuffer and
+// JS_GetTypedArrayBuffer throw a TypeError on any non-buffer, so the probes
+// clear pending exceptions instead of propagating. A REAL ArrayBuffer or
+// TypedArray whose backing store is gone (detached) converts to an EMPTY
+// QByteArray, like QJSEngine (V4 reads the data pointer + length, null/0
+// when detached) - falling through to the property enumeration instead
+// used to produce an empty QVariantMap for it.
 static QVariant jsBufferToVariant(JSContext* ctx, JSValueConst val)
 {
     if (JS_IsArrayBuffer(val)) {
         size_t bufSize = 0;
         uint8_t* buf = JS_GetArrayBuffer(ctx, &bufSize, val);
         if (buf) return QVariant(QByteArray(reinterpret_cast<const char*>(buf), static_cast<qsizetype>(bufSize)));
-        clearPendingException(ctx);   // detached buffer: fall through
-    } else if (JS_GetTypedArrayType(val) >= 0) {
+        clearPendingException(ctx);   // detached buffer
+        return QVariant(QByteArray());
+    }
+    if (JS_GetTypedArrayType(val) >= 0) {
         size_t byteOffset = 0, byteLength = 0, bytesPerElement = 0;
         ScopedJSValue abuf(ctx, JS_GetTypedArrayBuffer(ctx, val, &byteOffset, &byteLength, &bytesPerElement));
-        if (consumeException(ctx, abuf.value())) abuf = ScopedJSValue(ctx, JS_UNDEFINED);
-        if (!JS_IsNull(abuf.value()) && !JS_IsUndefined(abuf.value())) {
+        if (!consumeException(ctx, abuf.value())
+                && !JS_IsNull(abuf.value()) && !JS_IsUndefined(abuf.value())) {
             size_t bufSize = 0;
             uint8_t* buf = JS_GetArrayBuffer(ctx, &bufSize, abuf.value());
             if (buf) return QVariant(clampedByteArray(buf, bufSize, byteOffset, byteLength, bytesPerElement));
+            clearPendingException(ctx);
         }
-    } else {
-        // SharedArrayBuffer has no non-throwing test; the byteLength probe
-        // (one prototype-chain lookup) keeps plain maps off the throw path.
+        // JS_GetTypedArrayBuffer threw (or the buffer vanished between the
+        // calls): a DETACHED view or an out-of-bounds view on a LIVE
+        // resizable buffer. Distinguish through the view's "buffer"
+        // accessor, which never throws (verified in the vendored source): a
+        // live buffer means out-of-bounds, which must keep FAILING the
+        // conversion (V4 parity: a clean error, not garbage); only a
+        // detached backing store converts to an empty QByteArray.
+        ScopedJSValue bufObj(ctx, JS_GetPropertyStr(ctx, val, "buffer"));
+        if (consumeException(ctx, bufObj.value())) bufObj = ScopedJSValue(ctx, JS_UNDEFINED);
+        if (JS_IsObject(bufObj.value())) {
+            size_t bufSize = 0;
+            uint8_t* buf = JS_GetArrayBuffer(ctx, &bufSize, bufObj.value());
+            clearPendingException(ctx);
+            if (buf) return QVariant();   // live buffer: out-of-bounds view
+        }
+        return QVariant(QByteArray());
+    }
+    // SharedArrayBuffer has no non-throwing test; the byteLength probe
+    // (one prototype-chain lookup) keeps plain maps off the throw path.
+    {
         ScopedJSValue bl(ctx, JS_GetPropertyStr(ctx, val, "byteLength"));
         if (JS_IsException(bl.value())) {
             clearPendingException(ctx);
@@ -415,7 +439,24 @@ JSValue QuickJSConvert::stringListToJSArray(QQuickJSEngine* engine, JSContext* c
 }
 
 int QuickJSConvert::adjustEnumType(int type) {
-    if (QMetaType(type).flags() & QMetaType::IsEnumeration) return QMetaType::Int;
+    // The SINGLE enum policy for metacall slot types, applied where the meta
+    // caches are built (property types and method parameter types in
+    // QQuickJSEngine::wrapQObject()). It rewrites only int-backed enums to
+    // QMetaType::Int so they take the exact-width int fast paths of the
+    // read/write ladders. Every other enum width KEEPS its declared type:
+    // moc reads and writes sizeof(declared type) bytes through the slot, so
+    // a quint64-backed enum routed through a 4-byte int buffer is an
+    // out-of-bounds stack write, and a qint8-backed one loses its sign in a
+    // zero-initialized int buffer (-1 becomes 255). Non-int enums instead
+    // take the generic QVariant paths, whose storage is sized by the
+    // declared metatype (QVariant::convert handles the numeric-to-enum
+    // direction at the declared width - verified against Qt 6.12). Method
+    // RETURN types feed the same policy from the read ladder's enum guard;
+    // keeping the size check here makes both paths agree by construction.
+    if ((QMetaType(type).flags() & QMetaType::IsEnumeration)
+        && QMetaType(type).sizeOf() == sizeof(int)) {
+        return QMetaType::Int;
+    }
     return type;
 }
 

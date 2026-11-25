@@ -14,121 +14,144 @@
 
 namespace {
 
-// Calls a meta-method, stores the return value in a default-constructed
-// storage of type T and converts it to a JSValue. args[0] is the return slot.
+// ONE read primitive for both metacall slots: a property read (op =
+// ReadProperty, one-slot array) and a method invocation (op =
+// InvokeMetaMethod, where args[1..] hold the converted arguments and args[0]
+// is the return slot). Reads into a default-constructed storage of the EXACT
+// C++ type matching the metatype and converts it to a JSValue; the buffer
+// width is derived from T by construction - the invariant the whole
+// convertMetaRead() ladder below builds on (see the adjustEnumType comment
+// in QuickJSConvert.cpp).
 template<typename T, typename Convert>
-JSValue metacallReturn(JSContext* ctx, QObject* obj, int methodIdx,
-                       QVarLengthArray<void*, MetaCallArgsLimit>& args, Convert convert)
+JSValue readMetaSlot(JSContext* ctx, QObject* obj, QMetaObject::Call op, int slotIdx,
+                     QVarLengthArray<void*, MetaCallArgsLimit>* args, Convert convert)
 {
     T val{};
-    args[0] = &val;
-    const bool ok = safeMetacall(ctx, obj, QMetaObject::InvokeMetaMethod, methodIdx, args.data());
-    args[0] = nullptr;
+    void* propertySlot[1] = { &val };
+    void** a = args ? args->data() : propertySlot;
+    a[0] = &val;
+    const bool ok = safeMetacall(ctx, obj, op, slotIdx, a);
+    a[0] = nullptr;
     if (!ok) return JS_EXCEPTION;
-    return convert(std::move(val));
-}
-
-// Reads a meta-property into a default-constructed storage of type T and
-// converts it to a JSValue.
-template<typename T, typename Convert>
-JSValue readMetaProperty(JSContext* ctx, QObject* obj, int propIdx, Convert convert)
-{
-    T val{};
-    void* a[1] = { &val };
-    if (!safeMetacall(ctx, obj, QMetaObject::ReadProperty, propIdx, a)) return JS_EXCEPTION;
     return convert(std::move(val));
 }
 
 } // namespace
 
-JSValue QuickJSQObjectProxy::invokeAndConvertReturn(QQuickJSEngine* engine, JSContext* ctx, QObject* obj, int methodIdx, int retType, QVarLengthArray<void*, MetaCallArgsLimit>& args) {
-    switch (retType) {
-    case QMetaType::Void: {
-        if (!safeMetacall(ctx, obj, QMetaObject::InvokeMetaMethod, methodIdx, args.data())) return JS_EXCEPTION;
-        return JS_UNDEFINED;
-    }
-    case QMetaType::UnknownType:
-        return JS_ThrowTypeError(ctx, "Cannot invoke method: return type is not registered");
+// The single QMetaType read ladder, shared by method returns and property
+// reads (the two former parallel switches - keeping them in sync by hand is
+// how the Long/Char/enum width bugs crept in). Behavior differences between
+// the two callers are keyed off op alone: an unsupported method return type
+// throws a TypeError, an unsupported property type reads as undefined
+// (V4-like, so Object.keys()/for...in survive it).
+JSValue QuickJSQObjectProxy::convertMetaRead(QQuickJSEngine* engine, JSContext* ctx, QObject* obj,
+                                             QMetaObject::Call op, int slotIdx, int metaType,
+                                             QVarLengthArray<void*, MetaCallArgsLimit>* args)
+{
+    switch (metaType) {
     case QMetaType::Int:
-        return metacallReturn<int>(ctx, obj, methodIdx, args, [ctx](int v) { return JS_NewInt32(ctx, v); });
+        return readMetaSlot<int>(ctx, obj, op, slotIdx, args, [ctx](int v) { return JS_NewInt32(ctx, v); });
     case QMetaType::Bool:
-        return metacallReturn<bool>(ctx, obj, methodIdx, args, [ctx](bool v) { return JS_NewBool(ctx, v); });
+        return readMetaSlot<bool>(ctx, obj, op, slotIdx, args, [ctx](bool v) { return JS_NewBool(ctx, v); });
     case QMetaType::Double:
-        return metacallReturn<double>(ctx, obj, methodIdx, args, [ctx](double v) { return JS_NewFloat64(ctx, v); });
+        return readMetaSlot<double>(ctx, obj, op, slotIdx, args, [ctx](double v) { return JS_NewFloat64(ctx, v); });
     case QMetaType::Float:
-        return metacallReturn<float>(ctx, obj, methodIdx, args, [ctx](float v) { return JS_NewFloat64(ctx, v); });
+        return readMetaSlot<float>(ctx, obj, op, slotIdx, args, [ctx](float v) { return JS_NewFloat64(ctx, v); });
     case QMetaType::QString:
-        return metacallReturn<QString>(ctx, obj, methodIdx, args, [ctx](QString v) { return qStringToJS(ctx, v); });
+        return readMetaSlot<QString>(ctx, obj, op, slotIdx, args, [ctx](QString v) { return qStringToJS(ctx, v); });
     case QMetaType::QObjectStar:
-        return metacallReturn<QObject*>(ctx, obj, methodIdx, args, [engine, ctx](QObject* v) { return engine->wrapQObject(v); });
+        return readMetaSlot<QObject*>(ctx, obj, op, slotIdx, args, [engine, ctx](QObject* v) { return engine->wrapQObject(v); });
     case QMetaType::QVariant:
-        return metacallReturn<QVariant>(ctx, obj, methodIdx, args, [engine](QVariant v) { return engine->toJSValue(v); });
+        return readMetaSlot<QVariant>(ctx, obj, op, slotIdx, args, [engine](QVariant v) { return engine->toJSValue(v); });
     case QMetaType::QStringList:
-        return metacallReturn<QStringList>(ctx, obj, methodIdx, args, [engine, ctx](QStringList v) { return QuickJSConvert::stringListToJSArray(engine, ctx, &v); });
+        return readMetaSlot<QStringList>(ctx, obj, op, slotIdx, args, [engine, ctx](QStringList v) { return QuickJSConvert::stringListToJSArray(engine, ctx, &v); });
     case QMetaType::QVariantList:
-        return metacallReturn<QVariantList>(ctx, obj, methodIdx, args, [engine, ctx](QVariantList v) { return QuickJSConvert::listToJSArray(engine, ctx, &v, 0); });
+        return readMetaSlot<QVariantList>(ctx, obj, op, slotIdx, args, [engine, ctx](QVariantList v) { return QuickJSConvert::listToJSArray(engine, ctx, &v, 0); });
     // Narrow scalars: moc writes exactly sizeof(declared type) bytes into
-    // the return slot, so each case must read its exact C++ type. A char
-    // return read through a short buffer loses the sign (-1 becomes 255);
-    // a 4-byte LLP64 long read through a qint64 buffer does the same and a
-    // qint64 write would overflow it.
+    // the return/property slot, so each case must read its exact C++ type. A
+    // char return read through a short buffer loses the sign (-1 becomes
+    // 255); a 4-byte LLP64 long read through a qint64 buffer does the same
+    // and a qint64 write would overflow it.
     case QMetaType::Short:
-        return metacallReturn<short>(ctx, obj, methodIdx, args, [ctx](short v) { return JS_NewInt32(ctx, v); });
+        return readMetaSlot<short>(ctx, obj, op, slotIdx, args, [ctx](short v) { return JS_NewInt32(ctx, v); });
     case QMetaType::Char:
-        return metacallReturn<char>(ctx, obj, methodIdx, args, [ctx](char v) { return JS_NewInt32(ctx, v); });
+        return readMetaSlot<char>(ctx, obj, op, slotIdx, args, [ctx](char v) { return JS_NewInt32(ctx, v); });
     case QMetaType::SChar:
-        return metacallReturn<signed char>(ctx, obj, methodIdx, args, [ctx](signed char v) { return JS_NewInt32(ctx, v); });
+        return readMetaSlot<signed char>(ctx, obj, op, slotIdx, args, [ctx](signed char v) { return JS_NewInt32(ctx, v); });
     case QMetaType::UShort: case QMetaType::UChar:
         // Unsigned narrow types zero-extend correctly in a ushort buffer.
-        return metacallReturn<ushort>(ctx, obj, methodIdx, args, [ctx](ushort v) { return JS_NewInt32(ctx, v); });
+        return readMetaSlot<ushort>(ctx, obj, op, slotIdx, args, [ctx](ushort v) { return JS_NewInt32(ctx, v); });
     case QMetaType::UInt:
-        return metacallReturn<uint>(ctx, obj, methodIdx, args, [ctx](uint v) { return QuickJSConvert::uint64ToJS(ctx, v); });
+        return readMetaSlot<uint>(ctx, obj, op, slotIdx, args, [ctx](uint v) { return QuickJSConvert::uint64ToJS(ctx, v); });
     case QMetaType::Long:
-        return metacallReturn<long>(ctx, obj, methodIdx, args, [ctx](long v) { return QuickJSConvert::int64ToJS(ctx, v); });
+        return readMetaSlot<long>(ctx, obj, op, slotIdx, args, [ctx](long v) { return QuickJSConvert::int64ToJS(ctx, v); });
     case QMetaType::LongLong:
-        return metacallReturn<qint64>(ctx, obj, methodIdx, args, [ctx](qint64 v) { return QuickJSConvert::int64ToJS(ctx, v); });
+        return readMetaSlot<qint64>(ctx, obj, op, slotIdx, args, [ctx](qint64 v) { return QuickJSConvert::int64ToJS(ctx, v); });
     case QMetaType::ULong:
-        return metacallReturn<unsigned long>(ctx, obj, methodIdx, args, [ctx](unsigned long v) { return QuickJSConvert::uint64ToJS(ctx, v); });
+        return readMetaSlot<unsigned long>(ctx, obj, op, slotIdx, args, [ctx](unsigned long v) { return QuickJSConvert::uint64ToJS(ctx, v); });
     case QMetaType::ULongLong:
-        return metacallReturn<quint64>(ctx, obj, methodIdx, args, [ctx](quint64 v) { return QuickJSConvert::uint64ToJS(ctx, v); });
+        return readMetaSlot<quint64>(ctx, obj, op, slotIdx, args, [ctx](quint64 v) { return QuickJSConvert::uint64ToJS(ctx, v); });
     case QMetaType::QDateTime:
-        return metacallReturn<QDateTime>(ctx, obj, methodIdx, args, [ctx](QDateTime v) { return QuickJSConvert::dateTimeToJS(ctx, v); });
+        return readMetaSlot<QDateTime>(ctx, obj, op, slotIdx, args, [ctx](QDateTime v) { return QuickJSConvert::dateTimeToJS(ctx, v); });
     case QMetaType::QDate:
-        return metacallReturn<QDate>(ctx, obj, methodIdx, args, [ctx](QDate v) { return QuickJSConvert::dateToJS(ctx, v); });
+        return readMetaSlot<QDate>(ctx, obj, op, slotIdx, args, [ctx](QDate v) { return QuickJSConvert::dateToJS(ctx, v); });
     case QMetaType::QTime:
-        return metacallReturn<QTime>(ctx, obj, methodIdx, args, [ctx](QTime v) { return QuickJSConvert::timeToJS(ctx, v); });
+        return readMetaSlot<QTime>(ctx, obj, op, slotIdx, args, [ctx](QTime v) { return QuickJSConvert::timeToJS(ctx, v); });
     case QMetaType::QByteArray:
-        return metacallReturn<QByteArray>(ctx, obj, methodIdx, args, [ctx](QByteArray v) { return QuickJSConvert::byteArrayToJS(ctx, v); });
+        return readMetaSlot<QByteArray>(ctx, obj, op, slotIdx, args, [ctx](QByteArray v) { return QuickJSConvert::byteArrayToJS(ctx, v); });
     default: break;
     }
 
-    if (retType == qMetaTypeId<QVariantMap>()) {
-        return metacallReturn<QVariantMap>(ctx, obj, methodIdx, args, [engine, ctx](QVariantMap v) { return QuickJSConvert::mapToJSObject(engine, ctx, &v, 0); });
+    if (metaType == qMetaTypeId<QVariantMap>()) {
+        return readMetaSlot<QVariantMap>(ctx, obj, op, slotIdx, args, [engine, ctx](QVariantMap v) { return QuickJSConvert::mapToJSObject(engine, ctx, &v, 0); });
     }
-    if (retType == qMetaTypeId<QVariantHash>()) {
-        return metacallReturn<QVariantHash>(ctx, obj, methodIdx, args, [engine, ctx](QVariantHash v) { return QuickJSConvert::hashToJSObject(engine, ctx, &v, 0); });
+    if (metaType == qMetaTypeId<QVariantHash>()) {
+        return readMetaSlot<QVariantHash>(ctx, obj, op, slotIdx, args, [engine, ctx](QVariantHash v) { return QuickJSConvert::hashToJSObject(engine, ctx, &v, 0); });
     }
     {
         // int-backed enums read as int32, like the generic QVariant path;
-        // other enum widths keep the generic conversion below.
-        const QMetaType mt(retType);
+        // other enum widths keep the generic conversion below. This guard
+        // and adjustEnumType() apply the same size predicate, so the cache
+        // rewriting and the read ladder can never disagree on a width.
+        const QMetaType mt(metaType);
         if ((mt.flags() & QMetaType::IsEnumeration) && mt.sizeOf() == sizeof(int))
-            return metacallReturn<int>(ctx, obj, methodIdx, args, [ctx](int v) { return JS_NewInt32(ctx, v); });
+            return readMetaSlot<int>(ctx, obj, op, slotIdx, args, [ctx](int v) { return JS_NewInt32(ctx, v); });
     }
 
-    QVariant val = makeDefaultVariant(retType);
-    args[0] = val.data();
-    const bool ok = safeMetacall(ctx, obj, QMetaObject::InvokeMetaMethod, methodIdx, args.data());
-    args[0] = nullptr;
+    QVariant val = makeDefaultVariant(metaType);
+    void* propertySlot[1] = { val.data() };
+    void** a = args ? args->data() : propertySlot;
+    a[0] = val.data();
+    const bool ok = safeMetacall(ctx, obj, op, slotIdx, a);
+    a[0] = nullptr;
     if (!ok) return JS_EXCEPTION;
 
     JSValue jsVal = engine->toJSValue(val);
 
     if (JS_IsUndefined(jsVal) && val.isValid() && !val.isNull()) {
-        return JS_ThrowTypeError(ctx, "Cannot invoke method: return type '%s' is not supported", QMetaType(retType).name());
+        if (op == QMetaObject::InvokeMetaMethod) {
+            return JS_ThrowTypeError(ctx, "Cannot invoke method: return type '%s' is not supported", QMetaType(metaType).name());
+        }
+        // V4-like: a property of an unsupported type reads as undefined
+        // instead of throwing, so Object.keys()/for...in survive it. Only a
+        // JS exception deliberately thrown by the C++ code (throwError()) or
+        // a C++ exception escaping the metacall propagate as errors.
+        return JS_UNDEFINED;
     }
 
     return jsVal;
+}
+
+JSValue QuickJSQObjectProxy::invokeAndConvertReturn(QQuickJSEngine* engine, JSContext* ctx, QObject* obj, int methodIdx, int retType, QVarLengthArray<void*, MetaCallArgsLimit>& args) {
+    if (retType == QMetaType::Void) {
+        // No return slot to convert: invoke and report undefined.
+        if (!safeMetacall(ctx, obj, QMetaObject::InvokeMetaMethod, methodIdx, args.data())) return JS_EXCEPTION;
+        return JS_UNDEFINED;
+    }
+    if (retType == QMetaType::UnknownType) {
+        return JS_ThrowTypeError(ctx, "Cannot invoke method: return type is not registered");
+    }
+    return convertMetaRead(engine, ctx, obj, QMetaObject::InvokeMetaMethod, methodIdx, retType, &args);
 }
 
 JSValue QuickJSQObjectProxy::getMetaProperty(QQuickJSEngine* engine, JSContext* ctx, JSQObjectData* data, const MetaCacheEntry& entry) {
@@ -144,85 +167,7 @@ JSValue QuickJSQObjectProxy::getMetaProperty(QQuickJSEngine* engine, JSContext* 
 
     QObject* obj = data->obj.data();
 
-    switch (metaType) {
-    case QMetaType::Int:
-        return readMetaProperty<int>(ctx, obj, entry.index, [ctx](int v) { return JS_NewInt32(ctx, v); });
-    case QMetaType::Bool:
-        return readMetaProperty<bool>(ctx, obj, entry.index, [ctx](bool v) { return JS_NewBool(ctx, v); });
-    case QMetaType::Double:
-        return readMetaProperty<double>(ctx, obj, entry.index, [ctx](double v) { return JS_NewFloat64(ctx, v); });
-    case QMetaType::Float:
-        return readMetaProperty<float>(ctx, obj, entry.index, [ctx](float v) { return JS_NewFloat64(ctx, v); });
-    case QMetaType::QString:
-        return readMetaProperty<QString>(ctx, obj, entry.index, [ctx](QString v) { return qStringToJS(ctx, v); });
-    case QMetaType::QObjectStar:
-        return readMetaProperty<QObject*>(ctx, obj, entry.index, [engine, ctx](QObject* v) { return engine->wrapQObject(v); });
-    case QMetaType::QVariant:
-        return readMetaProperty<QVariant>(ctx, obj, entry.index, [engine](QVariant v) { return engine->toJSValue(v); });
-    case QMetaType::QStringList:
-        return readMetaProperty<QStringList>(ctx, obj, entry.index, [engine, ctx](QStringList v) { return QuickJSConvert::stringListToJSArray(engine, ctx, &v); });
-    case QMetaType::QVariantList:
-        return readMetaProperty<QVariantList>(ctx, obj, entry.index, [engine, ctx](QVariantList v) { return QuickJSConvert::listToJSArray(engine, ctx, &v, 0); });
-    // Narrow scalars: each case reads its exact C++ type (see the matching
-    // comment in invokeAndConvertReturn()).
-    case QMetaType::Short:
-        return readMetaProperty<short>(ctx, obj, entry.index, [ctx](short v) { return JS_NewInt32(ctx, v); });
-    case QMetaType::Char:
-        return readMetaProperty<char>(ctx, obj, entry.index, [ctx](char v) { return JS_NewInt32(ctx, v); });
-    case QMetaType::SChar:
-        return readMetaProperty<signed char>(ctx, obj, entry.index, [ctx](signed char v) { return JS_NewInt32(ctx, v); });
-    case QMetaType::UShort: case QMetaType::UChar:
-        return readMetaProperty<ushort>(ctx, obj, entry.index, [ctx](ushort v) { return JS_NewInt32(ctx, v); });
-    case QMetaType::UInt:
-        return readMetaProperty<uint>(ctx, obj, entry.index, [ctx](uint v) { return QuickJSConvert::uint64ToJS(ctx, v); });
-    case QMetaType::Long:
-        return readMetaProperty<long>(ctx, obj, entry.index, [ctx](long v) { return QuickJSConvert::int64ToJS(ctx, v); });
-    case QMetaType::LongLong:
-        return readMetaProperty<qint64>(ctx, obj, entry.index, [ctx](qint64 v) { return QuickJSConvert::int64ToJS(ctx, v); });
-    case QMetaType::ULong:
-        return readMetaProperty<unsigned long>(ctx, obj, entry.index, [ctx](unsigned long v) { return QuickJSConvert::uint64ToJS(ctx, v); });
-    case QMetaType::ULongLong:
-        return readMetaProperty<quint64>(ctx, obj, entry.index, [ctx](quint64 v) { return QuickJSConvert::uint64ToJS(ctx, v); });
-    case QMetaType::QDateTime:
-        return readMetaProperty<QDateTime>(ctx, obj, entry.index, [ctx](QDateTime v) { return QuickJSConvert::dateTimeToJS(ctx, v); });
-    case QMetaType::QDate:
-        return readMetaProperty<QDate>(ctx, obj, entry.index, [ctx](QDate v) { return QuickJSConvert::dateToJS(ctx, v); });
-    case QMetaType::QTime:
-        return readMetaProperty<QTime>(ctx, obj, entry.index, [ctx](QTime v) { return QuickJSConvert::timeToJS(ctx, v); });
-    case QMetaType::QByteArray:
-        return readMetaProperty<QByteArray>(ctx, obj, entry.index, [ctx](QByteArray v) { return QuickJSConvert::byteArrayToJS(ctx, v); });
-    default: break;
-    }
-
-    if (metaType == qMetaTypeId<QVariantMap>()) {
-        return readMetaProperty<QVariantMap>(ctx, obj, entry.index, [engine, ctx](QVariantMap v) { return QuickJSConvert::mapToJSObject(engine, ctx, &v, 0); });
-    }
-    if (metaType == qMetaTypeId<QVariantHash>()) {
-        return readMetaProperty<QVariantHash>(ctx, obj, entry.index, [engine, ctx](QVariantHash v) { return QuickJSConvert::hashToJSObject(engine, ctx, &v, 0); });
-    }
-    {
-        // int-backed enums read as int32, like the generic QVariant path;
-        // other enum widths keep the generic conversion below.
-        const QMetaType mt(metaType);
-        if ((mt.flags() & QMetaType::IsEnumeration) && mt.sizeOf() == sizeof(int))
-            return readMetaProperty<int>(ctx, obj, entry.index, [ctx](int v) { return JS_NewInt32(ctx, v); });
-    }
-
-    QVariant val = makeDefaultVariant(metaType);
-    void* a[1] = { val.data() };
-    if (!safeMetacall(ctx, obj, QMetaObject::ReadProperty, entry.index, a)) return JS_EXCEPTION;
-
-    JSValue jsVal = engine->toJSValue(val);
-
-    if (JS_IsUndefined(jsVal) && val.isValid() && !val.isNull()) {
-        // V4-like: a property of an unsupported type reads as undefined
-        // instead of throwing, so Object.keys()/for...in survive it. Only a
-        // JS exception deliberately thrown by the C++ code (throwError()) or
-        // a C++ exception escaping the metacall propagate as errors.
-        return JS_UNDEFINED;
-    }
-
-    return jsVal;
+    return convertMetaRead(engine, ctx, obj, QMetaObject::ReadProperty, entry.index, metaType, nullptr);
 }
 
 JSValue QuickJSQObjectProxy::createMethodProxy(QQuickJSEngine* engine, JSContext* ctx, JSQObjectData* data, JSAtom prop, const MetaCacheEntry& entry, JSClassID classId) {

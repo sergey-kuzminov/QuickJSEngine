@@ -245,22 +245,40 @@ QQuickJSValue::ErrorType QQuickJSValue::errorType() const {
     if (!c) return NoError;
     if (!JS_IsError(m_val)) return NoError;
 
-    ScopedJSValue nameVal(c, JS_GetProperty(c, m_val, m_engine.data()->m_atoms.name));
-    if (JS_IsException(nameVal.value())) {
-        clearPendingException(c);
-        return GenericError;
+    // Classification by prototype identity, NOT by the 'name' property:
+    // QJSEngine branches on the internal error class, while reading 'name'
+    // would both run script (a getter/toString) and misclassify trivial
+    // tampering (e.name = "RangeError" on a plain Error). The engine
+    // captured the intrinsic error prototypes at construction, before any
+    // script ran; walking this value's prototype chain against them is
+    // immune to 'name' mutation and to scripts replacing the global error
+    // constructors afterwards. Chain order is most-derived first, so a
+    // subclass of RangeError classifies as RangeError, like V4's
+    // construction-time class. Divergence: V4 keeps that class even after
+    // Object.setPrototypeOf() re-parents the instance; the chain walk then
+    // reports the new ancestry's class, or GenericError if none matches.
+    static const QQuickJSValue::ErrorType kClasses[7] = {
+        GenericError, EvalError, RangeError, ReferenceError,
+        SyntaxError, TypeError, URIError,
+    };
+    ScopedJSValue proto(c, JS_GetPrototype(c, m_val));
+    for (int hop = 0; hop < 16 && JS_IsObject(proto.value()); ++hop) {
+        const void* protoPtr = JS_VALUE_GET_PTR(proto.value());
+        const JSValue* const table = m_engine.data()->m_intrinsics.errorProtos;
+        for (int i = 0; i < 7; ++i) {
+            if (JS_IsObject(table[i]) && JS_VALUE_GET_PTR(table[i]) == protoPtr)
+                return kClasses[i];
+        }
+        JSValue next = JS_GetPrototype(c, proto.value());
+        if (JS_IsException(next)) {
+            // A Proxy getPrototypeOf trap in the chain threw: clear the
+            // pending exception and classify conservatively instead of
+            // leaking engine state into the next entry.
+            clearPendingException(c);
+            return GenericError;
+        }
+        proto = ScopedJSValue(c, next);
     }
-
-    // jsToQString clears the pending exception itself on failure.
-    const QString name = QuickJSConvert::jsToQString(c, nameVal.value());
-    if (name.isNull()) return GenericError;
-
-    if (name == QLatin1String("EvalError")) return EvalError;
-    if (name == QLatin1String("RangeError")) return RangeError;
-    if (name == QLatin1String("ReferenceError")) return ReferenceError;
-    if (name == QLatin1String("SyntaxError")) return SyntaxError;
-    if (name == QLatin1String("TypeError")) return TypeError;
-    if (name == QLatin1String("URIError")) return URIError;
     return GenericError;
 }
 

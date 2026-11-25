@@ -32,10 +32,13 @@
 #include <QObject>
 #include <QProcess>
 #include <QProcessEnvironment>
+#include <QTemporaryDir>
 #include <QVariant>
 #include <QVariantMap>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <fstream>
 #include <vector>
 
 #include "QuickJSEngine.h"
@@ -115,7 +118,28 @@ struct Snapshot {
     double mallocKB = 0;     // malloc_size: bytes allocated by the engine's allocator
     double atomsKB = 0, strsKB = 0, objsKB = 0, propsKB = 0, shapesKB = 0;
     int64_t atomCount = 0, objCount = 0, strCount = 0, propCount = 0;
+    double rssKB = 0;        // process RSS: C++-side growth the JS snapshot cannot see
 };
+
+// Process RSS from /proc (the same monitor 02_speed samples around its
+// benchmarks). The JS memory usage covers only the engine's heap: C++-side
+// containers (console label tables, meta-object caches, engine-side hashes)
+// grow invisible to it, so the report carries the process view too. 0 on
+// platforms without /proc - the verdict never depends on it.
+static double currentRSSKB()
+{
+#ifdef Q_OS_LINUX
+    std::ifstream f("/proc/self/status");
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.rfind("VmRSS:", 0) == 0) {
+            const size_t kb = line.find_first_of("0123456789");
+            if (kb != std::string::npos) return double(std::strtoull(line.c_str() + kb, nullptr, 10));
+        }
+    }
+#endif
+    return 0;
+}
 
 static double snapshotField(const JSMemoryUsage& u, int64_t JSMemoryUsage::*field)
 {
@@ -139,6 +163,7 @@ static Snapshot takeSnapshot(QQuickJSEngine& eng, int cycle)
     s.objCount = u.obj_count;
     s.strCount = u.str_count;
     s.propCount = u.prop_count;
+    s.rssKB = currentRSSKB();
     return s;
 }
 
@@ -176,6 +201,27 @@ static void reportSlope(const char* name, const std::vector<Snapshot>& snaps,
 // infrastructure object registered once).
 // ---------------------------------------------------------------------
 static int g_scriptErrors = 0;
+
+// Module infrastructure for the import step: canonical path of the file
+// module (empty if the temp dir failed); the registered module
+// "leakmod" is created in main(). Both engine-side module caches
+// (m_fileModules / m_registeredModules) are keyed by fixed distinct names
+// and filled once - they are cycle infrastructure like the `mon` object.
+static QString g_fileModulePath;
+
+// Escape a path for embedding inside a single-quoted JS string literal.
+static QString jsStringLiteral(const QString& s)
+{
+    QString out;
+    out.reserve(s.size() + 2);
+    for (const QChar c : s) {
+        if (c == QLatin1Char('\\') || c == QLatin1Char('\''))
+            out += QLatin1Char('\\');
+        out += c;
+    }
+    return out;
+}
+
 static void runCycle(QQuickJSEngine& eng, int cycle)
 {
     auto ev = [&eng](const QString& s) {
@@ -231,6 +277,20 @@ static void runCycle(QQuickJSEngine& eng, int cycle)
            "var j = JSON.parse('{\"idx\": %1, \"tags\": [\"ru\", \"data\"]}');"
            "mon.title = JSON.stringify(j);")
            .arg(cycle % 53));
+
+    // 9) Dynamic module import (the loader path that was previously outside
+    // the workload's coverage: specifier normalization, singleton cache
+    // lookup, namespace retrieval, and the import promise + .then draining
+    // with the job queue). Alternates between the file module (absolute
+    // specifier -> m_fileModules cache) and the registered module (bare
+    // specifier -> m_registeredModules); every per-cycle allocation on this
+    // path must be collectible after the cycle ends.
+    {
+        const bool useFile = (cycle % 2 == 0) && !g_fileModulePath.isEmpty();
+        const QString spec = useFile ? g_fileModulePath : QStringLiteral("leakmod");
+        ev(QStringLiteral("import('%1').then(m => { mon.title = m.tag; });")
+               .arg(jsStringLiteral(spec)));
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -456,6 +516,59 @@ int main(int argc, char* argv[])
     MonitorObject mon;
     eng.globalObject().setProperty("mon", eng.newQObject(&mon));
 
+    // Module infrastructure for the import step (step 9): a file module in a
+    // temp dir + a registered value module. Created once, before the
+    // baseline - like `mon`, they are persistent cycle infrastructure, and
+    // both engine-side module caches stay flat (fixed names, cache hits
+    // after the first import).
+    QTemporaryDir moduleDir;
+    if (moduleDir.isValid()) {
+        QFile moduleFile(moduleDir.filePath(QStringLiteral("cyclemod_file.js")));
+        if (moduleFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            moduleFile.write("export const tag = 'filemod';\nexport const n = 16;\n");
+            moduleFile.close();
+            g_fileModulePath = QFileInfo(moduleFile).canonicalFilePath();
+        }
+    }
+    if (g_fileModulePath.isEmpty()) {
+        qWarning().noquote() << "leakgate: temp module file unavailable - the import step "
+                                "will exercise the registered-module path only";
+    }
+    const QQuickJSValue regMod = eng.evaluate(
+        QStringLiteral("({ tag: 'regmod', n: 8 })"));
+    if (!eng.registerModule(QStringLiteral("leakmod"), regMod)) {
+        qWarning().noquote() << "leakgate: registerModule('leakmod') failed";
+        return 1;
+    }
+
+    // Verify the module infrastructure before the baseline: a silently
+    // broken import step would shrink the workload's coverage without
+    // failing the gate. Both flavors must resolve and expose .tag.
+    {
+        const QString fileSpec = jsStringLiteral(g_fileModulePath);
+        const QString checkScript = g_fileModulePath.isEmpty()
+                ? QStringLiteral("import('leakmod').then(m => { globalThis.modcheck = m.tag; });")
+                : QStringLiteral(
+                      "globalThis.modcheck = ''; "
+                      "import('%1').then(m => { globalThis.modcheck += m.tag; }); "
+                      "import('leakmod').then(m => { globalThis.modcheck += m.tag; });")
+                      .arg(fileSpec);
+        const QQuickJSValue started = eng.evaluate(checkScript);
+        const QQuickJSValue tag = eng.evaluate(QStringLiteral("globalThis.modcheck"));
+        const QString expected = g_fileModulePath.isEmpty()
+                                     ? QStringLiteral("regmod")
+                                     : QStringLiteral("filemodregmod");
+        if (started.isError() || tag.toString() != expected) {
+            qWarning().noquote() << QString("leakgate: module import verification failed "
+                                            "(started=%1 modcheck='%2', expected '%3')")
+                                        .arg(started.isError() ? QLatin1String("error")
+                                                               : QLatin1String("ok"))
+                                        .arg(tag.toString(), expected);
+            return 1;
+        }
+        eng.evaluate(QStringLiteral("delete globalThis.modcheck;"));
+    }
+
     // Warm-up: one full cycle + GC, then the baseline snapshot.
     runCycle(eng, 0);
     Snapshot base = takeSnapshot(eng, 0);
@@ -510,6 +623,19 @@ int main(int argc, char* argv[])
     qDebug().noquote() << QString("    seg1: %1, seg2: %2, seg3: %3")
                               .arg(slope(x1, y1), 0, 'f', 6).arg(slope(x2, y2), 0, 'f', 6)
                               .arg(slope(x3, y3), 0, 'f', 6);
+
+    // Process-RSS slope: informational only. RSS carries allocator arenas and
+    // page noise the JS snapshot does not, so a hard gate here would
+    // false-positive; a sustained climb is still the visible symptom of
+    // C++-side growth (see the comment on Snapshot::rssKB).
+    if (last.rssKB > 0) {
+        std::vector<double> xr, yr;
+        for (const auto& s : snaps) { xr.push_back(s.cycle); yr.push_back(s.rssKB); }
+        qDebug().noquote() << QString("Process RSS slope: %1 KB/cycle (base %2 KB, last %3 KB) -"
+                                     " informational, not gated")
+                                  .arg(slope(xr, yr), 0, 'f', 6)
+                                  .arg(base.rssKB, 0, 'f', 1).arg(last.rssKB, 0, 'f', 1);
+    }
 
     if (overall > 0.03125) {   // > 32 bytes/cycle
         // Growing-counter hints: which slice grows fastest?

@@ -145,6 +145,17 @@ public:
     QDateTime toDateTime() const;
     QObject* toQObject() const;
 
+    // The two call families bind 'this' differently, each matching its
+    // QJSValue counterpart (verified against Qt 6.12):
+    // - call() binds thisObj AS-IS: an object receiver stays the object, a
+    //   primitive receiver (number, string, ...) stays the primitive (a
+    //   sloppy-mode callee then sees it boxed, a strict callee sees the raw
+    //   value), and an INVALID thisObj (the default) binds the engine's
+    //   global object - even for strict callees.
+    // - callWithInstance() replaces a NON-OBJECT instance with the global
+    //   object before calling; only object instances bind as-is.
+    // The asymmetry is QJSEngine's own: call() mirrors QJSValue::call()'s
+    // pass-through, callWithInstance() mirrors its global-object coercion.
     QQuickJSValue call(const QVariantList& args = {}, const QQuickJSValue& thisObj = QQuickJSValue());
     QQuickJSValue call(const QList<QQuickJSValue>& args, const QQuickJSValue& thisObj = QQuickJSValue());
     QQuickJSValue callWithInstance(const QQuickJSValue& instance, const QVariantList& args = {});

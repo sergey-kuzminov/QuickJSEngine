@@ -17,12 +17,21 @@
  * Iteration covers only the object's own properties; the prototype chain is
  * not followed and symbol-keyed properties are skipped, like QJSValueIterator.
  * Non-enumerable own properties (an array's "length", for example) are
- * included. The property value is fetched lazily by value(): a getter runs at
- * that point, and a throwing getter yields an invalid value instead of
- * propagating the exception.
+ * included - verified against Qt 6.12's QJSValueIterator, which is built on
+ * V4's ownPropertyKeys() and behaves the same way. The property value is
+ * fetched lazily by value(): a getter runs at that point, and a throwing
+ * getter yields an invalid value instead of propagating the exception.
  *
  * @warning Like QQuickJSValue itself, the iterator is not thread-safe: all
  * operations must run in the thread that owns the engine.
+ *
+ * @warning The iterator must not outlive the engine that owns the iterated
+ * value: after the engine's destruction the context is gone and the iterator
+ * can neither free nor reuse its property enumeration. Destroying the
+ * iterator then leaks the whole JSPropertyEnum array - the atom references
+ * AND the array itself - on top of any QQuickJSValue it still hands out;
+ * the engine's leak dump cannot account for it. Reset it (assign a fresh
+ * value or destroy it) before the engine goes away.
  */
 class QQuickJSValueIterator {
 public:

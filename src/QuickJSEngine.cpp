@@ -162,16 +162,17 @@ uintptr_t measureThreadStackFloor()
 // threads (POSIX threads map the whole reserve up front; the Windows TEB
 // reports fixed limits), so a thread_local cache is safe.
 //
-// The Linux main thread is the one exception: pthread_getattr_np reports
-// the stack VMA grown SO FAR, and that VMA only extends downwards as
-// recursion touches new pages. A cached floor therefore goes stale HIGH
-// for the deepest entries; the cache re-measures whenever the caller's SP
-// is below the cached floor (the VMA must have grown since), so the clamp
-// never mistakes "stack grew below the cached floor" for "garbage floor".
-// The first (highest) value is otherwise the safe side: clamping against a
-// too-high floor only makes the guard fire a little earlier, never below
-// the real bottom. The re-measure logic lives in threadStackFloor(),
-// defined after the budget constants it reports in its diagnostics.
+// The Linux main thread is the one worth a word: pthread_getattr_np derives
+// the MAIN thread's bounds from the [stack] VMA and RLIMIT_STACK. Modern
+// glibc (verified on 2.41: the reported floor sits at top - rlimit and does
+// not move as recursion touches new pages) extends the mapping to the rlimit
+// growth boundary, so the cached floor is the true hard bottom and never
+// goes stale. Older glibc reported the VMA grown SO FAR - a floor ABOVE the
+// true bottom that only extended downwards as pages were touched. The
+// re-measure branch in threadStackFloor() (sp < cached => measure again)
+// keeps the cache correct under BOTH semantics without telling them apart:
+// a too-high floor only makes the guard fire a little earlier, never below
+// the real bottom, and re-measuring from a deeper SP refreshes it.
 
 // Distance kept between the guard line and the real thread stack bottom. The
 // JS guard is checked at JS frame entries only, so one whole C frame can slip
@@ -250,6 +251,47 @@ bool guardTraceEnabled()
 std::atomic<bool> g_emergencyWarned{false};
 std::atomic<bool> g_degenerateWarned{false};
 std::atomic<bool> g_floorUnknownWarned{false};
+// Ceiling for the console.count()/console.time() label tables. Both are
+// keyed by arbitrary script-supplied labels and were the only engine-side
+// containers without a natural bound: a script looping over dynamic labels
+// grew them without limit, and the leak stays invisible to the JSMemoryUsage
+// snapshot leakgate measures (it only sees the JS heap). 1024 labels matches
+// the order of the other engine caches (AtomNameCacheLimit etc.); a script
+// hitting it is almost certainly leaking labels on purpose.
+constexpr int kConsoleLabelLimit = 1024;
+std::atomic<bool> g_consoleLabelCapWarned{false};
+// Ceiling for the unhandled-rejection buffer (m_pendingRejections). The
+// buffer only drains at the end of a tick when no jobs are pending; with
+// setAutoProcessPromises(false) and a never-drained job queue it grows
+// without bound (each entry pins a promise and its reason on the JS heap,
+// a leak the JSMemoryUsage slope of the leakgate sees - the r5 probe's
+// "stuck job + fresh rejections" scenario). 1024 entries matches the order
+// of the other engine caches (kConsoleLabelLimit etc.); past the ceiling
+// the OLDEST buffered entry is evicted and reported immediately to make
+// room (see queueUnhandledRejection).
+constexpr int kMaxPendingRejections = 1024;
+std::atomic<bool> g_rejectionCapWarned{false};
+// The engine's interrupt heartbeat, in counted operations per poll: the
+// interpreter calls the interrupt handler after every 10000 counted
+// operations (branch opcodes, function entries, polled builtin loop
+// iterations - quickjs.c JS_INTERRUPT_COUNTER_INIT / js_poll_interrupts),
+// and the regex engine after every 10000 backtracking steps (libregexp.c
+// INTERRUPT_COUNTER_INIT / lre_poll_timeout -> lre_check_timeout, wired to
+// the same handler). One "step" of setStepBudget() is one such counted
+// operation; the accounting in interruptHandler() charges one full poll
+// interval per handler invocation (see notes-r8-heartbeat.md for the full
+// poll-site audit).
+constexpr quint64 kStepPollInterval = 10000;
+// Process-wide calibration cache for calibrateMachineryAllowance(): the
+// measured machinery chain is a property of THIS BINARY's frame layout
+// (build type, sanitizer flags), not of an engine instance - every engine
+// runs the same compile+eval+trampoline code. The first engine in the
+// process pays the probe; every later constructor reuses the cached value,
+// which is the common monitoring shape (one engine per script, hundreds
+// over a process lifetime). Two engines racing on different threads both
+// probe and both store - harmless: both measurements are valid for the
+// same binary, and the store is idempotent for the reader.
+std::atomic<size_t> g_cachedMachineryAllowance{0};
 bool warnOnce(std::atomic<bool>& latch)
 {
     return latch.exchange(true);
@@ -455,11 +497,47 @@ QQuickJSEngine::QQuickJSEngine(QObject* parent) : QObject(parent),
     }, this);
 
     m_atoms.length = JS_NewAtom(m_ctx, "length");
-    m_atoms.getTime = JS_NewAtom(m_ctx, "getTime");
     m_atoms.stack = JS_NewAtom(m_ctx, "stack");
     m_atoms.lineNumber = JS_NewAtom(m_ctx, "lineNumber");
     m_atoms.line = JS_NewAtom(m_ctx, "line");
     m_atoms.name = JS_NewAtom(m_ctx, "name");
+
+    // Capture the intrinsics (see JSIntrinsics) before anything script-visible
+    // can change them: errorType() then classifies by prototype identity
+    // instead of the mutable 'name' property, and the Date conversion calls
+    // the captured getTime instead of whatever the instance carries. A failed
+    // lookup (exotic context) leaves JS_UNDEFINED entries, which the consumers
+    // treat as "no match / not captured"; no lookup may leave a pending
+    // exception behind for the first evaluate().
+    for (JSValue& p : m_intrinsics.errorProtos) p = JS_UNDEFINED;
+    {
+        static const char* const kErrorCtors[] = {
+            "Error", "EvalError", "RangeError", "ReferenceError",
+            "SyntaxError", "TypeError", "URIError",
+        };
+        ScopedJSValue global(m_ctx, JS_GetGlobalObject(m_ctx));
+        for (size_t i = 0; i < std::size(kErrorCtors); ++i) {
+            ScopedJSValue ctor(m_ctx, JS_GetPropertyStr(m_ctx, global.value(), kErrorCtors[i]));
+            if (JS_IsFunction(m_ctx, ctor.value())) {
+                ScopedJSValue proto(m_ctx, JS_GetPropertyStr(m_ctx, ctor.value(), "prototype"));
+                if (JS_IsObject(proto.value()))
+                    m_intrinsics.errorProtos[i] = JS_DupValue(m_ctx, proto.value());
+            }
+        }
+        ScopedJSValue dateCtor(m_ctx, JS_GetPropertyStr(m_ctx, global.value(), "Date"));
+        if (JS_IsFunction(m_ctx, dateCtor.value())) {
+            ScopedJSValue proto(m_ctx, JS_GetPropertyStr(m_ctx, dateCtor.value(), "prototype"));
+            if (JS_IsObject(proto.value())) {
+                JSValue fn = JS_GetPropertyStr(m_ctx, proto.value(), "getTime");
+                if (JS_IsFunction(m_ctx, fn)) {
+                    m_intrinsics.dateGetTime = fn;   // owns the reference
+                } else {
+                    JS_FreeValue(m_ctx, fn);
+                }
+            }
+        }
+        clearPendingException(m_ctx);
+    }
 
     JS_NewClassID(m_rt, &m_qobjectClassID);
     JS_NewClassID(m_rt, &m_methodClassID);
@@ -676,8 +754,10 @@ QQuickJSEngine::~QQuickJSEngine() {
     }
     m_stringAtomCache.clear();
 
-    JS_FreeAtoms(m_ctx, m_atoms.length, m_atoms.getTime, m_atoms.stack,
+    JS_FreeAtoms(m_ctx, m_atoms.length, m_atoms.stack,
                  m_atoms.lineNumber, m_atoms.line, m_atoms.name);
+    for (JSValue& p : m_intrinsics.errorProtos) JS_FreeValue(m_ctx, p);
+    JS_FreeValue(m_ctx, m_intrinsics.dateGetTime);
 
     JS_FreeValue(m_ctx, m_globalObj);
     JS_FreeContext(m_ctx);
@@ -690,6 +770,14 @@ void QQuickJSEngine::setExecutionTimeoutMs(quint32 ms) {
     // Self-contained deadline: enabling the timeout mid-execution grants a
     // fresh full quota immediately (from any thread); disabling clears it.
     m_executionDeadlineMs.store(deadlineFromTimeout(ms));
+}
+void QQuickJSEngine::setStepBudget(quint64 maxSteps) {
+    // Self-contained like the timeout: enabling the budget mid-run applies
+    // from the next poll on (steps executed while no budget was set were not
+    // counted and do not count against the new quota); disabling stops the
+    // accounting. The quota itself is re-armed fresh at every top-level
+    // entry (resetExecutionState()).
+    m_stepBudget.store(maxSteps, std::memory_order_relaxed);
 }
 void QQuickJSEngine::setMemoryLimit(size_t limit) { if (m_rt) JS_SetMemoryLimit(m_rt, limit); }
 void QQuickJSEngine::setMaxStackSize(size_t size) {
@@ -822,6 +910,17 @@ void QQuickJSEngine::calibrateMachineryAllowance()
         return;
     m_allowanceCalibrated = true;   // one shot, even on failure
 
+    // Process-wide cache hit (see g_cachedMachineryAllowance): skip the
+    // probe entirely - no provisional guard, no eval, no /proc churn.
+    if (const size_t cached = g_cachedMachineryAllowance.load(std::memory_order_acquire)) {
+        m_machineryAllowance = cached;
+        if (guardTraceEnabled()) {
+            qWarning("QQuickJSEngine: [guard] calibration reused from process cache: allowance=%zu KiB",
+                     m_machineryAllowance / 1024);
+        }
+        return;
+    }
+
     // Provisional guard for the probe: HALF of what the thread can safely
     // spare below this anchor, never the full amount. When the machinery
     // descent on fat Debug/ASan builds exceeds the budget, the guard fires
@@ -895,6 +994,10 @@ void QQuickJSEngine::calibrateMachineryAllowance()
         if (allowance > kMaxMachineryAllowance) allowance = kMaxMachineryAllowance;
         m_machineryAllowance = allowance;
     }
+    // Publish even the fallback: it is a per-binary decision too (the probe
+    // failed for a reason tied to this binary's stack layout), and every
+    // later engine would measure the same nothing.
+    g_cachedMachineryAllowance.store(m_machineryAllowance, std::memory_order_release);
     if (guardTraceEnabled()) {
         qWarning("QQuickJSEngine: [guard] calibration chain=%zu KiB allowance=%zu KiB",
                  chain / 1024, m_machineryAllowance / 1024);
@@ -945,6 +1048,28 @@ void QQuickJSEngine::setEvalCacheLimit(int limit) {
     }
 }
 
+namespace {
+// The "%s" C error constructors stop at an embedded NUL, while error
+// messages CAN carry one (QAnyStringView over NUL-bearing data; QJSEngine
+// keeps the full payload). Restore it through a plain data-property write -
+// the same way quickjs-ng's own error constructors install the message; no
+// script runs. JS_SetPropertyStr frees the value on every path (verified in
+// the vendored source), so a failure only leaves the truncated message.
+void restoreFullErrorMessage(JSContext* ctx, JSValue err, const QString& message)
+{
+    const QByteArray utf8 = message.toUtf8();
+    if (!utf8.contains('\0')) return;
+    JSValue msg = qStringToJS(ctx, message);
+    if (JS_IsException(msg)) {
+        clearPendingException(ctx);
+        return;
+    }
+    if (JS_SetPropertyStr(ctx, err, "message", msg) < 0) {
+        clearPendingException(ctx);
+    }
+}
+} // namespace
+
 QQuickJSValue QQuickJSEngine::newErrorObject(QQuickJSValue::ErrorType errorType, QAnyStringView message) {
     ensureEngineThread();
     if (errorType == QQuickJSValue::NoError) {
@@ -971,6 +1096,7 @@ QQuickJSValue QQuickJSEngine::newErrorObject(QQuickJSValue::ErrorType errorType,
         default: break;   // unreachable: the remaining types are handled above
         }
         if (JS_IsException(err)) return QQuickJSValue::fromException(this);
+        restoreFullErrorMessage(m_ctx, err, message.toString());
         QQuickJSValue result(this, err, true);
         result.m_isError = true;
         return result;
@@ -989,6 +1115,7 @@ QQuickJSValue QQuickJSEngine::newErrorObject(QQuickJSValue::ErrorType errorType,
         const QByteArray utf8 = message.toString().toUtf8();
         JSValue err = JS_NewPlainError(m_ctx, "%s", utf8.constData());
         if (JS_IsException(err)) return QQuickJSValue::fromException(this);
+        restoreFullErrorMessage(m_ctx, err, message.toString());
         QQuickJSValue result(this, err, true);
         result.m_isError = true;
         return result;
@@ -1085,6 +1212,20 @@ int QQuickJSEngine::interruptHandler(JSContext * /*ctx*/, void* opaque) {
     const qint64 deadline = engine->m_executionDeadlineMs.load();
     if (deadline > 0 && steadyNowMs() > deadline) {
         return 1;
+    }
+
+    // Step budget (the deterministic complement to the wall-clock deadline
+    // above): each invocation of this handler marks one full poll interval
+    // of executed work (kStepPollInterval counted operations, interpreter or
+    // regex - whichever machinery polled). Skipped entirely when no budget
+    // is set: zero overhead for runs that do not use the API.
+    const quint64 stepBudget = engine->m_stepBudget.load(std::memory_order_relaxed);
+    if (stepBudget > 0) {
+        const quint64 used = engine->m_stepsUsed.fetch_add(kStepPollInterval, std::memory_order_relaxed)
+                             + kStepPollInterval;
+        if (used >= stepBudget) {
+            return 1;
+        }
     }
     return 0;
 }
@@ -1510,7 +1651,20 @@ void QQuickJSEngine::installExtensions(QQuickJSEngine::Extensions extensions, co
                     QQuickJSEngine* engine = engineFromContext(ctx);
                     if (!engine) return JS_UNDEFINED;
                     const QString label = argc > 0 ? consoleArgToString(ctx, argv[0]) : QString();
-                    const int value = ++engine->m_consoleCounters[label];
+                    // Known label: count on. New label while the table is at
+                    // the ceiling: report 1 WITHOUT storing (the counter
+                    // cannot accumulate; say so once instead of growing
+                    // without bound - see kConsoleLabelLimit).
+                    const auto it = engine->m_consoleCounters.find(label);
+                    int value = 1;
+                    if (it != engine->m_consoleCounters.end()) {
+                        value = ++it.value();
+                    } else if (engine->m_consoleCounters.size() < kConsoleLabelLimit) {
+                        engine->m_consoleCounters.insert(label, 1);
+                    } else if (!g_consoleLabelCapWarned.exchange(true)) {
+                        qWarning("QQuickJSEngine: console.count() label table at its ceiling (%d labels) -"
+                                 " new labels are counted but not stored", kConsoleLabelLimit);
+                    }
                     qDebug().noquote() << "[JS console]" << QStringLiteral("%1: %2").arg(label).arg(value);
                     return JS_UNDEFINED;
                 } catch (const std::exception& e) {
@@ -1529,7 +1683,19 @@ void QQuickJSEngine::installExtensions(QQuickJSEngine::Extensions extensions, co
                     if (engine) {
                         QElapsedTimer timer;
                         timer.start();
-                        engine->m_consoleTimers.insert(consoleArgToString(ctx, argv[0]), timer);
+                        const QString label = consoleArgToString(ctx, argv[0]);
+                        // A repeated label replaces its timer (no growth);
+                        // a new label past the ceiling is dropped with a
+                        // one-shot warning - the matching timeEnd() then
+                        // stays silent, like any label without a timer
+                        // (see kConsoleLabelLimit).
+                        if (engine->m_consoleTimers.contains(label)
+                                || engine->m_consoleTimers.size() < kConsoleLabelLimit) {
+                            engine->m_consoleTimers.insert(label, timer);
+                        } else if (!g_consoleLabelCapWarned.exchange(true)) {
+                            qWarning("QQuickJSEngine: console.time() label table at its ceiling (%d labels) -"
+                                     " new timers are dropped", kConsoleLabelLimit);
+                        }
                     }
                     return JS_UNDEFINED;
                 } catch (const std::exception& e) {
@@ -1723,6 +1889,30 @@ void QQuickJSEngine::processAndEmitException(JSContext* ctx, JSValueConst exc) {
 void QQuickJSEngine::queueUnhandledRejection(JSContext* ctx, JSValueConst promise, JSValueConst reason) {
     PendingRejection entry{JS_DupValue(ctx, promise), JS_DupValue(ctx, reason)};
     try {
+        // Soft ceiling (kMaxPendingRejections): the buffer only drains at the
+        // end of a tick with an empty job queue, so auto-processing disabled
+        // plus a never-drained job means unbounded growth. Make room by
+        // evicting the OLDEST entry and reporting it immediately: the oldest
+        // has had the longest retraction window, every rejection is still
+        // reported exactly once - the report just arrives earlier than
+        // end-of-tick for overflow entries (a late .catch() on an already
+        // evicted promise can no longer retract it; pathological regime
+        // either way). Reporting may re-enter this function (the reason's
+        // toString can reject promises): the evicted slot is already free at
+        // that point, so the re-entrant append fits and the list stays
+        // bounded (worst case one entry over the ceiling until the next
+        // rejection evicts again).
+        if (m_pendingRejections.size() >= kMaxPendingRejections) {
+            if (Q_UNLIKELY(!warnOnce(g_rejectionCapWarned))) {
+                qWarning("QQuickJSEngine: unhandled promise rejection buffer full (%d entries); "
+                         "reporting the oldest buffered rejection immediately - "
+                         "setAutoProcessPromises(false) with pending jobs is holding the buffer",
+                         kMaxPendingRejections);
+            }
+            PendingRejection evicted = m_pendingRejections.takeFirst();
+            processAndEmitException(ctx, evicted.reason);
+            JS_FreeValues(ctx, evicted.promise, evicted.reason);
+        }
         m_pendingRejections.append(entry);
     } catch (...) {
         // Cannot buffer (OOM): free the duplicates and report immediately.
@@ -1807,6 +1997,17 @@ QQuickJSValue QQuickJSEngine::evaluate(const QString& script, const QString& fil
         // the pending-exception report below) - the engine is unusable on
         // such a stack either way, but the process must stay alive.
         if (Q_UNLIKELY(m_stackStarved)) {
+            // A pending exception preempts the refusal exactly like it
+            // preempts the evaluation itself: consume it through the pure C
+            // path (JS_GetException runs no script - the guarantee this
+            // refusal makes) and return it instead of the RangeError, so the
+            // error does not stay pending behind every subsequent starved
+            // entry. The full report (stack collection, uncaughtException)
+            // stays skipped: it runs JS and needs the stack this entry
+            // refused. With nothing pending, the refusal RangeError itself.
+            if (JS_HasException(m_ctx)) {
+                return QQuickJSValue::fromException(this);
+            }
             return newErrorObject(QQuickJSValue::RangeError,
                                    QStringLiteral("Maximum call stack size exceeded"));
         }
@@ -2485,7 +2686,16 @@ JSValue QQuickJSEngine::toJSValueImpl(const QVariant& var, int depth) {
     if (var.userType() == QMetaType::QVariant) return toJSValueImpl(var.value<QVariant>(), depth);
 
     if (QMetaType(var.userType()).flags() & QMetaType::IsEnumeration) {
-        return JS_NewInt32(m_ctx, var.toInt());
+        // Enumerations convert through the declared width: toInt() truncates
+        // a quint64-backed enum (1 << 40 reads back as 0). IsUnsigned-
+        // Enumeration selects the signedness of the underlying read, the
+        // same policy the metacall ladders apply (adjustEnumType and the
+        // sizeOf guards). Narrow enums come out as plain int32 numbers,
+        // int-backed ones never even reach here (the fast paths).
+        const QMetaType enumMt(var.userType());
+        if (enumMt.flags() & QMetaType::IsUnsignedEnumeration)
+            return QuickJSConvert::uint64ToJS(m_ctx, var.toULongLong());
+        return QuickJSConvert::int64ToJS(m_ctx, var.toLongLong());
     }
 
     switch (var.userType()) {
@@ -2627,9 +2837,17 @@ QVariant QQuickJSEngine::toVariantImpl(JSValueConst val, JSVisitedStack& visited
         QVariant result;
         try {
             if (JS_IsDate(val)) {
-                ScopedJSValue timeVal(m_ctx, JS_GetProperty(m_ctx, val, m_atoms.getTime));
-                if (JS_IsFunction(m_ctx, timeVal.value())) {
-                    ScopedJSValue ret(m_ctx, JS_Call(m_ctx, timeVal.value(), val, 0, nullptr));
+                // Call the CAPTURED intrinsic Date.prototype.getTime, not the
+                // getTime property the instance (or an edited prototype
+                // chain) happens to carry: QJSEngine reads the internal date
+                // slot, so a script that replaced d.getTime or
+                // Date.prototype.getTime must not change the converted value.
+                // The captured original builtin still costs one JS_Call - a
+                // documented wrapper divergence (V4: slot read) - but its
+                // result is fixed by construction: it reads the internal slot
+                // of the receiver it is given.
+                if (JS_IsFunction(m_ctx, m_intrinsics.dateGetTime)) {
+                    ScopedJSValue ret(m_ctx, JS_Call(m_ctx, m_intrinsics.dateGetTime, val, 0, nullptr));
                     if (consumeException(m_ctx, ret.value())) {
                         result = QVariant();
                     } else {
@@ -2642,6 +2860,9 @@ QVariant QQuickJSEngine::toVariantImpl(JSValueConst val, JSVisitedStack& visited
                         }
                     }
                 } else {
+                    // Intrinsics not captured (exotic context): no honest
+                    // internal read is available; an invalid QDateTime beats
+                    // a script-controlled value.
                     result = QVariant();
                 }
             } else {
@@ -2887,9 +3108,16 @@ JSValue QQuickJSEngine::wrapQObject(QObject* obj) {
 
                 auto data = static_cast<JSQObjectData*>(JS_GetOpaque(jsObj, m_qobjectClassID));
                 if (data) {
+                    // Drop the heavy per-wrapper caches (method proxies hold
+                    // JSValues) but KEEP the wrapper a QObject wrapper with
+                    // its opaque data: isQObject() then stays true for the
+                    // zombie, like QJSEngine (V4 keeps the wrapper class
+                    // after the C++ object died; toQObject() returns nullptr
+                    // through the nulled QPointer). The exotic handlers'
+                    // obj.isNull() checks route every access to the "QObject
+                    // has been deleted" TypeError, and the JS-object
+                    // finalizer deletes the data for good.
                     data->clearCaches(m_rt);
-                    delete data;
-                    JS_SetOpaque(jsObj, nullptr);
                 }
                 JS_FreeValue(m_ctx, jsObj);
             }

@@ -12,6 +12,12 @@
 
 class QuickJSQObjectProxy {
 public:
+    // The single QMetaType read ladder shared by invokeAndConvertReturn()
+    // and getMetaProperty() (a member so the lambdas keep friend access to
+    // the engine's wrapQObject()/toJSValue()).
+    static JSValue convertMetaRead(QQuickJSEngine* engine, JSContext* ctx, QObject* obj,
+                                   QMetaObject::Call op, int slotIdx, int metaType,
+                                   QVarLengthArray<void*, MetaCallArgsLimit>* args);
     static JSValue invokeAndConvertReturn(QQuickJSEngine* engine, JSContext* ctx, QObject* obj, int methodIdx, int retType, QVarLengthArray<void*, MetaCallArgsLimit>& args);
     static JSValue getMetaProperty(QQuickJSEngine* engine, JSContext* ctx, JSQObjectData* data, const MetaCacheEntry& entry);
     static JSValue getMethodProxy(QQuickJSEngine* engine, JSContext* ctx, JSQObjectData* data, JSAtom prop, const MetaCacheEntry& entry);

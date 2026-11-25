@@ -179,10 +179,26 @@ public:
     int value() const { return m_value; }
     void setValue(int val) { if (m_value != val) { m_value = val; emit valueChanged(val); } }
     const QString& rusName() const { return m_rusName; }
-    void setRusName(const QString& val) { m_rusName = val; emit rusNameChanged(); }
+    // NOTIFY guard (r5): the property-write benchmark stores a constant, so
+    // the setter body must not emit on every call (value/setValue already
+    // had this guard; rusName did not).
+    void setRusName(const QString& val) { if (m_rusName == val) return; m_rusName = val; emit rusNameChanged(); }
 
     Q_INVOKABLE int add(int a, int b) { return a + b; }
-    Q_INVOKABLE QVariant echoVariant(QVariant v) { return v; }
+    // Direction decomposition (r5): sinkVariant measures the JS -> QVariant
+    // argument conversion (empty body, nothing returned); the getVariant*
+    // sources measure the QVariant -> JS return conversion from prebuilt
+    // members (return-by-value is a cheap refcount bump, like getList32).
+    // The old round-trip cases (echoVariant) mixed both directions in one
+    // number and hid where the cost sits.
+    Q_INVOKABLE void sinkVariant(QVariant v) { Q_UNUSED(v); }
+    // Typed sink (r6): the StringList JS->C++ case passes a real JS array
+    // into a QStringList parameter, so the measured work is the typed
+    // argument conversion rather than the QVariant bridge.
+    Q_INVOKABLE void sinkStringList(QStringList l) { Q_UNUSED(l); }
+    Q_INVOKABLE QVariant getVariantString() const { return m_variantString; }
+    Q_INVOKABLE QVariant getVariantMap() const { return m_variantMap; }
+    Q_INVOKABLE QVariant getVariantList() const { return m_variantList; }
     Q_INVOKABLE QObject* getChild() const { return m_child; }
     // Prebuilt lists: measure the C++ -> JS conversion only, no per-call
     // list construction (return-by-value is a cheap refcount bump).
@@ -197,6 +213,16 @@ private:
     int m_value = 0;
     QString m_rusName = "Привет, мир! Это тестовая строка на русском языке.";
     TestObject* m_child;
+    // Payloads mirrored by the JS literals in the QVariant direction cases,
+    // so JS->C++ and C++->JS rows measure the same data shape.
+    QString m_variantString = QStringLiteral("test string");
+    QVariantMap m_variantMap = {
+        {QStringLiteral("userId"), 42},
+        {QStringLiteral("userName"), QStringLiteral("ivan")},
+        {QStringLiteral("active"), true},
+        {QStringLiteral("score"), 3.5},
+    };
+    QVariantList m_variantList = { 1, 2, 3, 4, 5, 6, 7, 8 };
     QVariantList m_list32 = QVariantList{
         0, 1, QStringLiteral("two"), 3.5, true, 5, QStringLiteral("six"), 7,
         8, 9, QStringLiteral("ten"), 11.5, false, 13, QStringLiteral("fourteen"), 15,
@@ -319,6 +345,13 @@ struct BenchEngine {
     virtual void prepareCall() = 0;
     virtual double callOnce() = 0;
     virtual void collectGarbage() = 0;
+    // Constructs and destroys n same-flavor engines: the constructor benchmark.
+    // Configured like the owning adapter so the per-instance work matches.
+    virtual void constructCycle(int n) = 0;
+    // Eval-cache tuning for the cold/thrash cases; a no-op on engines without
+    // a bytecode cache (Qt V4 always compiles, so warm == cold there).
+    virtual void setEvalCacheEnabled(bool) {}
+    virtual void setEvalCacheLimit(int) {}
 };
 
 #ifndef SKIP_QT_BENCHMARK
@@ -345,6 +378,9 @@ public:
     }
     double callOnce() override { return m_fn.call(m_args).toNumber(); }
     void collectGarbage() override { engine.collectGarbage(); }
+    void constructCycle(int n) override {
+        for (int i = 0; i < n; ++i) { QJSEngine e; }
+    }
 private:
     QJSValue m_fn;
     QJSValueList m_args;
@@ -383,6 +419,21 @@ public:
     }
     double callOnce() override { return m_fn.call(*m_callArgs).toDouble(); }
     void collectGarbage() override { engine.collectGarbage(); }
+    void setEvalCacheEnabled(bool enabled) override { engine.setEvalCacheEnabled(enabled); }
+    void setEvalCacheLimit(int limit) override { engine.setEvalCacheLimit(limit); }
+    void constructCycle(int n) override {
+        // Same configuration as this adapter's constructor. The stack-guard
+        // calibration is warm by the time any benchmark runs (the adapter
+        // engines were built first and the calibration is cached per
+        // process), so this measures the steady-state multi-engine cost the
+        // cache exists for - not the one-time probe.
+        for (int i = 0; i < n; ++i) {
+            QQuickJSEngine e;
+            e.setMemoryLimit(0);
+            e.setMaxStackSize(0);
+            e.setExecutionTimeoutMs(0);
+        }
+    }
 private:
     QQuickJSValue m_fn;
     QList<QQuickJSValue>* m_callArgs = nullptr;
@@ -394,6 +445,11 @@ private:
 
 struct BenchCase {
     const char* name;
+    // 0 = informational/diagnostic: the row is printed and exported to the
+    // CSV, but excluded from BOTH aggregates (relative score and throughput
+    // index). Reserve it for rare or synthetic scenarios tracked only for
+    // regressions (engine ctor+dtor, eval-cache thrash); realistic cases
+    // carry a real weight.
     int weight;
     int defaultN;
     bool calibrated;                                  // per-engine n targeting ~400 ms
@@ -550,6 +606,60 @@ static QVector<BenchCase> buildCases(TestObject& obj)
             e.evaluate(QStringLiteral("function f(){ let a=[]; for(let i=0;i<%1;i++) a.push(i); let s=0; for(let i=0;i<%2;i++) s+=a[i]; return s; } f();").arg(n).arg(n));
         }, gcHook, gcHook);
 
+    // ---- Pure JS: monitoring workload (r5). Log parsing, JSON telemetry and
+    // string munging are frequent operations for the embedding scenario and
+    // were previously unmeasured (JSON only appeared in the leakgate
+    // workload, untimed). ----
+    // r7: the original r5 pattern was one ident group short for the two-dash
+    // CLF line ("host - - [ts]"), so it never matched and the row measured
+    // the anchored NO-match path - where the V4 Yarr JIT fails in ~96 ns
+    // (anchor honored, one attempt) while quickjs-ng walks the start-position
+    // retry loop (~1.3 us, 14x). The pattern below adds the authuser group
+    // (9 result elements) and really matches; the post-loop check makes a
+    // future silent regression to a non-matching pattern fail loudly through
+    // the script_errors counter instead of skewing the table.
+    add("Regex (log-line match)", 5, 200000, true,
+        [](BenchEngine& e, int n) {
+            e.evaluate(QStringLiteral(
+                "function f(){"
+                " const re = /^(\\S+) (\\S+) (\\S+) \\[(.+)\\] \"(\\w+) (\\S+) [^\"]*\" (\\d{3}) (\\d+)/;"
+                " const line = '10.14.2.201 - - [12/Nov/2026:10:34:58 +0300] \"GET /api/v1/stats HTTP/1.1\" 200 5123';"
+                " let r;"
+                " for(let i=0;i<%1;i++){ r = re.exec(line); }"
+                " if (!r || r.length !== 9) throw new Error('regex case no longer matches its line');"
+                " return r; } f();").arg(n));
+        }, gcHook, gcHook);
+
+    add("JSON.parse (small)", 5, 400000, true,
+        [](BenchEngine& e, int n) {
+            e.evaluate(QStringLiteral(
+                "function f(){"
+                " const s = '{\"userId\":42,\"userName\":\"ivan\",\"active\":true,\"score\":3.5,\"tags\":[\"a\",\"b\"]}';"
+                " let r;"
+                " for(let i=0;i<%1;i++){ r = JSON.parse(s); }"
+                " return r; } f();").arg(n));
+        }, gcHook, gcHook);
+
+    add("JSON.stringify (small)", 5, 400000, true,
+        [](BenchEngine& e, int n) {
+            e.evaluate(QStringLiteral(
+                "function f(){"
+                " const o = {userId:42, userName:'ivan', active:true, score:3.5, tags:['a','b']};"
+                " let r;"
+                " for(let i=0;i<%1;i++){ r = JSON.stringify(o); }"
+                " return r; } f();").arg(n));
+        }, gcHook, gcHook);
+
+    add("String ops (split+join)", 5, 400000, true,
+        [](BenchEngine& e, int n) {
+            e.evaluate(QStringLiteral(
+                "function f(){"
+                " const s = '10.14.2.201 - - [12/Nov/2026:10:34:58 +0300] \"GET /api/v1/stats HTTP/1.1\" 200 5123';"
+                " let r;"
+                " for(let i=0;i<%1;i++){ r = s.split(' ').slice(0, 6).join('|'); }"
+                " return r; } f();").arg(n));
+        }, gcHook, gcHook);
+
     // ---- Bridge (hoisted method calls) ----
     add("C++ -> JS call", 15, 1000000, false,
         [](BenchEngine& e, int n) {
@@ -558,9 +668,19 @@ static QVector<BenchCase> buildCases(TestObject& obj)
         [](BenchEngine& e) { e.prepareCall(); },
         nullptr);
 
-    add("JS -> C++ method", 15, 1000000, false,
+    add("JS -> C++ method (hoisted)", 15, 1000000, false,
         [](BenchEngine& e, int n) {
             e.evaluate(QStringLiteral("function f(){ const m = obj.add; let s=0; for(let i=0;i<%1;i++){ s+=m(i, i+1); } return s; } f();").arg(n));
+        }, nullptr, nullptr);
+
+    // Same call without hoisting: every iteration pays the wrapper property
+    // lookup again. The (hoisted) - (inline) delta is the per-call lookup
+    // cost per engine; ad-hoc scripts usually sit closer to this row. The
+    // old "Method cache" case was a near-duplicate of the hoisted row
+    // (same body, different constants) and was removed in its favor.
+    add("JS -> C++ method (inline)", 10, 1000000, false,
+        [](BenchEngine& e, int n) {
+            e.evaluate(QStringLiteral("function f(){ let s=0; for(let i=0;i<%1;i++){ s+=obj.add(i, i+1); } return s; } f();").arg(n));
         }, nullptr, nullptr);
 
     add("Wrapper cache (newQObject)", 5, 5000000, false,
@@ -607,49 +727,97 @@ static QVector<BenchCase> buildCases(TestObject& obj)
             e.evaluate(QStringLiteral("function f(){ for(let i=0;i<%1;i++){ Promise.resolve().then(v=>v); } } f();").arg(n));
         }, gcHook, gcHook);
 
-    // ---- QVariant bridge (calibrated: heavy per-call allocation on both engines) ----
-    add("QVariant: Map", 5, 400000, true,
+    // ---- QVariant bridge, split by direction (r5; calibrated) ----
+    // JS -> C++ (sink): the JS -> QVariant argument conversion is the call's
+    // only variable work. The argument is built once per script, not per
+    // iteration, so the sample is not diluted by JS object allocation.
+    add("QVariant: String JS->C++", 5, 1000000, true,
         [](BenchEngine& e, int n) {
-            e.evaluate(QStringLiteral("function f(){ const m = obj.echoVariant; let r; for(let i=0;i<%1;i++){ r=m({a:1, b:2}); } return r; } f();").arg(n));
+            e.evaluate(QStringLiteral("function f(){ const m = obj.sinkVariant; const a = 'test string'; for(let i=0;i<%1;i++){ m(a); } } f();").arg(n));
         }, gcHook, gcHook);
 
-    add("QVariant: Map long keys", 5, 400000, true,
+    add("QVariant: Map JS->C++", 5, 400000, true,
         [](BenchEngine& e, int n) {
-            e.evaluate(QStringLiteral("function f(){ const m = obj.echoVariant; let r; for(let i=0;i<%1;i++){ r=m({userName:1, displayName:2}); } return r; } f();").arg(n));
+            e.evaluate(QStringLiteral("function f(){ const m = obj.sinkVariant; const a = {userId: 42, userName: 'ivan', active: true, score: 3.5}; for(let i=0;i<%1;i++){ m(a); } } f();").arg(n));
         }, gcHook, gcHook);
 
-    add("QVariant: String", 10, 1000000, true,
+    add("QVariant: List JS->C++", 5, 400000, true,
         [](BenchEngine& e, int n) {
-            e.evaluate(QStringLiteral("function f(){ const m = obj.echoVariant; let r; for(let i=0;i<%1;i++){ r=m('test string'); } return r; } f();").arg(n));
+            e.evaluate(QStringLiteral("function f(){ const m = obj.sinkVariant; const a = [1,2,3,4,5,6,7,8]; for(let i=0;i<%1;i++){ m(a); } } f();").arg(n));
         }, gcHook, gcHook);
 
-    // Round-trip via echoVariant: JS literal -> QVariantList -> JS.
-    // Both directions per call (as in QVariant: Map).
-    add("QVariant: List", 5, 400000, true,
+    // C++ -> JS (source): a prebuilt member returned as QVariant - the
+    // QVariant -> JS conversion is the call's only variable work.
+    add("QVariant: String C++->JS", 5, 1000000, true,
         [](BenchEngine& e, int n) {
-            e.evaluate(QStringLiteral("function f(){ const m = obj.echoVariant; let r; for(let i=0;i<%1;i++){ r=m([1,2,3,4,5,6,7,8]); } return r; } f();").arg(n));
+            e.evaluate(QStringLiteral("function f(){ const m = obj.getVariantString; let r; for(let i=0;i<%1;i++){ r=m(); } return r; } f();").arg(n));
         }, gcHook, gcHook);
 
-    // Isolated C++ -> JS direction (listToJSArray / stringListToJSArray):
-    // the invokable returns a prebuilt list, conversion is the call's only work.
+    add("QVariant: Map C++->JS", 5, 400000, true,
+        [](BenchEngine& e, int n) {
+            e.evaluate(QStringLiteral("function f(){ const m = obj.getVariantMap; let r; for(let i=0;i<%1;i++){ r=m(); } return r; } f();").arg(n));
+        }, gcHook, gcHook);
+
+    add("QVariant: List C++->JS", 5, 400000, true,
+        [](BenchEngine& e, int n) {
+            e.evaluate(QStringLiteral("function f(){ const m = obj.getVariantList; let r; for(let i=0;i<%1;i++){ r=m(); } return r; } f();").arg(n));
+        }, gcHook, gcHook);
+
+    // Typed returns (listToJSArray / stringListToJSArray): the invokable
+    // returns a prebuilt list, conversion is the call's only work.
     add("QVariant: List 32 C++ -> JS", 5, 400000, true,
         [](BenchEngine& e, int n) {
             e.evaluate(QStringLiteral("function f(){ const m = obj.getList32; let r; for(let i=0;i<%1;i++){ r=m(); } return r; } f();").arg(n));
         }, gcHook, gcHook);
 
-    add("QVariant: StringList 16 C++ -> JS", 5, 400000, true,
+    // StringList split by consumption (r6). QJSEngine converts a
+    // QStringList lazily: the value comes back as a QV4::Sequence wrapper
+    // (one heap object sharing the QList; the elements are not touched),
+    // and every r[j] materializes one element (a QVariant plus a V4
+    // string). This wrapper converts eagerly: 16 JS strings plus the array
+    // on every call. A wrap-only loop therefore measures "16 string
+    // copies" against "one wrapper allocation" and flatters the lazy
+    // converter; it stays as a weight-0 diagnostic that decomposes
+    // conversion cost from access cost. The consume row is the realistic
+    // pattern - the caller walks the list - and forces the lazy side to
+    // materialize every element it reads.
+    add("QVariant: StringList 16 C++ -> JS (wrap)", 0, 400000, true,
         [](BenchEngine& e, int n) {
             e.evaluate(QStringLiteral("function f(){ const m = obj.getStrList16; let r; for(let i=0;i<%1;i++){ r=m(); } return r; } f();").arg(n));
         }, gcHook, gcHook);
 
-    add("Method cache", 10, 1000000, false,
+    add("QVariant: StringList 16 C++ -> JS consume", 5, 400000, true,
         [](BenchEngine& e, int n) {
-            e.evaluate(QStringLiteral("function f(){ const m = obj.add; let s=0; for(let i=0;i<%1;i++){ s+=m(0, 1); } return s; } f();").arg(n));
-        }, nullptr, nullptr);
+            e.evaluate(QStringLiteral("function f(){ const m = obj.getStrList16; let s=0; for(let i=0;i<%1;i++){ const r=m(); for(let j=0;j<16;j++){ s+=r[j].length; } } return s; } f();").arg(n));
+        }, gcHook, gcHook);
+
+    // The same type in the other direction: a real JS array passed into a
+    // QStringList parameter (the payload mirrors m_strList16). QV4
+    // converts each element with a shallow QString copy; this wrapper
+    // routes through the generic QVariant path (JS array -> QVariantList
+    // -> QMetaType::convert), which deep-copies every string.
+    add("QVariant: StringList 16 JS->C++", 5, 400000, true,
+        [](BenchEngine& e, int n) {
+            e.evaluate(QStringLiteral("function f(){ const m = obj.sinkStringList; const a = ['alpha','beta','gamma','delta','epsilon','zeta','eta','theta','iota','kappa','lambda','mu','nu','xi','omicron','pi']; for(let i=0;i<%1;i++){ m(a); } } f();").arg(n));
+        }, gcHook, gcHook);
 
     add("Property cache", 10, 1000000, false,
         [](BenchEngine& e, int n) {
             e.evaluate(QStringLiteral("function f(){ let s=0; for(let i=0;i<%1;i++){ s+=obj.value; } return s; } f();").arg(n));
+        }, nullptr, nullptr);
+
+    // ---- Property writes (r5): the WRITE path was unmeasured. A constant
+    // value keeps the NOTIFY guard silent after the first assignment, so the
+    // sample is coercion + WriteProperty metacall, not signal emission (the
+    // emit path is covered by the signal cases above). ----
+    add("Property write (int)", 5, 1000000, false,
+        [](BenchEngine& e, int n) {
+            e.evaluate(QStringLiteral("function f(){ for(let i=0;i<%1;i++){ obj.value = 42; } } f();").arg(n));
+        }, nullptr, nullptr);
+
+    add("Property write (UTF string)", 5, 200000, true,
+        [](BenchEngine& e, int n) {
+            e.evaluate(QStringLiteral("function f(){ const s = obj.rusName; for(let i=0;i<%1;i++){ obj.rusName = s; } } f();").arg(n));
         }, nullptr, nullptr);
 
     add("Negative cache", 5, 1000000, false,
@@ -657,11 +825,51 @@ static QVector<BenchCase> buildCases(TestObject& obj)
             e.evaluate(QStringLiteral("function f(){ let s; for(let i=0;i<%1;i++){ s=obj.nonExistentProp; } return s; } f();").arg(n));
         }, nullptr, nullptr);
 
-    // Qt recompiles on every evaluate() (no eval cache) - calibration bounds it.
-    add("Eval cache (same scripts)", 5, 100000, true,
+    // ---- Eval warm/cold pair (r5): the old single case measured only the
+    // cache hit; the README scenario (dynamically generated strings) is a
+    // permanent miss, where the QuickJS advantage shrinks to the compiler
+    // race. Same script in both rows; Qt recompiles on every evaluate()
+    // (no eval cache), so its warm and cold rows coincide by construction
+    // and calibration bounds them. ----
+    add("Eval warm (cache hit)", 5, 100000, true,
         [](BenchEngine& e, int n) {
             for (int i = 0; i < n; ++i) e.evaluate(QStringLiteral("var x = 1 + 1; obj.value;"));
         }, nullptr, nullptr);
+
+    add("Eval cold (compile)", 5, 100000, true,
+        [](BenchEngine& e, int n) {
+            // Idempotent adapter call first, so the calibration probes also
+            // measure the cold path (setup hooks run only per sample, after
+            // calibration).
+            e.setEvalCacheEnabled(false);
+            for (int i = 0; i < n; ++i) e.evaluate(QStringLiteral("var x = 1 + 1; obj.value;"));
+        }, nullptr,
+        [](BenchEngine& e) { e.setEvalCacheEnabled(true); });
+
+    // Weight 0 (diagnostic): the README tuning scenario left untuned - a big
+    // cache limit fed unique strings. Every evaluate() misses and scans the
+    // full 1024-entry cache before compiling; the row watches the miss-path
+    // cost (scan + eviction), the number setEvalCacheLimit() exists to bound.
+    add("Eval thrash (limit vs unique)", 0, 20000, true,
+        [](BenchEngine& e, int n) {
+            e.setEvalCacheLimit(1024);
+            static const QVector<QString> pool = [] {
+                // Equal-length scripts: the linear scan pays a real compare
+                // against every cached entry, not just a length mismatch.
+                // The number is written as 0x%1 because Qt's parser rejects
+                // legacy octal literals (0000) that plain zero-padding
+                // would produce.
+                QVector<QString> v;
+                v.reserve(4096);
+                for (int i = 0; i < 4096; ++i)
+                    v << QStringLiteral("var t%1 = 0x%2; obj.value;")
+                              .arg(i, 4, 10, QLatin1Char('0'))
+                              .arg(i, 4, 16, QLatin1Char('0'));
+                return v;
+            }();
+            for (int i = 0; i < n; ++i) e.evaluate(pool[i % pool.size()]);
+        }, nullptr,
+        [](BenchEngine& e) { e.setEvalCacheLimit(DefaultEvalCacheLimit); });
 
     add("Wrapper churn (create/delete)", 5, 100000, false,
         [](BenchEngine& e, int n) {
@@ -688,6 +896,14 @@ static QVector<BenchCase> buildCases(TestObject& obj)
         [](BenchEngine& e, int n) {
             e.evaluate(QStringLiteral("function f(){ const m = heavyObj.method39; let s=0; for(let i=0;i<%1;i++){ s+=m(i); } return s; } f();").arg(n));
         }, nullptr, nullptr);
+
+    // Constructor cost, previously unmeasured. Weight 0: not part of the
+    // weighted total, so the aggregate stays comparable across rounds; the
+    // line exists to see regressions in the engine setup path (intrinsics
+    // capture, class registration, guard anchoring) and the effect of the
+    // process-wide calibration cache on the multi-engine scenario.
+    add("Engine ctor+dtor", 0, 200, true,
+        [](BenchEngine& e, int n) { e.constructCycle(n); }, nullptr, nullptr);
 
     return cases;
 }
@@ -902,12 +1118,12 @@ static void printFinalScore(const EnvironmentInfo& env, ResultsCollector& qtCol,
 
     const QVector<BenchResult>& rowSource = soloQt ? qtCol.results() : quickCol.results();
 
-    qDebug().noquote() << padR("Test", 30) + " | " + padL("Qt V4", 10) + " | " + padL("QuickJS", 10) + " | "
+    qDebug().noquote() << padR("Test", 42) + " | " + padL("Qt V4", 10) + " | " + padL("QuickJS", 10) + " | "
                               + padL("Ratio", 7) + " | " + padL("Weight", 6) + " | " + padR("Winner", 8);
-    qDebug().noquote() << QString(86, '-');
+    qDebug().noquote() << QString(98, '-');
 
     double qtScore = 0, quickScore = 0, totalWeight = 0, logSumQt = 0, logSumQuick = 0;
-    int cnt = 0;
+    int cnt = 0, infoCnt = 0;
 
 #ifndef SKIP_QT_BENCHMARK
     QHash<QString, const BenchResult*> qtMap;
@@ -918,12 +1134,19 @@ static void printFinalScore(const EnvironmentInfo& env, ResultsCollector& qtCol,
     for (const BenchResult& qr : rowSource) {
         if (!qr.valid) continue;
 
+        // Weight 0 = informational/diagnostic row: printed and exported, but
+        // excluded from both aggregates (relative score, throughput index).
+        const bool informational = (qr.weight == 0);
+        if (informational) ++infoCnt;
+
         if (soloQt) {
             // Single-engine row: value in the Qt column.
-            totalWeight += qr.weight;
-            logSumQt += std::log10(1e9 / qr.nsPerOp());
-            cnt++;
-            qDebug().noquote() << padR(qr.name, 30) + " | " + padL(fmtPerOp(qr.nsPerOp()), 10) + " | "
+            if (!informational) {
+                totalWeight += qr.weight;
+                logSumQt += std::log10(1e9 / qr.nsPerOp());
+                cnt++;
+            }
+            qDebug().noquote() << padR(qr.name, 42) + " | " + padL(fmtPerOp(qr.nsPerOp()), 10) + " | "
                                       + padL("N/A", 10) + " | - | "
                                       + padL(QString::number(qr.weight), 6) + " | " + padR("-", 8);
             continue;
@@ -931,37 +1154,43 @@ static void printFinalScore(const EnvironmentInfo& env, ResultsCollector& qtCol,
 
 #ifndef SKIP_QT_BENCHMARK
         if (!g_runQt) {
-            totalWeight += qr.weight;
-            logSumQuick += std::log10(1e9 / qr.nsPerOp());
-            cnt++;
-            qDebug().noquote() << padR(qr.name, 30) + " | " + padL("N/A", 10) + " | "
+            if (!informational) {
+                totalWeight += qr.weight;
+                logSumQuick += std::log10(1e9 / qr.nsPerOp());
+                cnt++;
+            }
+            qDebug().noquote() << padR(qr.name, 42) + " | " + padL("N/A", 10) + " | "
                                       + padL(fmtPerOp(qr.nsPerOp()), 10) + " | - | "
                                       + padL(QString::number(qr.weight), 6) + " | " + padR("-", 8);
             continue;
         }
         const BenchResult* tr = qtMap.value(qr.name, nullptr);
         if (!tr || !tr->valid) {
-            qDebug().noquote() << padR(qr.name, 30) + " | " + padL("N/A", 10) + " | " + padL("N/A", 10) + " | - | "
+            qDebug().noquote() << padR(qr.name, 42) + " | " + padL("N/A", 10) + " | " + padL("N/A", 10) + " | - | "
                                       + padL(QString::number(qr.weight), 6) + " | " + padR("N/A", 8);
             continue;
         }
         const double qns = qr.nsPerOp(), tns = tr->nsPerOp();
-        totalWeight += qr.weight;
-        qtScore += qr.weight * (qns / (qns + tns));
-        quickScore += qr.weight * (tns / (qns + tns));
-        logSumQt += std::log10(1e9 / tns);
-        logSumQuick += std::log10(1e9 / qns);
-        cnt++;
+        if (!informational) {
+            totalWeight += qr.weight;
+            qtScore += qr.weight * (qns / (qns + tns));
+            quickScore += qr.weight * (tns / (qns + tns));
+            logSumQt += std::log10(1e9 / tns);
+            logSumQuick += std::log10(1e9 / qns);
+            cnt++;
+        }
         const QString winner = (tns < qns) ? QStringLiteral("Qt V4") : QStringLiteral("QuickJS");
-        qDebug().noquote() << padR(qr.name, 30) + " | " + padL(fmtPerOp(tns), 10) + " | "
+        qDebug().noquote() << padR(qr.name, 42) + " | " + padL(fmtPerOp(tns), 10) + " | "
                                   + padL(fmtPerOp(qns), 10) + " | "
                                   + padL(QString::number(qns / tns, 'f', 2) + "x", 7) + " | "
                                   + padL(QString::number(qr.weight), 6) + " | " + padR(winner, 8);
 #else
-        totalWeight += qr.weight;
-        logSumQuick += std::log10(1e9 / qr.nsPerOp());
-        cnt++;
-        qDebug().noquote() << padR(qr.name, 30) + " | " + padL("N/A", 10) + " | "
+        if (!informational) {
+            totalWeight += qr.weight;
+            logSumQuick += std::log10(1e9 / qr.nsPerOp());
+            cnt++;
+        }
+        qDebug().noquote() << padR(qr.name, 42) + " | " + padL("N/A", 10) + " | "
                                   + padL(fmtPerOp(qr.nsPerOp()), 10) + " | - | "
                                   + padL(QString::number(qr.weight), 6) + " | " + padR("-", 8);
 #endif
@@ -974,6 +1203,8 @@ static void printFinalScore(const EnvironmentInfo& env, ResultsCollector& qtCol,
 #endif
     if (!soloQt) qDebug().noquote() << QString("  QQuickJSEngine    : %1").arg(quickScore, 0, 'f', 2);
     qDebug().noquote() << "  (relative score requires both engines; single-engine run)";
+    if (infoCnt > 0)
+        qDebug().noquote() << QString("  (%1 weight-0 row(s): informational, excluded from both aggregates)").arg(infoCnt);
 #ifndef SKIP_QT_BENCHMARK
     if (g_runQt && !soloQt && quickScore > 0) {
         if (quickScore > qtScore)
@@ -1027,7 +1258,7 @@ static void saveCsv(const QString& path, const EnvironmentInfo& env,
     s << "# launched_from;" << env.parentProcess << "\n";
     s << "# engines;" << env.enginesMode << "\n";
     s << "# runs_per_test;" << g_runs << "\n";
-    s << "# hoisting;yes (bridge method calls hoisted: const m = obj.method)\n";
+    s << "# hoisting;bridge calls hoisted unless the case name says (inline)\n";
     s << "# script_errors;qt=" << g_scriptErrorsQt << ";quickjs=" << g_scriptErrorsQuick << "\n";
     s << "# note;ns_per_op is the comparable metric; calibrated tests pick per-engine n targeting ~400ms (floor defaultN/10); spread=(max-min)/median; per-test peaks are process RSS maxima sampled at 5ms (include the idle engine's resident memory in duel mode); retention is process-level RSS delta after engines destroyed\n";
     s << "# note;retention is process-level RSS delta after engines destroyed; "

@@ -147,6 +147,27 @@ public:
     Q_INVOKABLE void setStatus(Status s) { m_status = s; }
     Q_INVOKABLE Status processStatus(Status s) const { return static_cast<Status>(static_cast<int>(s) + 1); }
 
+    // Width-regression enums: a quint64-backed and a qint8-backed enum class,
+    // each exposed as a property, a method parameter and a return value. moc
+    // reads and writes sizeof(declared type) bytes per metacall slot, so any
+    // dispatch path that rewrites these to QMetaType::Int corrupts the stack
+    // (an 8-byte write into a 4-byte buffer) or loses the sign (a 1-byte
+    // write read out of a zeroed 4-byte buffer as 255).
+    enum class Wide : quint64 { None = 0, Big = 1ULL << 40, Bigger = 1ULL << 42 };
+    Q_ENUM(Wide)
+    enum class Narrow : qint8 { Neg = -1, Pos = 1 };
+    Q_ENUM(Narrow)
+    Q_PROPERTY(Wide wideProp READ getWideProp WRITE setWideProp)
+    Q_PROPERTY(Narrow narrowProp READ getNarrowProp WRITE setNarrowProp)
+    Q_INVOKABLE Wide echoWide(Wide v) const { return v; }
+    Q_INVOKABLE Narrow echoNarrow(Narrow v) const { return v; }
+    Q_INVOKABLE quint64 wideAsInt(Wide v) const { return static_cast<quint64>(v); }
+    Q_INVOKABLE int narrowAsInt(Narrow v) const { return static_cast<int>(v); }
+    Wide getWideProp() const { return m_wide; }
+    void setWideProp(Wide v) { m_wide = v; }
+    Narrow getNarrowProp() const { return m_narrow; }
+    void setNarrowProp(Narrow v) { m_narrow = v; }
+
     Q_INVOKABLE int secretCalls() const { return m_secretCalls; }
     Q_INVOKABLE int unregArgs() const { return m_unregArgs; }
     void setJsEngine(QQuickJSEngine* e) { m_jsEngine = e; }
@@ -167,6 +188,8 @@ private:
     int m_value = 0;
     QString m_name = QStringLiteral("Default");
     Status m_status = Active;
+    Wide m_wide = Wide::Big;
+    Narrow m_narrow = Narrow::Neg;
     TestObject* m_child;
     QVariant m_variantProp;
     QDate m_dateProp;
@@ -551,6 +574,12 @@ public:
     // both halves of the refusal contract.
     bool registered = true;
     Outcome imported = NotRun;
+    // A pending exception set from C++ between starved entries: evaluate()
+    // must consume and return it through the pure C path (JS_GetException
+    // runs no script) instead of returning the refusal RangeError and
+    // leaving the old error pending behind every subsequent entry.
+    bool pendingConsumed = false;
+    bool pendingWasRangeError = true;
     void run() override {
         QQuickJSEngine eng;
         const QQuickJSValue res = eng.evaluate(QStringLiteral("function f(){f();} f();"));
@@ -561,6 +590,10 @@ public:
         const QQuickJSValue imp = eng.importModule(QStringLiteral("m"));
         imported = isStackGuardError(imp) ? Refused
             : (imp.isError() ? ReturnedOther : Completed);
+        eng.throwError(QStringLiteral("pending boom"));
+        const QQuickJSValue res3 = eng.evaluate(QStringLiteral("1 + 1"));
+        pendingConsumed = res3.isError() && res3.toString().contains(QLatin1String("pending boom"));
+        pendingWasRangeError = isStackGuardError(res3);
     }
 };
 
@@ -673,6 +706,49 @@ static void runAllTests(const bool runDangerous) {
                         reports == 1,
                         QStringLiteral("reports=%1 - the report was lost until the next evaluate").arg(reports));
             delete obj;
+        }
+
+        // Soft ceiling of the unhandled-rejection buffer (r8): with
+        // auto-processing off and a stuck job queue the buffer never drains
+        // and used to grow without bound (the r5 probe's "stuck job +
+        // fresh rejections" leak scenario). Past the ceiling (1024 entries)
+        // the OLDEST buffered rejection is evicted and reported immediately,
+        // so every rejection is still reported exactly once and the buffer
+        // stays bounded.
+        {
+            QQuickJSEngine qEng;
+            int reports = 0;
+            QString firstMsg, lastMsg;
+            QObject::connect(&qEng, &QQuickJSEngine::uncaughtException,
+                             [&](const QString& m, int) { ++reports; if (firstMsg.isNull()) firstMsg = m; lastMsg = m; });
+
+            qEng.setAutoProcessPromises(false);
+            // Plant a never-drained job, then reject 2000 distinct promises:
+            // 1024 stay buffered, 976 overflow. The overflow reports arrive
+            // immediately (during the rejection tracker callback), oldest
+            // first.
+            const QQuickJSValue run = qEng.evaluate(QStringLiteral(
+                "Promise.resolve().then(()=>{});"
+                "for (let i = 0; i < 2000; ++i) Promise.reject(new Error('cap_r' + i));"));
+            TEST_RESULT("Promise: Rejection buffer ceiling evicts oldest and reports it",
+                        !run.isError() && reports == 976 && firstMsg.contains(QLatin1String("cap_r0")),
+                        QStringLiteral("reports=%1 firstMsg='%2' - expected 976 immediate overflow "
+                                       "reports starting with the oldest (cap_r0)")
+                            .arg(reports).arg(firstMsg));
+
+            // Re-enabling auto-processing drains the stuck job and flushes the
+            // 1024 buffered entries: total must be exactly 2000 (every
+            // rejection reported exactly once, none lost to the ceiling).
+            qEng.setAutoProcessPromises(true);
+            qEng.evaluate(QStringLiteral("0;"));
+            TEST_RESULT("Promise: Every rejection reported exactly once after ceiling overflow",
+                        reports == 2000 && lastMsg.contains(QLatin1String("cap_r1999")),
+                        QStringLiteral("reports=%1 lastMsg='%2' - entries were lost or double-reported "
+                                       "across the ceiling")
+                            .arg(reports).arg(lastMsg));
+            TEST_RESULT("Promise: Engine alive after ceiling overflow",
+                        qEng.evaluate(QStringLiteral("1+1")).toInt() == 2,
+                        "engine damaged");
         }
     }
 
@@ -874,6 +950,36 @@ static void runAllTests(const bool runDangerous) {
         compareQObjectEngines("QObject: Enum Read", obj, "testObj.getStatus()");
         compareQObjectEngines("QObject: Enum Set", obj, "testObj.setStatus(0); testObj.getStatus()");
         compareQObjectEngines("QObject: Enum Method", obj, "testObj.processStatus(1)");
+
+        // Width regressions: non-int enum widths must flow through their
+        // declared storage in every direction (property read/write, method
+        // argument, method return). A quint64-backed enum rewritten to Int
+        // smashes a 4-byte stack buffer (moc writes 8); a qint8-backed one
+        // loses its sign (-1 read as 255). Run under ASan in the suite build,
+        // the old code fails these by memory corruption, not just values.
+        compareQObjectEngines("QObject: wide quint64 enum property read", obj, "testObj.wideProp");
+        compareQObjectEngines("QObject: narrow qint8 enum property read", obj, "String(testObj.narrowProp)");
+        compareQObjectEngines("QObject: wide enum method round-trip", obj, "testObj.echoWide(4398046511104)");
+        compareQObjectEngines("QObject: narrow enum method round-trip", obj, "String(testObj.echoNarrow(-1))");
+        {
+            QQuickJSEngine qEngWidth;
+            TestObject* wobj = new TestObject();
+            qEngWidth.globalObject().setProperty("testObj", qEngWidth.newQObject(wobj));
+            const QQuickJSValue wideWrite = qEngWidth.evaluate(
+                "testObj.wideProp = 2199023255552; testObj.wideAsInt(2199023255552)");
+            TEST_RESULT("QObject: wide quint64 enum write keeps the full width",
+                        wideWrite.toVariant().toDouble() == 2199023255552.0
+                            && static_cast<quint64>(wobj->getWideProp()) == 2199023255552ULL,
+                        QStringLiteral("JS=%1 C++=%2")
+                            .arg(wideWrite.toVariant().toDouble())
+                            .arg(qint64(static_cast<quint64>(wobj->getWideProp()))));
+            const QQuickJSValue narrowWrite = qEngWidth.evaluate(
+                "testObj.narrowProp = -1; testObj.narrowAsInt(-1)");
+            TEST_RESULT("QObject: narrow qint8 enum keeps the sign",
+                        narrowWrite.toInt() == -1 && wobj->getNarrowProp() == TestObject::Narrow::Neg,
+                        QStringLiteral("JS=%1").arg(narrowWrite.toInt()));
+            delete wobj;
+        }
         compareQObjectEngines("QObject: Nullptr ==", obj, "testObj.getNull() == null");
         compareQObjectEngines("QObject: Nullptr ===", obj, "testObj.getNull() === null");
         compareQObjectEngines("QObject: Nullptr if", obj, "if(testObj.getNull()) { 'truthy'; } else { 'falsy'; }");
@@ -1183,6 +1289,111 @@ static void runAllTests(const bool runDangerous) {
         delete obj;
     }
 
+    // Step budget (r8): a deterministic per-run complement to the wall-clock
+    // timeout. One "step" is one counted operation of the engine's interrupt
+    // heartbeat (interpreter branch/function-entry/builtin-loop operations,
+    // regex backtracking steps), charged 10000 at a time at each poll - so
+    // the tests below assert pure counting behavior with no timing. Budgets
+    // are multiples of 10000 (the poll interval) for exact boundaries, and
+    // the loop sizes leave a >=3x margin on both sides of the boundary so
+    // the exact per-iteration branch count of the compiled bytecode cannot
+    // flip a verdict.
+    {
+        // A run whose step total stays far below the budget completes and
+        // returns its result (1000 iterations compile to at most a few
+        // thousand counted operations - far below 100000; the handler is
+        // never even reached before the run ends).
+        QQuickJSEngine okEng;
+        okEng.setStepBudget(100000);
+        const QQuickJSValue shortRun = okEng.evaluate(
+            QStringLiteral("var s = 0; for (var i = 0; i < 1000; i++) s += i; s;"));
+        TEST_RESULT("Limit: Step budget - short run completes",
+                    !shortRun.isError() && shortRun.toInt() == 499500,
+                    QStringLiteral("res=%1 - a run under the budget did not complete")
+                        .arg(shortRun.toString()));
+
+        // A runaway loop is killed deterministically: 100000 iterations
+        // execute at least 100000 counted operations >= the 50000 budget, so
+        // the fifth poll fires. No wall-clock assertion anywhere.
+        QQuickJSEngine killEng;
+        killEng.setStepBudget(50000);
+        const QQuickJSValue killed = killEng.evaluate(
+            QStringLiteral("var s = 0; for (var i = 0; i < 100000; i++) s++; s;"));
+        TEST_RESULT("Limit: Step budget kills a runaway loop deterministically",
+                    killed.isError() && killed.toString().contains(QLatin1String("interrupted")),
+                    QStringLiteral("res=%1 - the loop was not interrupted by the step budget")
+                        .arg(killed.toString()));
+        TEST_RESULT("Limit: Engine alive after step-budget kill",
+                    killEng.evaluate(QStringLiteral("1+1")).toInt() == 2,
+                    "engine damaged");
+
+        // The budget is a per-run quota: an unbounded run exhausts it, and
+        // the NEXT top-level entry starts fresh (20000 iterations cost at
+        // most ~60000 counted operations - below the 200000 budget, but only
+        // if the counter was reset; a carried-over count would kill it at the
+        // first poll of the second run).
+        QQuickJSEngine quotaEng;
+        quotaEng.setStepBudget(200000);
+        const QQuickJSValue first = quotaEng.evaluate(QStringLiteral("while (true) {}"));
+        const QQuickJSValue second = quotaEng.evaluate(
+            QStringLiteral("var s = 0; for (var i = 0; i < 20000; i++) s += i; s;"));
+        TEST_RESULT("Limit: Step budget is a per-run quota",
+                    first.isError() && !second.isError() && second.toInt() == 199990000,
+                    QStringLiteral("first=%1 second=%2 - the quota was not re-armed at the "
+                                   "second top-level entry")
+                        .arg(first.isError() ? QLatin1String("killed") : first.toString())
+                        .arg(second.isError() ? QLatin1String("killed") : second.toString()));
+
+        // The regex engine shares the same heartbeat (libregexp polls the
+        // interrupt handler every 10000 backtracking steps): a fast match
+        // completes under a small budget...
+        QQuickJSEngine reEng;
+        reEng.setStepBudget(20000);
+        const QQuickJSValue fastMatch = reEng.evaluate(
+            QStringLiteral("var re = /(?:a+)+b/; re.test('aaab');"));
+        TEST_RESULT("Limit: Step budget - fast regex match completes",
+                    !fastMatch.isError() && fastMatch.isBool() && fastMatch.toBool(),
+                    QStringLiteral("res=%1 - a fast regex match was interrupted")
+                        .arg(fastMatch.toString()));
+
+        // ...while catastrophic backtracking is policed by the same budget:
+        // (?:a+)+b against a^28 + 'c' explores exponentially many
+        // partitions (hundreds of millions of backtracking steps - orders of
+        // magnitude over the 100000 budget), so the run must die at the
+        // tenth poll regardless of machine speed.
+        QQuickJSEngine btEng;
+        btEng.setStepBudget(100000);
+        const QQuickJSValue backtrack = btEng.evaluate(
+            QStringLiteral("var re = /(?:a+)+b/; re.test('aaaaaaaaaaaaaaaaaaaaaaaaaaaa' + 'c');"));
+        TEST_RESULT("Limit: Step budget polices regex backtracking",
+                    backtrack.isError() && backtrack.toString().contains(QLatin1String("interrupted")),
+                    QStringLiteral("res=%1 - catastrophic backtracking was not policed by "
+                                   "the step budget")
+                        .arg(backtrack.toString()));
+
+        // Budget 0 (the default) disables the accounting entirely: the loop
+        // below runs until the watchdog's sticky interrupt flag fires at
+        // ~300 ms - if the budget path fired instead, the run would die
+        // within microseconds of entry.
+        {
+            QQuickJSEngine offEng;
+            offEng.setStepBudget(0);
+            InterruptWatchdog watchdog;
+            watchdog.engine = &offEng;
+            watchdog.delayMs = 300;
+            watchdog.start();
+            QElapsedTimer t; t.start();
+            const QQuickJSValue res = offEng.evaluate(QStringLiteral("while (true) {}"));
+            watchdog.stopFlag = true;
+            watchdog.wait();
+            const qint64 el = t.elapsed();
+            TEST_RESULT("Limit: Step budget 0 (default) does not limit execution",
+                        res.isError() && el >= 250,
+                        QStringLiteral("elapsed=%1ms - the disabled budget still interrupted "
+                                       "the run").arg(el));
+        }
+    }
+
     // Qt parity: the interrupt flag is sticky - any execution aborts until
     // setInterrupted(false) (QJSEngine documented semantics)
     {
@@ -1311,6 +1522,114 @@ static void runAllTests(const bool runDangerous) {
                                 && qEng.evaluate("throw {}").errorType() == QQuickJSValue::NoError
                                 && qtPrim.evaluate("throw 42").errorType() == QJSValue::NoError,
                             "a thrown non-Error value must classify as NoError");
+            }
+
+            // errorType() classifies by prototype identity against the
+            // construction-time intrinsics, not by the mutable 'name'
+            // property (QJSEngine branches on the internal error class).
+            // Dedicated engine: the global-constructor replacement below
+            // must not leak into the other tests.
+            {
+                QQuickJSEngine tEng;
+                const QQuickJSValue tampered = tEng.evaluate(
+                    "(function(){ var e = new Error('x'); e.name = 'RangeError'; return e; })()");
+                TEST_RESULT("API: errorType ignores 'name' tampering",
+                            tampered.errorType() == QQuickJSValue::GenericError,
+                            "a plain Error with e.name='RangeError' must stay GenericError");
+
+                const QQuickJSValue sub = tEng.evaluate(
+                    "class MyRE extends RangeError {}; (function(){ try { throw new MyRE('sub'); } catch (e) { return e; } })()");
+                TEST_RESULT("API: errorType of an error subclass is the base class",
+                            sub.errorType() == QQuickJSValue::RangeError,
+                            "MyRE extends RangeError must classify as RangeError");
+
+                const QQuickJSValue plain = tEng.evaluate(
+                    "(function(){ try { null.x; } catch (e) { return e; } })()");
+                const bool wasTypeError = plain.errorType() == QQuickJSValue::TypeError;
+                tEng.evaluate("globalThis.TypeError = function Stolen(){};");
+                TEST_RESULT("API: errorType stable after global constructor replacement",
+                            wasTypeError && plain.errorType() == QQuickJSValue::TypeError,
+                            "classification must use the construction-time intrinsics");
+            }
+
+            // toDateTime() reads the internal date slot through the captured
+            // intrinsic getTime: overriding d.getTime or
+            // Date.prototype.getTime must not change the converted value
+            // (QJSEngine reads the slot directly).
+            {
+                QQuickJSEngine dEng;
+                const QQuickJSValue ownOverride = dEng.evaluate(
+                    "var d = new Date(1234567890123); d.getTime = function(){ return 42; }; d");
+                const QQuickJSValue protoOverride = dEng.evaluate(
+                    "Date.prototype.getTime = function(){ return 7; }; var d2 = new Date(1000); d2");
+                TEST_RESULT("API: toDateTime ignores getTime tampering",
+                            ownOverride.toDateTime().toMSecsSinceEpoch() == 1234567890123
+                                && protoOverride.toDateTime().toMSecsSinceEpoch() == 1000,
+                            "the Date conversion must call the captured intrinsic");
+            }
+
+            // newErrorObject(): a message with an embedded NUL survives
+            // whole (the "%s" C constructors stop at the first NUL; the
+            // full payload is restored through a plain data-property write).
+            {
+                QQuickJSEngine nEng;
+                const QString nulMsg = QString::fromUtf8(QByteArray("before\0after", 11));
+                const QQuickJSValue err = nEng.newErrorObject(QQuickJSValue::TypeError, nulMsg);
+                const QString back = err.property("message").toString();
+                TEST_RESULT("API: newErrorObject keeps messages with an embedded NUL",
+                            err.errorType() == QQuickJSValue::TypeError
+                                && back == nulMsg && back.size() == 11,
+                            QStringLiteral("message came back %1 bytes long").arg(back.size()));
+            }
+
+            // Detached buffers convert to an empty QByteArray (V4 reads the
+            // data pointer + length, null/0 after a detach) instead of
+            // falling into the property enumeration and yielding an empty
+            // QVariantMap.
+            {
+                QQuickJSEngine bEng;
+                const QVariant ab = bEng.evaluate("var b = new ArrayBuffer(8); b.transfer(); b").toVariant();
+                const QVariant ta = bEng.evaluate("var b = new ArrayBuffer(8); var v = new Uint8Array(b); b.transfer(); v").toVariant();
+                TEST_RESULT("Buffer: detached ArrayBuffer converts to an empty QByteArray",
+                            ab.userType() == QMetaType::QByteArray && ab.toByteArray().isEmpty(),
+                            QStringLiteral("userType=%1").arg(ab.userType()));
+                TEST_RESULT("Buffer: typed array over a detached buffer converts to an empty QByteArray",
+                            ta.userType() == QMetaType::QByteArray && ta.toByteArray().isEmpty(),
+                            QStringLiteral("userType=%1").arg(ta.userType()));
+            }
+
+            // A wrapper whose QObject died keeps reporting isQObject()==true
+            // with a null toQObject() - both the QJSEngine behavior (the
+            // wrapper object survives; the classification does not branch on
+            // the wrapped pointer being alive).
+            {
+                QQuickJSEngine zEng;
+                auto* zombie = new TestObject();
+                const QQuickJSValue wrap = zEng.newQObject(zombie);
+                const bool wasQObject = wrap.isQObject();
+                delete zombie;
+                TEST_RESULT("QObject: wrapper stays isQObject() after C++ deletion (Qt parity)",
+                            wasQObject && wrap.isQObject() && wrap.toQObject() == nullptr,
+                            "isQObject must survive the wrapped object, like QJSEngine");
+            }
+
+            // console.count()/console.time() label tables are capped: dynamic
+            // labels cannot grow them without bound, and the cap says so
+            // once (the JSMemoryUsage-based leakgate cannot see C++-side
+            // containers).
+            {
+                QQuickJSEngine cEng;
+                cEng.installExtensions(QQuickJSEngine::ConsoleExtension);
+                int ceilingWarnings = 0;
+                {
+                    MessageCaptureGuard guard;
+                    cEng.evaluate(QStringLiteral("for (let i = 0; i < 1200; ++i) console.count('lbl' + i);"));
+                    for (const QString& m : g_capturedMessages)
+                        if (m.contains(QLatin1String("label table at its ceiling"))) ++ceilingWarnings;
+                }
+                TEST_RESULT("Console: label tables capped with a one-shot warning",
+                            ceilingWarnings == 1,
+                            QStringLiteral("ceiling warnings: %1").arg(ceilingWarnings));
             }
 
             // A primitive this follows JS call semantics in both engines (a
@@ -2286,6 +2605,15 @@ static void runAllTests(const bool runDangerous) {
                             .arg(thread.registered)
                             .arg(int(thread.imported))
                             .arg(int(thread.trivial)));
+
+            // Same starved anchor, pending-exception interplay: a C++-thrown
+            // error preempts the refusal and is CONSUMED by it (pure C path),
+            // never left dangling behind the starved entries.
+            TEST_RESULT("Limit: starved evaluate consumes a pending exception",
+                        thread.pendingConsumed && !thread.pendingWasRangeError,
+                        QStringLiteral("consumed=%1 wasRangeError=%2")
+                            .arg(thread.pendingConsumed)
+                            .arg(thread.pendingWasRangeError));
         }
 
         // Foreign engine value should be rejected by setProperty
