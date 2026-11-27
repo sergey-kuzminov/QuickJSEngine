@@ -9,6 +9,7 @@
 #include "QuickJSConvert.h"
 
 #include <cmath>
+#include <limits>
 #include <utility>
 #include <memory>
 
@@ -36,7 +37,50 @@ JSValue readMetaSlot(JSContext* ctx, QObject* obj, QMetaObject::Call op, int slo
     return convert(std::move(val));
 }
 
+// Narrows a Date-origin variant (a local-spec QDateTime, invalid for a NaN
+// Date) to a date/time target exactly like V4's hinted toVariant
+// (qv4engine.cpp) combined with DateObject::dateTimeToDate
+// (qv4dateobject.cpp): QDate = the local date with the QTBUG-92466
+// exception (an instant that is exactly the UTC midnight of a day whose
+// local wall time falls on the previous day - a negative-offset zone -
+// yields the UTC date, so date-only strings and QDate-anchored Dates
+// round-trip); QTime = the local time-of-day; QDateTime = the local
+// datetime. An invalid input yields the invalid target value, silently.
+static QVariant dateTargetFromVariant(const QVariant& dtVar, int targetType)
+{
+    const QDateTime dt = dtVar.isValid() ? dtVar.toDateTime() : QDateTime();
+    if (targetType == QMetaType::QDate)
+        return QVariant::fromValue(QuickJSConvert::dateTimeToDate(dt));
+    if (targetType == QMetaType::QTime)
+        return QVariant::fromValue(dt.time());
+    return QVariant::fromValue(dt);
+}
+
 } // namespace
+
+// A wrapper's cached metaobject can go stale when the QObject's dynamic
+// metaobject changes at runtime (QML component refinement, dynamic
+// property systems). The exotic handlers re-check the identity (one
+// pointer compare) and rebind the wrapper when it changed: method proxies
+// are dropped (their atoms and cache entries belong to the old meta
+// cache's name set), the dynamic-property cache (name-keyed) and the
+// destroyed hook survive. Returns false with a pending exception on a
+// failed rebuild. A class member (not a free helper) for the engine's
+// private access, like the other proxy helpers.
+bool QuickJSQObjectProxy::refreshMetaCacheIfChanged(QQuickJSEngine* engine, JSQObjectData* data) {
+    const QMetaObject* current = data->obj->metaObject();
+    if (current == data->metaObj) return true;
+    JSMetaObjectCache* cache = engine->metaObjectCacheFor(current);
+    if (!cache) return false;
+    for (auto& e : data->methodProxyCache) {
+        JS_FreeAtom(engine->m_ctx, e.atom);
+        JS_FreeValue(engine->m_ctx, e.value);
+    }
+    data->methodProxyCache.clear();
+    data->metaObj = current;
+    data->metaCache = cache;
+    return true;
+}
 
 // The single QMetaType read ladder, shared by method returns and property
 // reads (the two former parallel switches - keeping them in sync by hand is
@@ -119,6 +163,16 @@ JSValue QuickJSQObjectProxy::convertMetaRead(QQuickJSEngine* engine, JSContext* 
     }
 
     QVariant val = makeDefaultVariant(metaType);
+    if (Q_UNLIKELY(!val.isValid())) {
+        // A metatype whose QVariant payload cannot be default-constructed
+        // (legacy registrations without a public default ctor): the data
+        // slot would be a nullptr passed straight into the metacall.
+        if (op == QMetaObject::InvokeMetaMethod) {
+            return JS_ThrowTypeError(ctx, "Cannot invoke method: return type '%s' cannot be default-constructed", QMetaType(metaType).name());
+        }
+        qWarning("QQuickJSEngine: Property type '%s' cannot be default-constructed, returning undefined", QMetaType(metaType).name());
+        return JS_UNDEFINED;
+    }
     void* propertySlot[1] = { val.data() };
     void** a = args ? args->data() : propertySlot;
     a[0] = val.data();
@@ -178,13 +232,39 @@ JSValue QuickJSQObjectProxy::createMethodProxy(QQuickJSEngine* engine, JSContext
 
     auto proxyData = std::make_unique<JSMethodProxyData>();
     proxyData->obj = data->obj;
-    proxyData->methodIdx = entry.index;
-    proxyData->retType = entry.type;
-    proxyData->paramCount = entry.paramCount;
-    proxyData->paramTypes = entry.paramTypes;
 
-    QMetaMethod m = data->obj->metaObject()->method(entry.index);
+    // Collect every same-name overload in metaobject order (the cache entry
+    // remembers only the first; the invoke path selects among all of them
+    // like V4). moc lists the full signature before the default-argument
+    // truncated synthetic entries it generates.
+    const QMetaObject* meta = data->obj->metaObject();
+    QMetaMethod m = meta->method(entry.index);
     proxyData->methodName = m.name();
+    for (int i = 0; i < meta->methodCount(); ++i) {
+        QMetaMethod mm = meta->method(i);
+        if (mm.access() == QMetaMethod::Private) continue;
+        if (mm.name() != proxyData->methodName) continue;
+        const int pc = mm.parameterCount();
+        if (pc > 255) {
+            // Same ceiling as the meta-cache build: paramCount is a uint8_t
+            // there; the candidate list keeps the same policy.
+            qWarning("QQuickJSEngine: Method '%s' has more than 255 parameters (%d), skipping the overload",
+                     proxyData->methodName.constData(), pc);
+            continue;
+        }
+        JSMethodCandidate c;
+        c.methodIdx = i;
+        c.retType = mm.returnType();
+        if (!QMetaType(c.retType).isRegistered()) c.retType = QMetaType::UnknownType;
+        c.paramCount = pc;
+        c.paramTypes.resize(pc);
+        for (int j = 0; j < pc; ++j) {
+            int paramType = mm.parameterType(j);
+            if (!QMetaType(paramType).isRegistered()) paramType = QMetaType::UnknownType;
+            c.paramTypes[j] = QuickJSConvert::adjustEnumType(paramType);
+        }
+        proxyData->candidates.append(std::move(c));
+    }
 
     // Set the opaque pointer before publishing the proxy in the cache: on the
     // (practically unreachable) failure path the cache must not hold a proxy
@@ -227,6 +307,10 @@ int QuickJSQObjectProxy::qobject_get_own_property(JSContext* ctx, JSPropertyDesc
             return -1;
         }
 
+        // A stale cached metaobject (dynamic metaobject swap at runtime)
+        // rebinds before the lookup; the comment below the lookup documents
+        // the error semantics of what a found entry returns.
+        if (!refreshMetaCacheIfChanged(engine, data)) return -1;
         const MetaCacheEntry* it = data->metaCache->find(prop);
         // A JS exception thrown by the C++ accessor (throwError(), or a C++
         // exception caught by safeMetacall) propagates like a method call
@@ -301,7 +385,7 @@ int QuickJSQObjectProxy::qobject_get_own_property(JSContext* ctx, JSPropertyDesc
             }
         }
 
-        const QString& nameQ = QuickJSConvert::atomName(engine, ctx, prop);
+        const QString nameQ = QuickJSConvert::atomName(engine, ctx, prop);
         if (!nameQ.isNull()) {
             const QByteArray nameBa(nameQ.toUtf8());
             QVariant dynProp = data->obj->property(nameBa.constData());
@@ -345,6 +429,7 @@ int QuickJSQObjectProxy::qobject_get_own_property_names(JSContext* ctx, JSProper
             return -1;
         }
 
+        if (!refreshMetaCacheIfChanged(engine, data)) return -1;
         const JSMetaObjectCache* metaCache = data->metaCache;
         const QList<QByteArray> dynNames = data->obj->dynamicPropertyNames();
         const int dynCount = dynNames.size();
@@ -412,8 +497,21 @@ int QuickJSQObjectProxy::qobject_set_property(JSContext* ctx, JSValueConst this_
             return -1;
         }
 
-        QObject* obj = data->obj.data();
+        // Liveness for every write below: the value conversions can run user
+        // JS (valueOf, toString, getters) and that JS may delete the target
+        // QObject; a local raw pointer would dangle (H-3). data->obj is a
+        // QPointer and reflects the deletion immediately.
+        auto writeProp = [&](int idx, void** a) -> bool {
+            if (Q_UNLIKELY(data->obj.isNull())) {
+                JS_ThrowTypeError(ctx, "QObject has been deleted");
+                return false;
+            }
+            return safeMetacall(ctx, data->obj.data(), QMetaObject::WriteProperty, idx, a);
+        };
+
         const MetaCacheEntry* it = data->metaCache->find(prop);
+        if (!refreshMetaCacheIfChanged(engine, data)) return -1;
+        it = data->metaCache->find(prop);
         if (it && it->kind == MetaCacheEntry::Kind::Property) {
             const auto& entry = *it;
 
@@ -430,11 +528,88 @@ int QuickJSQObjectProxy::qobject_set_property(JSContext* ctx, JSValueConst this_
                 return -1;
             }
 
+            // V4 parity for JS null/undefined (probed against live Qt
+            // 6.12): a meta-property write coerces them through a strict
+            // table, NOT through the valueOf/ToNumber machinery below.
+            // undefined: only a QVariant-typed property accepts it (V4
+            // stores an invalid QVariant); everything else throws
+            // "Cannot assign [undefined] to <type>". null: the nullable and
+            // JS-coercible types take their null value (a null QString, an
+            // empty list, false/0 - the setter IS invoked, V4 does not
+            // reset to the declaration default); the remaining types throw
+            // "Cannot assign std::nullptr_t to <type>".
+            if (JS_IsUndefined(val)) {
+                if (metaType != QMetaType::QVariant) {
+                    JS_ThrowTypeError(ctx, "Cannot assign [undefined] to %s", QMetaType(metaType).name());
+                    return -1;
+                }
+                QVariant v;
+                void* a[1] = { &v };
+                if (!writeProp(entry.index, a)) return -1;
+                return 1;
+            }
+            if (JS_IsNull(val)) {
+                // Typed slots so the metacall reads the exact C++ width.
+                switch (metaType) {
+                case QMetaType::QString: {
+                    QString v;
+                    void* a[1] = { &v };
+                    if (!writeProp(entry.index, a)) return -1;
+                    return 1;
+                }
+                case QMetaType::QByteArray: {
+                    QByteArray v;
+                    void* a[1] = { &v };
+                    if (!writeProp(entry.index, a)) return -1;
+                    return 1;
+                }
+                case QMetaType::Bool: {
+                    bool v = false;
+                    void* a[1] = { &v };
+                    if (!writeProp(entry.index, a)) return -1;
+                    return 1;
+                }
+                case QMetaType::Double: {
+                    double v = 0.0;
+                    void* a[1] = { &v };
+                    if (!writeProp(entry.index, a)) return -1;
+                    return 1;
+                }
+                case QMetaType::Float: {
+                    float v = 0.0f;
+                    void* a[1] = { &v };
+                    if (!writeProp(entry.index, a)) return -1;
+                    return 1;
+                }
+                case QMetaType::QStringList: {
+                    QStringList v;
+                    void* a[1] = { &v };
+                    if (!writeProp(entry.index, a)) return -1;
+                    return 1;
+                }
+                case QMetaType::QVariant: {
+                    QVariant v = QVariant::fromValue(nullptr);
+                    void* a[1] = { &v };
+                    if (!writeProp(entry.index, a)) return -1;
+                    return 1;
+                }
+                case QMetaType::QObjectStar: {
+                    QObject* v = nullptr;
+                    void* a[1] = { &v };
+                    if (!writeProp(entry.index, a)) return -1;
+                    return 1;
+                }
+                default:
+                    JS_ThrowTypeError(ctx, "Cannot assign std::nullptr_t to %s", QMetaType(metaType).name());
+                    return -1;
+                }
+            }
+
             if (metaType == QMetaType::Int) {
                 int v = 0;
                 if (JS_ToInt32(ctx, &v, val) == 0) {
                     void* a[1] = { &v };
-                    if (!safeMetacall(ctx, obj, QMetaObject::WriteProperty, entry.index, a)) return -1;
+                    if (!writeProp(entry.index, a)) return -1;
                     return 1;
                 }
                 clearPendingException(ctx);
@@ -442,7 +617,7 @@ int QuickJSQObjectProxy::qobject_set_property(JSContext* ctx, JSValueConst this_
                 int b = JS_ToBool(ctx, val);
                 if (b >= 0) {
                     bool v = (b != 0); void* a[1] = { &v };
-                    if (!safeMetacall(ctx, obj, QMetaObject::WriteProperty, entry.index, a)) return -1;
+                    if (!writeProp(entry.index, a)) return -1;
                     return 1;
                 }
                 clearPendingException(ctx);
@@ -450,7 +625,7 @@ int QuickJSQObjectProxy::qobject_set_property(JSContext* ctx, JSValueConst this_
                 double v = 0;
                 if (JS_ToFloat64(ctx, &v, val) == 0) {
                     void* a[1] = { &v };
-                    if (!safeMetacall(ctx, obj, QMetaObject::WriteProperty, entry.index, a)) return -1;
+                    if (!writeProp(entry.index, a)) return -1;
                     return 1;
                 }
                 clearPendingException(ctx);
@@ -460,21 +635,23 @@ int QuickJSQObjectProxy::qobject_set_property(JSContext* ctx, JSValueConst this_
 
                 QString v = QuickJSConvert::jsToQString(ctx, strVal.value());
                 void* a[1] = { &v };
-                if (!safeMetacall(ctx, obj, QMetaObject::WriteProperty, entry.index, a)) return -1;
+                if (!writeProp(entry.index, a)) return -1;
                 return 1;
             } else if (metaType == QMetaType::QObjectStar) {
                 QVariant var = engine->toVariant(val);
-                if (!var.isValid() && !JS_IsUndefined(val) && !JS_IsNull(val)) {
-                    // Unrepresentable value (Symbol, Map, RegExp, ...): refuse
-                    // instead of silently writing nullptr, symmetric to the
-                    // generic path below.
+                // V4 parity (probed against live Qt 6.12): only a QObject
+                // wrapper (or null/undefined, handled above) assigns to a
+                // QObject* property; any other value - a plain object, a
+                // number, a string - throws instead of silently writing
+                // nullptr.
+                if (!var.isValid() || !var.canConvert<QObject*>()) {
                     const QByteArray name = QuickJSConvert::atomName(engine, ctx, prop).toUtf8();
                     JS_ThrowTypeError(ctx, "Cannot assign value to property '%s' (incompatible type)", name.constData());
                     return -1;
                 }
                 QObject* v = var.value<QObject*>();
                 void* a[1] = { &v };
-                if (!safeMetacall(ctx, obj, QMetaObject::WriteProperty, entry.index, a)) return -1;
+                if (!writeProp(entry.index, a)) return -1;
                 return 1;
             } else if (metaType == QMetaType::Float) {
                 // Exact numeric tags only: other shapes keep the generic
@@ -487,7 +664,7 @@ int QuickJSQObjectProxy::qobject_set_property(JSContext* ctx, JSValueConst this_
                                            : JS_VALUE_GET_FLOAT64(val);
                     float v = static_cast<float>(num);
                     void* a[1] = { &v };
-                    if (!safeMetacall(ctx, obj, QMetaObject::WriteProperty, entry.index, a)) return -1;
+                    if (!writeProp(entry.index, a)) return -1;
                     return 1;
                 }
             } else if (metaType == QMetaType::LongLong) {
@@ -508,7 +685,7 @@ int QuickJSQObjectProxy::qobject_set_property(JSContext* ctx, JSValueConst this_
                 }
                 if (exact) {
                     void* a[1] = { &v };
-                    if (!safeMetacall(ctx, obj, QMetaObject::WriteProperty, entry.index, a)) return -1;
+                    if (!writeProp(entry.index, a)) return -1;
                     return 1;
                 }
             } else if (metaType == QMetaType::UInt) {
@@ -527,28 +704,34 @@ int QuickJSQObjectProxy::qobject_set_property(JSContext* ctx, JSValueConst this_
                 }
                 if (exact) {
                     void* a[1] = { &v };
-                    if (!safeMetacall(ctx, obj, QMetaObject::WriteProperty, entry.index, a)) return -1;
+                    if (!writeProp(entry.index, a)) return -1;
                     return 1;
                 }
             }
 
-            QVariant convertedVar = engine->toVariant(val);
+            QVariant convertedVar;
+            if ((metaType == QMetaType::QDate || metaType == QMetaType::QTime
+                 || metaType == QMetaType::QDateTime)
+                && JS_IsDate(val)) {
+                // V4 parity (probed in America/New_York and Europe/Moscow;
+                // qv4engine.cpp toVariant passes the property type as the
+                // hint): a Date narrows to a date/time property through
+                // dateTargetFromVariant() - the local date/time with the
+                // QTBUG-92466 exception for QDate. An invalid (NaN) Date
+                // writes the invalid target value silently, like V4,
+                // instead of throwing.
+                convertedVar = dateTargetFromVariant(engine->toVariant(val), metaType);
+            } else {
+                convertedVar = engine->toVariant(val);
+            }
             if (!convertedVar.isValid()) {
-                if (JS_IsUndefined(val) || JS_IsNull(val)) {
-                    // Legacy semantics: undefined/null reset or write the default.
-                    if (entry.isResettable) {
-                        void* a[1] = { nullptr };
-                        if (!safeMetacall(ctx, obj, QMetaObject::ResetProperty, entry.index, a)) return -1;
-                        return 1;
-                    }
-                    convertedVar = makeDefaultVariant(metaType);
-                } else {
-                    // Any other unrepresentable value (Symbol, RegExp, Promise,
-                    // ...) must not silently write the default.
-                    const QByteArray name = QuickJSConvert::atomName(engine, ctx, prop).toUtf8();
-                    JS_ThrowTypeError(ctx, "Cannot assign value to property '%s' (incompatible type)", name.constData());
-                    return -1;
-                }
+                // Any unrepresentable value (Symbol, RegExp, Promise,
+                // ...) must not silently write the default; null and
+                // undefined never reach here (the strict V4 table above
+                // handled them).
+                const QByteArray name = QuickJSConvert::atomName(engine, ctx, prop).toUtf8();
+                JS_ThrowTypeError(ctx, "Cannot assign value to property '%s' (incompatible type)", name.constData());
+                return -1;
             } else if (metaType != QMetaType::QVariant && convertedVar.userType() != metaType) {
                 const QMetaType mt(metaType);
                 if (!mt.isValid() || !convertedVar.canConvert(mt) || !convertedVar.convert(mt)) {
@@ -559,15 +742,13 @@ int QuickJSQObjectProxy::qobject_set_property(JSContext* ctx, JSValueConst this_
             }
 
             void* a[1] = { (metaType == QMetaType::QVariant) ? static_cast<void*>(&convertedVar) : convertedVar.data() };
-            if (!safeMetacall(ctx, obj, QMetaObject::WriteProperty, entry.index, a)) return -1;
+            if (!writeProp(entry.index, a)) return -1;
             return 1;
         } else if (it && it->kind == MetaCacheEntry::Kind::Method) {
             const QByteArray name = QuickJSConvert::atomName(engine, ctx, prop).toUtf8();
             JS_ThrowTypeError(ctx, "Cannot assign to read only property '%s'", name.constData());
             return -1;
         }
-
-        QVariant var = engine->toVariant(val);
 
         QByteArray dynName;
         bool foundInCache = false;
@@ -582,7 +763,7 @@ int QuickJSQObjectProxy::qobject_set_property(JSContext* ctx, JSValueConst this_
         }
 
         if (!foundInCache) {
-            const QString& nameQ = QuickJSConvert::atomName(engine, ctx, prop);
+            const QString nameQ = QuickJSConvert::atomName(engine, ctx, prop);
             if (nameQ.isNull()) {
                 JS_ThrowInternalError(ctx, "Failed to allocate memory for property name");
                 return -1;
@@ -605,10 +786,80 @@ int QuickJSQObjectProxy::qobject_set_property(JSContext* ctx, JSValueConst this_
             }
         }
 
-        obj->setProperty(dynName.constData(), var);
+        // Dynamic-property semantics (a wrapper extension: QJSEngine keeps
+        // unknown writes on the JS wrapper itself, this wrapper mirrors them
+        // into C++ dynamic properties instead - see README). undefined
+        // removes the property (an invalid QVariant is QObject's remove
+        // signal, the counterpart of a JS property deletion); null stores
+        // the null marker QVariant (std::nullptr_t, which reads back as JS
+        // null); any other value that cannot be represented as a QVariant
+        // (Symbol, RegExp, Promise, ...) throws instead of silently
+        // DELETING the property through the invalid-QVariant remove path.
+        QVariant var = engine->toVariant(val);
+        if (JS_IsNull(val)) {
+            var = QVariant::fromValue(nullptr);
+        } else if (JS_IsUndefined(val)) {
+            var = QVariant();
+        } else if (!var.isValid()) {
+            JS_ThrowTypeError(ctx, "Cannot assign value to dynamic property '%s' (incompatible type)", dynName.constData());
+            return -1;
+        }
+
+        // Liveness re-check (H-3): the toVariant() conversion above may have
+        // run user JS that deleted the target QObject.
+        if (Q_UNLIKELY(data->obj.isNull())) {
+            JS_ThrowTypeError(ctx, "QObject has been deleted");
+            return -1;
+        }
+        data->obj.data()->setProperty(dynName.constData(), var);
         return 1;
     });
 }
+
+namespace {
+// Conversion-cost heuristic for overload selection among same-argc
+// candidates (V4 picks by argument conversion cost; pinned against live
+// Qt 6.12: a JS number or bool prefers a numeric parameter over QString,
+// a JS string prefers QString). Lower is better; ties keep the first
+// declared candidate. The cost never decides convertibility - the actual
+// conversion below still throws for incompatible values.
+int argConversionCost(int paramType, JSValueConst v)
+{
+    const int tag = JS_VALUE_GET_TAG(v);
+    const bool isNumber = (tag == JS_TAG_INT || JS_TAG_IS_FLOAT64(tag));
+    const bool isString = (tag == JS_TAG_STRING);
+    const bool isBool = (tag == JS_TAG_BOOL);
+
+    switch (paramType) {
+    case QMetaType::Int: case QMetaType::UInt: case QMetaType::Double:
+    case QMetaType::Float: case QMetaType::Long: case QMetaType::ULong:
+    case QMetaType::LongLong: case QMetaType::ULongLong:
+    case QMetaType::Short: case QMetaType::UShort: case QMetaType::Char:
+    case QMetaType::SChar: case QMetaType::UChar:
+        if (isNumber) return 0;
+        if (isBool) return 1;
+        return 2;
+    case QMetaType::QString:
+        if (isString) return 0;
+        if (isNumber || isBool) return 1;
+        return 2;
+    case QMetaType::QByteArray:
+        return isString ? 1 : 2;
+    case QMetaType::Bool:
+        if (isBool) return 0;
+        if (isNumber) return 1;
+        return 2;
+    case QMetaType::QObjectStar:
+        return (tag == JS_TAG_OBJECT || JS_IsNull(v) || JS_IsUndefined(v)) ? 0 : 2;
+    case QMetaType::QVariant:
+        return 1;
+    default:
+        break;
+    }
+    if (paramType == qMetaTypeId<QQuickJSValue>()) return 0;
+    return 2;  // anything else: the generic conversion decides later
+}
+} // namespace
 
 JSValue QuickJSQObjectProxy::js_method_invoke(JSContext* ctx, JSValueConst func_obj, JSValueConst this_val, int argc, JSValueConst* argv, int flags) {
     Q_UNUSED(this_val);
@@ -627,22 +878,54 @@ JSValue QuickJSQObjectProxy::js_method_invoke(JSContext* ctx, JSValueConst func_
         }
 
         QObject* obj = data->obj.data();
-        const int paramCount = data->paramCount;
+
+        // V4 parity (probed against live Qt 6.12): select among ALL
+        // same-name overloads. An exact parameter-count match wins (ties
+        // broken by argument conversion cost, then by declaration order);
+        // with no exact match the candidate with the largest parameter
+        // count below argc runs and the extra arguments are ignored; when
+        // every candidate needs more arguments than provided, the call
+        // fails with "Insufficient arguments" instead of silently filling
+        // value-initialized defaults. moc lists the full signature before
+        // the default-argument-truncated entries it generates, so an exact
+        // match exists whenever the C++ declaration has defaults.
+        const JSMethodCandidate* chosen = nullptr;
+        {
+            int bestCost = std::numeric_limits<int>::max();
+            for (const JSMethodCandidate& c : data->candidates) {
+                if (c.paramCount != argc) continue;
+                int cost = 0;
+                for (int i = 0; i < c.paramCount; ++i)
+                    cost += argConversionCost(c.paramTypes[i], argv[i]);
+                if (cost < bestCost) { bestCost = cost; chosen = &c; }
+            }
+            if (!chosen) {
+                int bestPc = -1;
+                for (const JSMethodCandidate& c : data->candidates) {
+                    if (c.paramCount < argc && c.paramCount > bestPc) { bestPc = c.paramCount; chosen = &c; }
+                }
+            }
+        }
+        if (!chosen) {
+            return JS_ThrowPlainError(ctx, "Insufficient arguments");
+        }
+
+        const int paramCount = chosen->paramCount;
 
         QVarLengthArray<void*, MetaCallArgsLimit> args(paramCount + 1);
         args[0] = nullptr;
 
         struct NativeArgHolder {
-            int i; bool b; double d; float f; qint64 i64; quint32 u32; QString str; QObject* obj;
+            int i; bool b; double d; float f; qint64 i64; quint32 u32; QString str; QByteArray ba; QObject* obj;
         };
         QVarLengthArray<NativeArgHolder, 10> nativeArgs(paramCount);
         QVarLengthArray<QVariant, 10> varArgs(paramCount);
 
         for (int i = 0; i < paramCount; ++i) {
-            const int expectedType = data->paramTypes[i];
+            const int expectedType = chosen->paramTypes[i];
             bool converted = false;
 
-            if (i < argc && expectedType != QMetaType::UnknownType && expectedType != QMetaType::QVariant) {
+            if (expectedType != QMetaType::UnknownType && expectedType != QMetaType::QVariant) {
                 if (expectedType == QMetaType::Int) {
                     if (JS_ToInt32(ctx, &nativeArgs[i].i, argv[i]) == 0) { args[i+1] = &nativeArgs[i].i; converted = true; }
                     else clearPendingException(ctx);
@@ -692,12 +975,28 @@ JSValue QuickJSQObjectProxy::js_method_invoke(JSContext* ctx, JSValueConst func_
                         }
                     }
                 } else if (expectedType == QMetaType::QString) {
-                    ScopedJSValue strVal(ctx, JS_ToString(ctx, argv[i]));
-                    if (JS_IsException(strVal.value())) {
-                        return JS_EXCEPTION;
+                    if (JS_IsNull(argv[i])) {
+                        // V4 parity (probed against live Qt 6.12): a JS null
+                        // argument coerces to a NULL QString, not to the
+                        // "null" string JS_ToString would produce.
+                        nativeArgs[i].str = QString();
+                        args[i+1] = &nativeArgs[i].str;
+                        converted = true;
+                    } else {
+                        ScopedJSValue strVal(ctx, JS_ToString(ctx, argv[i]));
+                        if (JS_IsException(strVal.value())) {
+                            return JS_EXCEPTION;
+                        }
+                        nativeArgs[i].str = QuickJSConvert::jsToQString(ctx, strVal.value());
+                        args[i+1] = &nativeArgs[i].str;
+                        converted = true;
                     }
-                    nativeArgs[i].str = QuickJSConvert::jsToQString(ctx, strVal.value());
-                    args[i+1] = &nativeArgs[i].str;
+                } else if (expectedType == QMetaType::QByteArray && JS_IsNull(argv[i])) {
+                    // V4 parity (probed): a JS null argument coerces to a
+                    // NULL QByteArray (the generic void*->QByteArray
+                    // conversion below would throw instead).
+                    nativeArgs[i].ba = QByteArray();
+                    args[i+1] = &nativeArgs[i].ba;
                     converted = true;
                 } else if (expectedType == QMetaType::QObjectStar) {
                     QVariant v = engine->toVariant(argv[i]);
@@ -716,21 +1015,29 @@ JSValue QuickJSQObjectProxy::js_method_invoke(JSContext* ctx, JSValueConst func_
                 }
 
                 if (expectedType == QMetaType::QVariant) {
-                    varArgs[i] = (i < argc) ? engine->toVariant(argv[i]) : QVariant();
+                    varArgs[i] = engine->toVariant(argv[i]);
+                } else if ((expectedType == QMetaType::QDate || expectedType == QMetaType::QTime
+                            || expectedType == QMetaType::QDateTime)
+                           && JS_IsDate(argv[i])) {
+                    // V4 parity (probed in America/New_York and Europe/Moscow;
+                    // qv4engine.cpp toVariant passes the argument type as the
+                    // hint): a Date narrows to a date/time argument through
+                    // dateTargetFromVariant() - the local date/time with the
+                    // QTBUG-92466 exception for QDate. An invalid (NaN) Date
+                    // passes the invalid target value silently, like V4,
+                    // instead of throwing.
+                    varArgs[i] = dateTargetFromVariant(engine->toVariant(argv[i]), expectedType);
                 } else {
-                    varArgs[i] = makeDefaultVariant(expectedType);
-                    if (i < argc) {
-                        QVariant convertedVar = engine->toVariant(argv[i]);
-                        if (convertedVar.userType() != expectedType) {
-                            const QMetaType mt(expectedType);
-                            if (mt.isValid() && convertedVar.canConvert(mt) && convertedVar.convert(mt)) {
-                                varArgs[i] = convertedVar;
-                            } else {
-                                return JS_ThrowTypeError(ctx, "Argument %d for method '%s' has incompatible type", i + 1, data->methodName.constData());
-                            }
-                        } else {
+                    QVariant convertedVar = engine->toVariant(argv[i]);
+                    if (convertedVar.userType() != expectedType) {
+                        const QMetaType mt(expectedType);
+                        if (mt.isValid() && convertedVar.canConvert(mt) && convertedVar.convert(mt)) {
                             varArgs[i] = convertedVar;
+                        } else {
+                            return JS_ThrowTypeError(ctx, "Argument %d for method '%s' has incompatible type", i + 1, data->methodName.constData());
                         }
+                    } else {
+                        varArgs[i] = convertedVar;
                     }
                 }
                 args[i + 1] = (expectedType == QMetaType::QVariant)
@@ -739,7 +1046,14 @@ JSValue QuickJSQObjectProxy::js_method_invoke(JSContext* ctx, JSValueConst func_
             }
         }
 
-        return invokeAndConvertReturn(engine, ctx, obj, data->methodIdx, data->retType, args);
+        // Liveness re-check (H-3): the argument conversions above may have
+        // run user JS (valueOf, toString, getters) that deleted the target
+        // QObject; the metacall must not go through the dangling pointer.
+        if (Q_UNLIKELY(data->obj.isNull())) {
+            return JS_ThrowTypeError(ctx, "C++ object has been deleted");
+        }
+
+        return invokeAndConvertReturn(engine, ctx, obj, chosen->methodIdx, chosen->retType, args);
     });
 }
 
@@ -762,6 +1076,7 @@ int QuickJSQObjectProxy::qobject_delete_property(JSContext* ctx, JSValueConst ob
             JS_ThrowTypeError(ctx, "QObject has been deleted");
             return -1;
         }
+        if (!refreshMetaCacheIfChanged(engine, data)) return -1;
 
         if (data->metaCache->find(prop)) {
             return 0;
@@ -774,11 +1089,20 @@ int QuickJSQObjectProxy::qobject_delete_property(JSContext* ctx, JSValueConst ob
                     e.state = PropertyCacheState::Invalid;
                     return 1;
                 }
+                // Invalid state: the property may have been removed and
+                // re-added from the C++ side while the entry was
+                // invalidated - re-probe like the read path (get_own_property),
+                // so delete sees what get sees.
+                QVariant dynProp = data->obj->property(e.name.constData());
+                if (dynProp.isValid()) {
+                    data->obj->setProperty(e.name.constData(), QVariant());
+                    return 1;
+                }
                 return 0;
             }
         }
 
-        const QString& nameQ = QuickJSConvert::atomName(engine, ctx, prop);
+        const QString nameQ = QuickJSConvert::atomName(engine, ctx, prop);
         if (!nameQ.isNull()) {
             const QByteArray nameBa(nameQ.toUtf8());
             QVariant dynProp = data->obj->property(nameBa.constData());

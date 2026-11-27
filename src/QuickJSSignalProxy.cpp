@@ -15,9 +15,9 @@
 
 namespace {
 struct ExecGuard {
-    bool* flag;
-    explicit ExecGuard(bool* f) : flag(f) {}
-    ~ExecGuard() { if (flag) *flag = false; }
+    int* depth;
+    explicit ExecGuard(int* d) : depth(d) { ++*depth; }
+    ~ExecGuard() { if (depth) --*depth; }
     Q_DISABLE_COPY(ExecGuard)
 };
 }
@@ -49,14 +49,16 @@ JSValue QuickJSSignalProxy::js_signal_connect(JSContext* ctx, JSValueConst this_
             return JS_ThrowTypeError(ctx, "Cannot connect signal from a different thread");
         }
 
-        const int methodIdx = data->methodIdx;
+        // connect() targets the first declared signal of the name, like the
+        // pre-overload-selection behavior.
+        const int methodIdx = data->first().methodIdx;
 
         // Warn per connect: an unregistered parameter type converts to
         // undefined on direct emission, but a cross-thread queued emission
         // cannot copy the argument and the JS callback is never invoked.
         const QMetaMethod method = sender->metaObject()->method(methodIdx);
-        for (int i = 0; i < data->paramCount; ++i) {
-            if (data->paramTypes[i] == QMetaType::UnknownType) {
+        for (int i = 0; i < data->first().paramCount; ++i) {
+            if (data->first().paramTypes[i] == QMetaType::UnknownType) {
                 qWarning("QQuickJSEngine: signal '%s' has parameter %d of unregistered type '%s'; "
                          "cross-thread queued emission will not deliver the JS callback",
                          method.name().constData(), i + 1, method.parameterTypeName(i).constData());
@@ -64,8 +66,8 @@ JSValue QuickJSSignalProxy::js_signal_connect(JSContext* ctx, JSValueConst this_
         }
 
         auto receiver = std::make_unique<JSGenericReceiver>();
-        receiver->paramCount = data->paramCount;
-        receiver->paramTypes = data->paramTypes;
+        receiver->paramCount = data->first().paramCount;
+        receiver->paramTypes = data->first().paramTypes;
 
         receiver->m_ctx = ctx;
         receiver->m_jsCallback = JS_DupValue(ctx, argv[0]);
@@ -104,27 +106,31 @@ JSValue QuickJSSignalProxy::js_signal_connect(JSContext* ctx, JSValueConst this_
                     jsArgs[i] = v;
                 }
 
-                receiver_ptr->m_isExecuting = true;
-                ExecGuard guard(&receiver_ptr->m_isExecuting);
+                // Depth counting starts at the receiver creation (zero) and
+                // only ever increments/decrements: a nested emission of the
+                // same signal must add on TOP of the outer frame's count, so
+                // the outer exit - not the nested one - brings it back to
+                // zero. Resetting here would leave the outer frame
+                // unprotected against a disconnect-time deletion (UAF).
+                ExecGuard guard(&receiver_ptr->m_execDepth);
 
-                const bool topLevel = (eng->m_evalDepth == 0);
-                if (topLevel) {
-                    eng->resetExecutionState();
-                    // Starved entry (see QQuickJSEngine::evaluate()): the
-                    // window below this anchor is inside the guard's safety
-                    // margin; refuse with a catchable RangeError instead of
-                    // calling into JS on a stack that cannot fit the throw
-                    // path, and report it like any callback exception.
-                    if (eng->m_stackStarved) {
-                        try { JS_ThrowRangeError(ctx, "Maximum call stack size exceeded"); } catch (...) {}
-                        if (JS_HasException(ctx)) {
-                            ScopedJSValue exc(ctx, JS_GetException(ctx));
-                            eng->processAndEmitException(ctx, exc.value());
-                        }
-                        return;
+                // Entry bookkeeping (fresh quota + stack re-anchor at depth
+                // 0, end-of-tick rejection flush) and the tick rule for the
+                // microtask queue: a NESTED emission (a signal fired from a
+                // running script) never drains the queue - run-to-completion,
+                // the outer entry owns the drain.
+                JsEntryScope entryScope(eng);
+                if (Q_UNLIKELY(entryScope.starved())) {
+                    // Refusal shape of the other JS-running entries: pure C
+                    // throw, reported through the normal callback-exception
+                    // channel (no script runs on the starved stack).
+                    try { JS_ThrowRangeError(ctx, "Maximum call stack size exceeded"); } catch (...) {}
+                    if (JS_HasException(ctx)) {
+                        ScopedJSValue exc(ctx, JS_GetException(ctx));
+                        eng->processAndEmitException(ctx, exc.value());
                     }
+                    return;
                 }
-                EvalDepthGuard depthGuard(eng->m_evalDepth);
 
                 ScopedJSValue ret(ctx, JS_Call(ctx, receiver_ptr->m_jsCallback, JS_UNDEFINED, argsSize, jsArgs.data()));
 
@@ -133,13 +139,8 @@ JSValue QuickJSSignalProxy::js_signal_connect(JSContext* ctx, JSValueConst this_
                     eng->processAndEmitException(ctx, exc.value());
                 }
 
-                if (eng->m_autoProcessPromises) {
+                if (entryScope.isTopLevel() && eng->m_autoProcessPromises) {
                     eng->processPendingJobs();
-                }
-                // A top-level signal callback is an external entry point: the
-                // tick ends here, report rejections left unhandled.
-                if (topLevel) {
-                    eng->flushUnhandledRejections();
                 }
             } catch (const std::exception& e) {
                 // Known std::exception -> catchable plain Error (uniform policy with safeMetacall)
@@ -164,7 +165,7 @@ JSValue QuickJSSignalProxy::js_signal_connect(JSContext* ctx, JSValueConst this_
         }
 
         try {
-            engine->m_signalReceivers.append(rawReceiver);
+            engine->m_signalReceivers.insert(sender, rawReceiver);
         } catch (...) {
             QMetaObject::disconnect(sender, methodIdx, rawReceiver, rawReceiver->m_deleteLaterIdx);
             delete rawReceiver;
@@ -172,9 +173,9 @@ JSValue QuickJSSignalProxy::js_signal_connect(JSContext* ctx, JSValueConst this_
             return JS_EXCEPTION;
         }
 
-        rawReceiver->m_destroyedConn = QObject::connect(sender, &QObject::destroyed, engine, [engine, rawReceiver](QObject*) {
-            engine->m_signalReceivers.removeAll(rawReceiver);
-            if (rawReceiver->m_isExecuting) {
+        rawReceiver->m_destroyedConn = QObject::connect(sender, &QObject::destroyed, engine, [engine, rawReceiver](QObject* deadSender) {
+            engine->m_signalReceivers.remove(deadSender, rawReceiver);
+            if (rawReceiver->m_execDepth > 0) {
                 engine->m_garbageReceivers.append(rawReceiver);
                 QQuickJSEngine* eng = engine;
                 QMetaObject::invokeMethod(eng, [eng, rawReceiver]() {
@@ -205,30 +206,30 @@ JSValue QuickJSSignalProxy::js_signal_disconnect(JSContext* ctx, JSValueConst th
         if (data->obj.isNull()) return JS_ThrowTypeError(ctx, "C++ object has been deleted");
 
         QObject* sender = data->obj.data();
-        const int methodIdx = data->methodIdx;
+        const int methodIdx = data->first().methodIdx;
 
-        for (qsizetype i = 0; i < engine->m_signalReceivers.size(); ) {
-            JSGenericReceiver* receiver = engine->m_signalReceivers[i];
-            if (receiver->m_sender == sender && receiver->m_methodIdx == methodIdx) {
-                if (JS_IsStrictEqual(ctx, receiver->m_jsCallback, argv[0])) {
-                    QMetaObject::disconnect(sender, methodIdx, receiver, receiver->m_deleteLaterIdx);
-                    QObject::disconnect(receiver->m_destroyedConn);
-                    engine->m_signalReceivers.removeAt(i);
+        for (auto it = engine->m_signalReceivers.find(sender); it != engine->m_signalReceivers.end() && it.key() == sender; ) {
+            JSGenericReceiver* receiver = it.value();
+            if (receiver->m_methodIdx == methodIdx && JS_IsStrictEqual(ctx, receiver->m_jsCallback, argv[0])) {
+                QMetaObject::disconnect(sender, methodIdx, receiver, receiver->m_deleteLaterIdx);
+                QObject::disconnect(receiver->m_destroyedConn);
+                it = engine->m_signalReceivers.erase(it);
 
-                    if (receiver->m_isExecuting) {
-                        engine->m_garbageReceivers.append(receiver);
-                        QQuickJSEngine* eng = engine;
-                        QMetaObject::invokeMethod(eng, [eng, receiver]() {
-                            eng->m_garbageReceivers.removeAll(receiver);
-                            delete receiver;
-                        }, Qt::QueuedConnection);
-                    } else {
+                if (receiver->m_execDepth > 0) {
+                    // A frame of this receiver is still executing (a nested
+                    // emission): defer the deletion to the event loop.
+                    engine->m_garbageReceivers.append(receiver);
+                    QQuickJSEngine* eng = engine;
+                    QMetaObject::invokeMethod(eng, [eng, receiver]() {
+                        eng->m_garbageReceivers.removeAll(receiver);
                         delete receiver;
-                    }
-                    continue;
+                    }, Qt::QueuedConnection);
+                } else {
+                    delete receiver;
                 }
+                continue;
             }
-            i++;
+            ++it;
         }
         return JS_UNDEFINED;
     });

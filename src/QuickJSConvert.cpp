@@ -9,6 +9,7 @@
 #include "QuickJSEngine_p.h"
 
 #include <QDateTime>
+#include <QTimeZone>
 #include <limits>
 
 #include <QRegularExpression>
@@ -81,11 +82,11 @@ int QuickJSConvert::extractExceptionLine(JSContext* ctx, JSValueConst exc) {
     return line;
 }
 
-// P15 (2026-11-08), quickjs-ng #1894: JS_GetTypedArrayBuffer returns a stale
-// ta->length (the view's length at CREATION time) for a length-tracking view
-// over a resizable ArrayBuffer: resize() down causes an out-of-bounds heap
-// read (ASan: READ of size 64 from a realloc'd 7-byte block), resize() up
-// silently truncates. JS_GetArrayBuffer is always honest, so the view span is
+// quickjs-ng #1894: JS_GetTypedArrayBuffer returns a stale ta->length (the
+// view's length at CREATION time) for a length-tracking view over a resizable
+// ArrayBuffer: resize() down causes an out-of-bounds heap read (ASan: READ of
+// size 64 from a realloc'd 7-byte block), resize() up silently truncates.
+// JS_GetArrayBuffer is always honest, so the view span is
 // clamped to the live buffer, element-aligned (JS ta.byteLength semantics:
 // floor((byteLength-offset)/bpe)*bpe). After the upstream #1894 fix the
 // condition always holds - the clamp becomes a no-op. Buffer growth is not
@@ -137,6 +138,15 @@ static QVariant jsBufferToVariant(JSContext* ctx, JSValueConst val)
         // live buffer means out-of-bounds, which must keep FAILING the
         // conversion (V4 parity: a clean error, not garbage); only a
         // detached backing store converts to an empty QByteArray.
+        //
+        // Tamper surface (accepted): unlike the Date read (D-51 captures
+        // the intrinsic getTime), this probe goes through the MUTABLE
+        // "buffer" property - a tampered prototype getter or a Proxy
+        // get-trap on a buffer-like object runs here and its return value
+        // decides detached-vs-OOB. The outcome stays safe either way (a
+        // lying accessor can only choose between an empty QByteArray and
+        // a failed conversion, never read out of bounds), so capturing the
+        // intrinsic is not worth its lifetime plumbing.
         ScopedJSValue bufObj(ctx, JS_GetPropertyStr(ctx, val, "buffer"));
         if (consumeException(ctx, bufObj.value())) bufObj = ScopedJSValue(ctx, JS_UNDEFINED);
         if (JS_IsObject(bufObj.value())) {
@@ -171,6 +181,29 @@ static QVariant jsBufferToVariant(JSContext* ctx, JSValueConst val)
     }
     return QVariant();
 }
+
+// Owns a JSPropertyEnum array for the scope lifetime: a C++ exception
+// escaping the conversion loop (bad_alloc from map.insert, or a throw from
+// a nested conversion) must not leak the enum array and its atoms
+// (invariant 3). JS_FreePropertyEnum(nullptr, 0) is a no-op, so a failed
+// JS_GetOwnPropertyNames needs no special casing.
+class ScopedPropertyEnum {
+public:
+    ScopedPropertyEnum(JSContext* ctx, JSPropertyEnum* props, uint32_t n)
+        : m_ctx(ctx), m_props(props), m_n(n) {}
+    ~ScopedPropertyEnum() { if (m_ctx && m_props) JS_FreePropertyEnum(m_ctx, m_props, m_n); }
+
+    ScopedPropertyEnum(const ScopedPropertyEnum&) = delete;
+    ScopedPropertyEnum& operator=(const ScopedPropertyEnum&) = delete;
+
+    [[nodiscard]] JSPropertyEnum* props() const noexcept { return m_props; }
+    [[nodiscard]] uint32_t count() const noexcept { return m_n; }
+
+private:
+    JSContext* m_ctx;
+    JSPropertyEnum* m_props;
+    uint32_t m_n;
+};
 
 QVariant QuickJSConvert::variantFromJSObject(QQuickJSEngine* engine, JSContext* ctx, JSValueConst val,
                                             JSClassID qobjectClassID, JSClassID objectClassID,
@@ -214,7 +247,7 @@ QVariant QuickJSConvert::variantFromJSObject(QQuickJSEngine* engine, JSContext* 
         for (uint32_t i = 0; i < len; ++i) {
             ScopedJSValue item(ctx, JS_GetPropertyUint32(ctx, val, i));
             if (JS_IsException(item.value())) {
-                qWarning("QQuickJSEngine: Exception thrown while reading array property, returning null QVariant");
+                qWarning("QQuickJSEngine: Exception thrown while reading array property, returning invalid QVariant");
                 clearPendingException(ctx);
                 list.append(QVariant());
             } else {
@@ -249,14 +282,15 @@ QVariant QuickJSConvert::variantFromJSObject(QQuickJSEngine* engine, JSContext* 
         clearPendingException(ctx);
         return QVariant();
     }
+    const ScopedPropertyEnum propsGuard(ctx, props, n_props);
 
     for (uint32_t i = 0; i < n_props; ++i) {
         JSAtom atom = props[i].atom;
 
-        // Fetch the value first: an enumerable getter may run user JS and
-        // trigger other atom-name lookups, invalidating the key reference.
+        // atomName() returns the key by value (D-56), so a getter that
+        // recurses into the atom-name cache cannot invalidate it.
         ScopedJSValue item(ctx, JS_GetProperty(ctx, val, atom));
-        const QString& keyStr = atomName(engine, ctx, atom);
+        const QString keyStr = atomName(engine, ctx, atom);
         if (keyStr.isNull()) {
             qWarning("QQuickJSEngine: Failed to get property name during conversion to QVariantMap");
             clearPendingException(ctx);
@@ -264,21 +298,14 @@ QVariant QuickJSConvert::variantFromJSObject(QQuickJSEngine* engine, JSContext* 
         }
 
         if (JS_IsException(item.value())) {
-            qWarning("QQuickJSEngine: Exception thrown while reading object property, returning null QVariant");
+            qWarning("QQuickJSEngine: Exception thrown while reading object property, returning invalid QVariant");
             clearPendingException(ctx);
             map.insert(keyStr, QVariant());
-        } else if (JS_IsObject(item.value())) {
-            // Object values may recurse into atomName(); copy the key first.
-            const QString key = keyStr;
-            QVariant converted = engine->toVariantImpl(item.value(), visited, depth, behavior);
-            map.insert(key, converted);
         } else {
-            // Scalar values perform no atom lookups; the reference stays valid.
             map.insert(keyStr, engine->toVariantImpl(item.value(), visited, depth, behavior));
         }
     }
 
-    JS_FreePropertyEnum(ctx, props, n_props);
     return map;
 }
 
@@ -304,13 +331,13 @@ JSAtom QuickJSConvert::cachedStringAtom(QQuickJSEngine* engine, JSContext* ctx, 
     return atom;   // reference owned by the caller
 }
 
-const QString& QuickJSConvert::atomName(QQuickJSEngine* engine, JSContext* ctx, JSAtom atom) {
+QString QuickJSConvert::atomName(QQuickJSEngine* engine, JSContext* ctx, JSAtom atom) {
     const auto it = engine->m_atomNameCache.constFind(atom);
     if (it != engine->m_atomNameCache.constEnd()) return it.value();
 
-    // Miss: render the name and cache it while under the capacity limit.
-    // Above the limit the name lands in the engine-owned fallback slot; the
-    // reference contract is documented in the header.
+    // Miss: render the name and cache it while under the capacity limit;
+    // above the limit the caller gets an uncached copy (one QString
+    // refcount per call - the price of a stable by-value contract).
     QString name;
     ScopedCString key(ctx, JS_AtomToCString(ctx, atom));
     if (key.isValid()) {
@@ -319,7 +346,7 @@ const QString& QuickJSConvert::atomName(QQuickJSEngine* engine, JSContext* ctx, 
             JSAtom dupAtom = JS_DupAtom(ctx, atom);
             if (dupAtom != JS_ATOM_NULL) {
                 try {
-                    return engine->m_atomNameCache.insert(dupAtom, name).value();
+                    engine->m_atomNameCache.insert(dupAtom, name);
                 } catch (...) {
                     JS_FreeAtom(ctx, dupAtom);
                 }
@@ -328,8 +355,7 @@ const QString& QuickJSConvert::atomName(QQuickJSEngine* engine, JSContext* ctx, 
     } else {
         clearPendingException(ctx);
     }
-    engine->m_atomNameFallback = std::move(name);
-    return engine->m_atomNameFallback;
+    return name;
 }
 
 JSValue QuickJSConvert::mapToJSObject(QQuickJSEngine* engine, JSContext* ctx, const QVariantMap* mapPtr, int depth) {
@@ -470,15 +496,48 @@ int QuickJSConvert::adjustEnumType(int type) {
 // method returns and signal arguments).
 
 JSValue QuickJSConvert::dateTimeToJS(JSContext* ctx, const QDateTime& dt) {
+    // V4 parity (live Qt 6.12): an invalid QDateTime converts to an Invalid
+    // Date (NaN). toMSecsSinceEpoch() of an invalid value is 0, which would
+    // silently turn a "no value" return into the 1970-01-01 epoch.
+    if (!dt.isValid()) return JS_NewDate(ctx, std::numeric_limits<double>::quiet_NaN());
     return JS_NewDate(ctx, static_cast<double>(dt.toMSecsSinceEpoch()));
 }
 
 JSValue QuickJSConvert::dateToJS(JSContext* ctx, const QDate& d) {
-    return dateTimeToJS(ctx, QDateTime(d, QTime(0, 0)));
+    // V4 parity (live Qt 6.12, probed in UTC and Europe/Moscow): a valid
+    // QDate anchors the UTC midnight of that date (qv4dateobject.cpp
+    // builds d.startOfDay(QTimeZone::utc())), not the local midnight - the
+    // two differ by the zone offset in non-UTC environments. An invalid
+    // QDate yields an invalid QDateTime; the NaN path above produces the
+    // Invalid Date.
+    return dateTimeToJS(ctx, d.startOfDay(QTimeZone::utc()));
+}
+
+QDate QuickJSConvert::dateTimeToDate(const QDateTime& dt) {
+    // V4 parity (qv4dateobject.cpp, DateObject::dateTimeToDate): the date
+    // of the LOCAL datetime, except the QTBUG-92466 special case - an
+    // instant that is exactly the UTC midnight of a day whose local wall
+    // time already falls on the previous day (a negative-offset zone)
+    // yields the UTC date, so date-only strings and QDate-anchored Dates
+    // survive the round trip. An invalid datetime yields an invalid QDate.
+    const QDateTime utc = dt.toUTC();
+    if (utc.date() != dt.date() && utc.addSecs(-1).date() == dt.date())
+        return utc.date();
+    return dt.date();
 }
 
 JSValue QuickJSConvert::timeToJS(JSContext* ctx, const QTime& t) {
-    return qStringToJS(ctx, t.toString(Qt::ISODate));
+    // V4 parity (live Qt 6.12, probed in UTC and Europe/Moscow): a valid
+    // QTime converts to a real Date anchored at the LOCAL
+    // QDateTime(1971-04-01, time) - the "April Fools' day" anchor
+    // qtdeclarative picked as a DST-transition-free window (qv4dateobject.cpp,
+    // Date::init(QTime)). The epoch is therefore timezone-dependent, exactly
+    // like V4, while the local getters (getHours()...) are stable. The
+    // round trip changes the variant type to QDateTime - an inherited V4
+    // wart, acknowledged by a NOTE in qv4engine.cpp. An invalid QTime
+    // becomes an Invalid Date (NaN), like the invalid QDateTime above.
+    if (!t.isValid()) return JS_NewDate(ctx, std::numeric_limits<double>::quiet_NaN());
+    return dateTimeToJS(ctx, QDateTime(QDate(1971, 4, 1), t));
 }
 
 JSValue QuickJSConvert::byteArrayToJS(JSContext* ctx, const QByteArray& ba) {

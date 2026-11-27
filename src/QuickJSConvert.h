@@ -41,12 +41,11 @@ public:
 
     // Atom -> property name via the engine-wide cache (m_atomNameCache), shared
     // by all proxy/conversion sites. Returns a null QString only when the atom
-    // cannot be rendered (OOM); an empty name is a valid result.
-    // The reference stays valid until the next atomName() call on this engine:
-    // above the cache capacity the name lives in a single engine-owned fallback
-    // slot, and a miss inserts into the cache. Do not run JS or trigger other
-    // atom-name lookups while holding it.
-    static const QString& atomName(QQuickJSEngine* engine, JSContext* ctx, JSAtom atom);
+    // cannot be rendered (OOM); an empty name is a valid result. Returned by
+    // value: the cache still dedupes the rendering, and callers may hold the
+    // name across further JS runs without a "valid until the next call"
+    // contract to keep in mind.
+    static QString atomName(QQuickJSEngine* engine, JSContext* ctx, JSAtom atom);
 
     static int extractExceptionLine(JSContext* ctx, JSValueConst exc);
     static int parseLineNumberFromStack(const QString& stack);
@@ -86,6 +85,7 @@ public:
     }
     static JSValue dateTimeToJS(JSContext* ctx, const QDateTime& dt);
     static JSValue dateToJS(JSContext* ctx, const QDate& d);
+    static QDate dateTimeToDate(const QDateTime& dt);
     static JSValue timeToJS(JSContext* ctx, const QTime& t);
     static JSValue byteArrayToJS(JSContext* ctx, const QByteArray& ba);
 

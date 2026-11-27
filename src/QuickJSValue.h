@@ -58,6 +58,17 @@ public:
     static constexpr int InlineArgumentCount = 10;
 
     QQuickJSValue();
+    // Low-level constructing constructor (Q8 contract, deliberate):
+    // wraps a raw quickjs JSValue. With owned = true the value OWNS the
+    // reference it is given (the caller transfers it; no DupValue happens
+    // here) - passing a borrowed value with owned = true double-frees on
+    // destruction. With owned = false the value borrows and never frees:
+    // suitable only for values the engine itself keeps alive (m_globalObj).
+    // The engine pointer must be null only together with JS_UNDEFINED.
+    // Kept public on purpose: the wrapper's header templates and sibling
+    // TUs build values from raw JSValues, and quickjs.h is a public
+    // dependency of this API anyway (QJSValue keeps its equivalent private
+    // only because V4's value representation is opaque there).
     QQuickJSValue(QQuickJSEngine* engine, JSValue val, bool owned);
     ~QQuickJSValue();
 
@@ -67,6 +78,13 @@ public:
     QQuickJSValue(QQuickJSValue&& other) noexcept;
     QQuickJSValue& operator=(QQuickJSValue&& other) noexcept;
 
+    // Raw access (Q8 contract, deliberate): the returned JSValue is a COPY
+    // of the stored value, not a reference - quickjs JSValues are trivially
+    // copyable. Refcounted payload types (string/object) are NOT bumped by
+    // this call: treat the result as borrowed and DupValue it before
+    // storing. On a zombie (engine destroyed while the value survived) the
+    // underlying JSValue is stale - its payload may already be freed; only
+    // the copy itself is safe to inspect by tag.
     [[nodiscard]] JSValue jsVal() const;
     QQuickJSEngine* engine() const;
 

@@ -118,6 +118,12 @@ struct PendingRejection {
 /**
  * @brief The QQuickJSEngine class provides a lightweight wrapper around quickjs-ng.
  *
+ * Default resource limits (all adjustable, see the setter documentation):
+ * the JS heap is capped at 64 MiB (setMemoryLimit()), and the JS recursion
+ * budget is 512 KiB plus a calibrated C machinery allowance, clamped to the
+ * real bounds of the engine thread's stack (setMaxStackSize()); the
+ * execution timeout and the step budget are OFF by default.
+ *
  * @warning All public slots of exposed QObject instances (including
  * QObject::deleteLater()) are accessible from JavaScript. If you are running
  * untrusted scripts, be aware that scripts can modify or delete the exposed
@@ -133,6 +139,8 @@ public:
     friend class QuickJSQObjectProxy;
     friend class QuickJSSignalProxy;
     friend class QuickJSConvert;
+    // The shared entry-bookkeeping RAII used by the friends above.
+    friend class JsEntryScope;
 
     explicit QQuickJSEngine(QObject* parent = nullptr);
     ~QQuickJSEngine();
@@ -169,6 +177,11 @@ public:
      * provide the default export. Re-registration with the same name replaces
      * the previous registration. Returns false when the value does not belong
      * to this engine or when a snapshot read throws.
+     *
+     * Re-registration replaces the module for NEW imports; the replaced
+     * internal module record stays alive until the engine is destroyed
+     * (quickjs-ng keeps module defs in a runtime-owned list with no public
+     * free API), so avoid unbounded re-registration loops.
      */
     bool registerModule(const QString& moduleName, const QQuickJSValue& value);
 
@@ -365,6 +378,14 @@ public:
      * budget keeps the engine-internal JS catchable and script entries are
      * refused with a catchable RangeError instead of entering JS at all.
      * Call from the engine's thread, like the other setters of this class.
+     *
+     * Limitation: the measured thread-stack floor is cached per thread and
+     * is NOT invalidated when a host switches that thread onto another
+     * stack (fibers, coroutines, ucontext swaps). A fiber stack located
+     * above the previously measured floor sees an inflated usable window,
+     * so the guard line may sit below the fiber stack's real bottom. Hosts
+     * using cooperative stacks should create the engine while running on
+     * the deepest stack the engine will ever execute on.
      */
     void setMaxStackSize(size_t size);
     void collectGarbage();
@@ -444,6 +465,10 @@ private:
     QVariant toVariant(JSValueConst val);
     QVariant toVariant(JSValueConst val, QQuickJSValue::ObjectConversionBehavior behavior);
     JSValue wrapQObject(QObject* obj);
+    // Engine-wide metaobject cache lookup/build for a QMetaObject; nullptr
+    // means the build failed with a pending JS exception. Used by
+    // wrapQObject() and the proxy's runtime metaobject-change refresh.
+    JSMetaObjectCache* metaObjectCacheFor(const QMetaObject* meta);
     void processAndEmitException(JSContext* ctx, JSValueConst exc);
     void processPendingJobs();
     // End-of-tick: report promise rejections that stayed unhandled after the
@@ -497,7 +522,7 @@ private:
     size_t m_guardStackSize = 0;
     // SP of the depth-0 QVariant conversion entry (both directions): the
     // descent bound for the conversion floor checks when the real thread
-    // floor is unknown (see kUnknownFloorAssumedUsable in the .cpp). A
+    // floor is unknown (see kUnknownFloorAssumedUsable in QuickJSEngine_p.h). A
     // depth-0 entry resets it to its own frame; a strictly-nested chain
     // inherits the outer anchor, which only ever errs conservative.
     uintptr_t m_conversionAnchorSp = 0;
@@ -512,7 +537,6 @@ private:
     JSClassID m_objectClassID;
 
     QHash<JSAtom, QString> m_atomNameCache;
-    QString m_atomNameFallback;   // last uncached atom name, see QuickJSConvert::atomName()
     QHash<QString, JSAtom> m_stringAtomCache;
     QHash<QObject*, JSValue> m_qobjectWrapperCache;
     QHash<const QMetaObject*, JSMetaObjectCache*> m_metaObjectCaches;
@@ -533,10 +557,18 @@ private:
     QHash<QString, QByteArray> m_registeredModules;
     int m_moduleSerial = 0;
 
-    QList<JSGenericReceiver*> m_signalReceivers;
+    // Keyed by sender: connect/disconnect and the destroyed-cleanup walk the
+    // per-sender bucket instead of scanning the whole list (O(N) total
+    // receivers with tens of thousands of connections made disconnect and
+    // sender destruction quadratic).
+    QMultiHash<QObject*, JSGenericReceiver*> m_signalReceivers;
     QList<JSGenericReceiver*> m_garbageReceivers;
 
     QList<PendingRejection> m_pendingRejections;
+    // One-shot latch for the rejection-buffer ceiling warning, PER ENGINE
+    // (a process-global latch would swallow the warning for every engine
+    // after the first one).
+    std::atomic<bool> m_rejectionCapWarned{false};
 
     QList<EvalCacheEntry> m_evalCache;
 
@@ -563,15 +595,13 @@ private:
     // setMaxStackSize(): a guard anchored only at engine creation misses the
     // C++ machinery below deeper entry points. The effective budget always
     // includes the calibrated machinery allowance (see
-    // calibrateMachineryAllowance()), so on Debug/ASan builds with fat C
-    // frames the guard line stays below the legitimate entry chain and only
-    // runaway JS recursion crosses it (Windows MinGW Debug+ASan measured
-    // ~22 KiB per JS_CallInternal frame: a bare 512 KiB budget anchored at
-    // the entry made every check-hitting operation - promise jobs, typed
-    // array construction, apply(), async resume, module linking - throw a
-    // false "Maximum call stack size exceeded" while plain bytecode scripts
-    // without stack checks kept running - the Windows MinGW Debug+ASan
-    // failure class). Refuses to re-anchor from inside running JS
+    // calibrateMachineryAllowance()): on fat Debug/ASan builds a single
+    // JS_CallInternal frame can take tens of KiB, so a bare recursion share
+    // would make the guard fire inside the legitimate entry chain and every
+    // check-hitting operation (promise jobs, typed array construction,
+    // apply(), async resume, module linking) would throw a false
+    // "Maximum call stack size exceeded" while plain scripts without stack
+    // checks keep running. Refuses to re-anchor from inside running JS
     // (m_evalDepth != 0): the next top-level entry re-measures.
     void reanchorStackGuard();
     // One-shot (per engine) measurement of the real C machinery descent
@@ -626,8 +656,12 @@ void QQuickJSValue::setProperty(const QString& name, const T& value) {
     if constexpr (std::is_null_pointer_v<T>) {
         setProperty(name, QQuickJSValue(jsEngine, JS_NULL, true));
     } else if constexpr (std::is_convertible_v<T, const char*>) {
-        if (value) {
-            setProperty(name, QVariant::fromValue(QString::fromUtf8(value)));
+        // Null test through a real pointer: `value` is a reference, and for
+        // an array T (a string literal) GCC's -Wnonnull-compare flags a
+        // direct test even though the decayed pointer is never null.
+        const char* const s = value;
+        if (s) {
+            setProperty(name, QVariant::fromValue(QString::fromUtf8(s)));
         } else {
             setProperty(name, QQuickJSValue(jsEngine, JS_NULL, true));
         }
@@ -644,8 +678,11 @@ void QQuickJSValue::setProperty(const char* name, const T& value) {
     if constexpr (std::is_null_pointer_v<T>) {
         setProperty(name, QQuickJSValue(jsEngine, JS_NULL, true));
     } else if constexpr (std::is_convertible_v<T, const char*>) {
-        if (value) {
-            setProperty(name, QVariant::fromValue(QString::fromUtf8(value)));
+        // See the QString overload for why the null test goes through a
+        // real pointer (-Wnonnull-compare on array T instantiations).
+        const char* const s = value;
+        if (s) {
+            setProperty(name, QVariant::fromValue(QString::fromUtf8(s)));
         } else {
             setProperty(name, QQuickJSValue(jsEngine, JS_NULL, true));
         }
@@ -662,8 +699,11 @@ void QQuickJSValue::setProperty(quint32 arrayIndex, const T& value) {
     if constexpr (std::is_null_pointer_v<T>) {
         setProperty(arrayIndex, QQuickJSValue(jsEngine, JS_NULL, true));
     } else if constexpr (std::is_convertible_v<T, const char*>) {
-        if (value) {
-            setProperty(arrayIndex, QVariant::fromValue(QString::fromUtf8(value)));
+        // See the QString overload for why the null test goes through a
+        // real pointer (-Wnonnull-compare on array T instantiations).
+        const char* const s = value;
+        if (s) {
+            setProperty(arrayIndex, QVariant::fromValue(QString::fromUtf8(s)));
         } else {
             setProperty(arrayIndex, QQuickJSValue(jsEngine, JS_NULL, true));
         }

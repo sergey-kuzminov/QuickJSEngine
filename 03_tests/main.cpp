@@ -49,6 +49,7 @@ class TestObject : public QObject {
     Q_PROPERTY(int readOnlyProp READ getReadOnlyProp CONSTANT)
     Q_PROPERTY(QVariant variantProp READ getVariantProp WRITE setVariantProp)
     Q_PROPERTY(QDate dateProp READ getDateProp WRITE setDateProp)
+    Q_PROPERTY(QTime timeProp READ getTimeProp WRITE setTimeProp)
     Q_PROPERTY(qint64 bigProp READ getBigProp WRITE setBigProp)
     Q_PROPERTY(float floatProp READ getFloatProp WRITE setFloatProp)
     Q_PROPERTY(uint uintProp READ getUintProp WRITE setUintProp)
@@ -106,6 +107,21 @@ public:
         return l;
     }
 
+    // Argument-count and overload-selection coverage (V4 parity): no
+    // defaults (missing arguments must throw), C++ defaults (moc emits
+    // truncated synthetic signatures), and a same-name int/QString
+    // overload pair.
+    Q_INVOKABLE QString needTwo(int a, const QString& b) { return QString::number(a) + QLatin1Char(',') + b; }
+    Q_INVOKABLE QString withDefaults(int a, int b = 7) { return QString::number(a) + QLatin1Char(',') + QString::number(b); }
+    Q_INVOKABLE QString ovOverload(int v) { return QStringLiteral("int:%1").arg(v); }
+    Q_INVOKABLE QString ovOverload(const QString& v) { return QStringLiteral("str:%1").arg(v); }
+    Q_INVOKABLE QDateTime invalidDateTime() { return QDateTime(); }
+    Q_INVOKABLE QDate invalidDate() { return QDate(); }
+    Q_INVOKABLE QTime invalidTime() { return QTime(); }
+    Q_INVOKABLE QTime echoTime(const QTime& t) { return t; }
+    Q_INVOKABLE QDate echoDate(const QDate& d) { return d; }
+    Q_INVOKABLE QDateTime echoDateTime(const QDateTime& dt) { return dt; }
+
     int getValue() const { return m_value; }
     void setValue(int v) { m_value = v; emit valueChanged(v); }
     void setName(const QString& n) { m_name = n; emit nameChanged(n); }
@@ -115,6 +131,8 @@ public:
     void setVariantProp(const QVariant& v) { m_variantProp = v; }
     QDate getDateProp() const { return m_dateProp; }
     void setDateProp(const QDate& d) { m_dateProp = d; }
+    QTime getTimeProp() const { return m_timeProp; }
+    void setTimeProp(const QTime& t) { m_timeProp = t; }
 
     qint64 getBigProp() const { return m_bigProp; }
     void setBigProp(qint64 v) { m_bigProp = v; }
@@ -193,6 +211,7 @@ private:
     TestObject* m_child;
     QVariant m_variantProp;
     QDate m_dateProp;
+    QTime m_timeProp{13, 45, 36, 150};
     qint64 m_bigProp = 0;
     float m_floatProp = 0.0f;
     uint m_uintProp = 0;
@@ -245,6 +264,12 @@ class RegressionTestObject : public QObject {
     Q_PROPERTY(bool boolProp READ boolProp WRITE setBoolProp)
     Q_PROPERTY(double doubleProp READ doubleProp WRITE setDoubleProp)
     Q_PROPERTY(QObject* objProp READ objProp WRITE setObjProp)
+    Q_PROPERTY(QString strProp READ strProp WRITE setStrProp)
+    Q_PROPERTY(QByteArray baProp READ baProp WRITE setBaProp)
+    Q_PROPERTY(float floatProp READ floatProp WRITE setFloatProp)
+    Q_PROPERTY(QStringList slProp READ slProp WRITE setSlProp)
+    Q_PROPERTY(QVariant varProp READ varProp WRITE setVarProp)
+    Q_PROPERTY(QDateTime dtProp READ dtProp WRITE setDtProp)
 public:
     explicit RegressionTestObject(QObject* p = nullptr) : QObject(p), m_obj(this) {}
 
@@ -256,6 +281,24 @@ public:
     void setDoubleProp(double v) { m_double = v; }
     QObject* objProp() const { return m_obj; }
     void setObjProp(QObject* v) { m_obj = v; }
+    QString strProp() const { return m_str; }
+    void setStrProp(const QString& v) { m_str = v; }
+    QByteArray baProp() const { return m_ba; }
+    void setBaProp(const QByteArray& v) { m_ba = v; }
+    float floatProp() const { return m_float; }
+    void setFloatProp(float v) { m_float = v; }
+    QStringList slProp() const { return m_sl; }
+    void setSlProp(const QStringList& v) { m_sl = v; }
+    QVariant varProp() const { return m_var; }
+    void setVarProp(const QVariant& v) { m_var = v; }
+    QDateTime dtProp() const { return m_dt; }
+    void setDtProp(const QDateTime& v) { m_dt = v; }
+
+    // Argument-path null/undefined coercion probes (V4 parity)
+    Q_INVOKABLE void takeStr(const QString& s) { m_str = s; }
+    Q_INVOKABLE void takeBa(const QByteArray& b) { m_ba = b; }
+    // A no-op sink whose argument coercion runs user JS (valueOf)
+    Q_INVOKABLE int sink(int v) { return v; }
 
     // Enables the execution timeout while a script is running
     Q_INVOKABLE void enableTimeout(int ms) { if (m_jsEngine) m_jsEngine->setExecutionTimeoutMs(static_cast<quint32>(ms)); }
@@ -273,7 +316,23 @@ private:
     bool m_bool = false;
     double m_double = -1.0;
     QObject* m_obj = nullptr;   // initialized to `this`: distinguishes a silent nullptr write
+    QString m_str = QStringLiteral("INIT");
+    QByteArray m_ba = "INIT";
+    float m_float = -1.0f;
+    QStringList m_sl = { QStringLiteral("x") };
+    QVariant m_var = 7;
+    QDateTime m_dt = QDateTime(QDate(2020, 1, 1), QTime(1, 2, 3));
     QQuickJSEngine* m_jsEngine = nullptr;
+};
+
+// Deletes a target QObject on demand from JS (H-3 regression coverage:
+// the deletion happens DURING the argument/value conversion of another
+// wrapper's call or property write).
+class DeleterObject : public QObject {
+    Q_OBJECT
+public:
+    QObject* m_target = nullptr;
+    Q_INVOKABLE void deleteTarget() { delete m_target; }
 };
 
 // ------------------------------------------------------------------------------------------------
@@ -598,6 +657,216 @@ public:
 };
 
 // Runs the full test suite
+// Property-write/argument type-coercion contracts (r11, D-60): strict V4
+// null/undefined table for meta-properties, JS coercion for arguments,
+// UAF regression (H-3), dynamic-property semantics (M-2). Extracted into
+// its own function: with ASan's per-scope stack slots these locals would
+// inflate runAllTests' frame and push the depth-limit conversion tests
+// below the reserve line on 1 MiB stacks (D-60 starved-matrix note).
+static void runPropertyTypeCoercionTests()
+{
+// Unrepresentable values must throw TypeError instead of silently writing defaults
+    QQuickJSEngine qEng;
+    RegressionTestObject* obj = new RegressionTestObject();
+    qEng.globalObject().setProperty("testObj", qEng.newQObject(obj));
+
+    QQuickJSValue r1 = qEng.evaluate("testObj.intProp = Symbol()");
+    TEST_RESULT("QProperty: Symbol to int throws TypeError",
+                r1.isError() && r1.toString().contains("incompatible type", Qt::CaseInsensitive) && obj->intProp() == -1,
+                QStringLiteral("silent default write: r='%1' intProp=%2").arg(r1.toString()).arg(obj->intProp()));
+
+    QQuickJSValue r2 = qEng.evaluate("testObj.doubleProp = Symbol()");
+    TEST_RESULT("QProperty: Symbol to double throws TypeError",
+                r2.isError() && r2.toString().contains("incompatible type", Qt::CaseInsensitive) && obj->doubleProp() == -1.0,
+                QStringLiteral("silent default write: r='%1'").arg(r2.toString()));
+
+    QQuickJSValue r3 = qEng.evaluate("testObj.objProp = Symbol()");
+    TEST_RESULT("QProperty: Symbol to QObject* throws TypeError",
+                r3.isError() && r3.toString().contains("incompatible type", Qt::CaseInsensitive) && obj->objProp() == obj,
+                QStringLiteral("silent nullptr write: r='%1'").arg(r3.toString()));
+
+    QQuickJSValue r4 = qEng.evaluate("testObj.objProp = new Map()");
+    TEST_RESULT("QProperty: Map to QObject* throws TypeError",
+                r4.isError() && r4.toString().contains("incompatible type", Qt::CaseInsensitive) && obj->objProp() == obj,
+                QStringLiteral("silent nullptr write: r='%1'").arg(r4.toString()));
+
+    // V4 parity (probed against live Qt 6.12): property writes coerce
+    // JS null/undefined through a strict table, NOT through the JS
+    // valueOf/ToNumber machinery.
+    // undefined: only a QVariant-typed property accepts it (an
+    // invalid QVariant); everything else throws
+    // "Cannot assign [undefined] to <type>".
+    // null: nullable/JS-coercible types take their null value (the
+    // setter IS invoked - V4 does not reset to the default); other
+    // types throw "Cannot assign std::nullptr_t to <type>".
+    QQuickJSValue u1 = qEng.evaluate("testObj.intProp = undefined");
+    TEST_RESULT("QProperty: undefined to int throws (V4 parity)",
+                u1.isError() && u1.toString().contains("Cannot assign [undefined] to int")
+                    && obj->intProp() == -1,
+                QStringLiteral("got='%1'").arg(u1.toString()));
+    QQuickJSValue u2 = qEng.evaluate("testObj.strProp = undefined");
+    TEST_RESULT("QProperty: undefined to QString throws (V4 parity)",
+                u2.isError() && u2.toString().contains("Cannot assign [undefined] to QString")
+                    && obj->strProp() == QStringLiteral("INIT"),
+                QStringLiteral("got='%1'").arg(u2.toString()));
+    QQuickJSValue u3 = qEng.evaluate("testObj.varProp = undefined; 'ok'");
+    TEST_RESULT("QProperty: undefined to QVariant writes invalid variant (V4 parity)",
+                !u3.isError() && !obj->varProp().isValid(),
+                QStringLiteral("got='%1'").arg(u3.toString()));
+    obj->setObjProp(obj);
+    QQuickJSValue u4 = qEng.evaluate("testObj.objProp = undefined");
+    TEST_RESULT("QProperty: undefined to QObject* throws (V4 parity)",
+                u4.isError() && u4.toString().contains("Cannot assign [undefined] to QObject*")
+                    && obj->objProp() == obj,
+                QStringLiteral("got='%1' - undefined must not write nullptr").arg(u4.toString()));
+
+    QQuickJSValue n1 = qEng.evaluate("testObj.intProp = null");
+    TEST_RESULT("QProperty: null to int throws (V4 parity)",
+                n1.isError() && n1.toString().contains("Cannot assign std::nullptr_t to int")
+                    && obj->intProp() == -1,
+                QStringLiteral("got='%1' - null must not coerce to 0").arg(n1.toString()));
+    QQuickJSValue n2 = qEng.evaluate("testObj.dtProp = null");
+    TEST_RESULT("QProperty: null to QDateTime throws (V4 parity)",
+                n2.isError() && n2.toString().contains("Cannot assign std::nullptr_t to QDateTime")
+                    && obj->dtProp().isValid(),
+                QStringLiteral("got='%1'").arg(n2.toString()));
+    QQuickJSValue n3 = qEng.evaluate("testObj.strProp = null; 'ok'");
+    TEST_RESULT("QProperty: null to QString writes null QString (V4 parity)",
+                !n3.isError() && obj->strProp().isNull(),
+                QStringLiteral("got='%1' str='%2'").arg(n3.toString(), obj->strProp()));
+    QQuickJSValue n3r = qEng.evaluate("String(testObj.strProp) + '|' + (testObj.strProp === '')");
+    TEST_RESULT("QProperty: null QString reads back as empty string (V4 parity)",
+                n3r.toString() == QStringLiteral("|true"),
+                QStringLiteral("got='%1' - a null QString must not become JS null").arg(n3r.toString()));
+    QQuickJSValue n4 = qEng.evaluate("testObj.baProp = null; 'ok'");
+    TEST_RESULT("QProperty: null to QByteArray writes null QByteArray (V4 parity)",
+                !n4.isError() && obj->baProp().isNull(),
+                QStringLiteral("got='%1'").arg(n4.toString()));
+    qEng.evaluate("testObj.boolProp = 1");
+    QQuickJSValue n5 = qEng.evaluate("testObj.boolProp = null; 'ok'");
+    TEST_RESULT("QProperty: null to bool writes false (V4 parity)",
+                !n5.isError() && obj->boolProp() == false,
+                QStringLiteral("got='%1' b=%2").arg(n5.toString()).arg(obj->boolProp()));
+    QQuickJSValue n6 = qEng.evaluate("testObj.doubleProp = null; 'ok'");
+    QQuickJSValue n7 = qEng.evaluate("testObj.floatProp = null; 'ok'");
+    QQuickJSValue n8 = qEng.evaluate("testObj.slProp = null; 'ok'");
+    TEST_RESULT("QProperty: null to double/float/QStringList writes zero/empty (V4 parity)",
+                !n6.isError() && !n7.isError() && !n8.isError()
+                    && obj->doubleProp() == 0.0 && obj->floatProp() == 0.0f
+                    && obj->slProp().isEmpty(),
+                QStringLiteral("d=%1 f=%2 sl=%3").arg(obj->doubleProp()).arg(obj->floatProp()).arg(obj->slProp().size()));
+    QQuickJSValue n9 = qEng.evaluate("testObj.varProp = null; 'ok'");
+    TEST_RESULT("QProperty: null to QVariant writes nullptr_t variant reading back as null (V4 parity)",
+                !n9.isError() && obj->varProp().isValid()
+                    && obj->varProp().metaType().id() == QMetaType::Nullptr
+                    && qEng.evaluate("String(testObj.varProp)").toString() == QStringLiteral("null")
+                    && qEng.evaluate("testObj.varProp === null").toBool(),
+                QStringLiteral("type='%1'").arg(QString::fromLatin1(obj->varProp().metaType().name())));
+    QQuickJSValue n10 = qEng.evaluate("testObj.objProp = null; 'ok'");
+    TEST_RESULT("QProperty: null to QObject* writes nullptr (V4 parity)",
+                !n10.isError() && obj->objProp() == nullptr,
+                QStringLiteral("got='%1'").arg(n10.toString()));
+
+    // Argument path: JS coercion (V4 parity, probed): null coerces to
+    // a NULL QString/QByteArray (NOT the "null" string), undefined to
+    // the "undefined" string, numbers follow ToNumber.
+    qEng.evaluate("testObj.takeStr(null)");
+    TEST_RESULT("QArgs: null to QString argument is a null QString (V4 parity)",
+                obj->strProp().isNull(),
+                QStringLiteral("got='%1' - null became the \"null\" string").arg(obj->strProp()));
+    qEng.evaluate("testObj.takeStr(undefined)");
+    TEST_RESULT("QArgs: undefined to QString argument is the 'undefined' string (V4 parity)",
+                obj->strProp() == QStringLiteral("undefined"),
+                QStringLiteral("got='%1'").arg(obj->strProp()));
+    qEng.evaluate("testObj.takeBa(null)");
+    TEST_RESULT("QArgs: null to QByteArray argument is a null QByteArray (V4 parity)",
+                obj->baProp().isNull(),
+                QStringLiteral("got='%1'").arg(QString::fromLatin1(obj->baProp())));
+
+    // H-3: user JS running during argument/value conversion may
+    // delete the target QObject; the metacall must be skipped with a
+    // TypeError instead of going through a dangling pointer (an
+    // unfixed build crashes here under ASan).
+    {
+        QQuickJSEngine dEng;
+        auto* target = new RegressionTestObject();
+        auto* target2 = new RegressionTestObject();
+        DeleterObject* deleter = new DeleterObject();
+        deleter->m_target = target;
+        dEng.globalObject().setProperty("victim", dEng.newQObject(target));
+        dEng.globalObject().setProperty("victim2", dEng.newQObject(target2));
+        dEng.globalObject().setProperty("deleter", dEng.newQObject(deleter));
+        QQuickJSValue c1 = dEng.evaluate(
+            "try { victim.sink({ valueOf() { deleter.deleteTarget(); return 1; } }); 'ran'; }"
+            " catch (e) { e.message; }");
+        TEST_RESULT("QObject: method call survives deletion during argument coercion",
+                    c1.toString() == QStringLiteral("C++ object has been deleted"),
+                    QStringLiteral("got='%1'").arg(c1.toString()));
+        TEST_RESULT("QObject: engine alive after deletion-during-call",
+                    dEng.evaluate("1+1").toInt() == 2, "engine damaged");
+        deleter->m_target = target2;
+        QQuickJSValue c2 = dEng.evaluate(
+            "try { victim2.intProp = { valueOf() { deleter.deleteTarget(); return 5; } }; 'ran'; }"
+            " catch (e) { e.message; }");
+        TEST_RESULT("QObject: property write survives deletion during value coercion",
+                    c2.toString() == QStringLiteral("QObject has been deleted"),
+                    QStringLiteral("got='%1'").arg(c2.toString()));
+        TEST_RESULT("QObject: engine alive after deletion-during-write",
+                    dEng.evaluate("1+1").toInt() == 2, "engine damaged");
+        delete deleter;   // both targets were already deleted from JS
+    }
+
+    // Dynamic properties (wrapper extension): Symbol refuses with a
+    // TypeError instead of silently DELETING the property; undefined
+    // removes; null stores the null marker reading back as null.
+    {
+        QQuickJSEngine dEng;
+        auto* dObj = new RegressionTestObject();
+        dEng.globalObject().setProperty("d", dEng.newQObject(dObj));
+        dEng.evaluate("d.dynX = 41");
+        TEST_RESULT("QDynamic: unknown write creates a C++ dynamic property",
+                    dObj->property("dynX").isValid() && dObj->property("dynX").toInt() == 41,
+                    "the dynamic property was not created");
+        QQuickJSValue s1 = dEng.evaluate("d.dynX = Symbol()");
+        TEST_RESULT("QDynamic: Symbol to dynamic property throws instead of deleting",
+                    s1.isError() && s1.toString().contains("incompatible type", Qt::CaseInsensitive)
+                        && dObj->property("dynX").isValid() && dObj->property("dynX").toInt() == 41,
+                    QStringLiteral("got='%1' - the property was silently deleted").arg(s1.toString()));
+        QQuickJSValue s2 = dEng.evaluate("d.dynU = 'x'; d.dynU = undefined; 'ok'");
+        TEST_RESULT("QDynamic: undefined removes the dynamic property",
+                    !s2.isError() && !dObj->property("dynU").isValid(),
+                    QStringLiteral("got='%1'").arg(s2.toString()));
+        QQuickJSValue s3 = dEng.evaluate("d.dynN = null; 'ok'");
+        TEST_RESULT("QDynamic: null stores the null marker reading back as JS null",
+                    !s3.isError() && dObj->property("dynN").isValid()
+                        && dEng.evaluate("d.dynN === null").toBool(),
+                    QStringLiteral("got='%1'").arg(s3.toString()));
+        delete dObj;
+    }
+
+    qEng.evaluate("testObj.objProp = testObj");
+    TEST_RESULT("QProperty: QObject wrapper still assignable to QObject*", obj->objProp() == obj, "the QObject wrapper is no longer assignable");
+
+    // V4 parity (probed): only a QObject wrapper assigns to a
+    // QObject* property; other values throw instead of a silent
+    // nullptr write.
+    QQuickJSValue p1 = qEng.evaluate("testObj.objProp = {a:1}");
+    QQuickJSValue p2 = qEng.evaluate("testObj.objProp = 42");
+    TEST_RESULT("QProperty: object/number to QObject* throws (V4 parity)",
+                p1.isError() && p2.isError() && obj->objProp() == obj,
+                QStringLiteral("p1='%1' p2='%2' - silent nullptr write").arg(p1.toString(), p2.toString()));
+
+    // Bool fast path keeps ECMAScript ToBoolean semantics (total, never throws)
+    qEng.evaluate("testObj.boolProp = Symbol()");
+    TEST_RESULT("QProperty: Symbol to bool keeps ToBoolean coercion",
+                obj->boolProp() == true,
+                "the bool path must not break total ToBoolean semantics (Symbol is truthy)");
+
+    TEST_RESULT("QProperty: Engine alive after TypeErrors", qEng.evaluate("1+1").toInt() == 2, "engine damaged");
+    delete obj;
+}
+
+
 static void runAllTests(const bool runDangerous) {
     // 1. Core JS Types & Equality
     compareEngines("Type: undefined", "String(undefined)");
@@ -1625,7 +1894,7 @@ static void runAllTests(const bool runDangerous) {
                     MessageCaptureGuard guard;
                     cEng.evaluate(QStringLiteral("for (let i = 0; i < 1200; ++i) console.count('lbl' + i);"));
                     for (const QString& m : g_capturedMessages)
-                        if (m.contains(QLatin1String("label table at its ceiling"))) ++ceilingWarnings;
+                        if (m.contains(QLatin1String("label tables are capped"))) ++ceilingWarnings;
                 }
                 TEST_RESULT("Console: label tables capped with a one-shot warning",
                             ceilingWarnings == 1,
@@ -1928,58 +2197,9 @@ static void runAllTests(const bool runDangerous) {
         TEST_RESULT("Exception: isError for string throw", qEng.evaluate("throw 'string error';").isError(), "throw string not detected as error");
         delete obj;
 
-        // Unrepresentable values must throw TypeError instead of silently writing defaults
-        {
-            QQuickJSEngine qEng;
-            RegressionTestObject* obj = new RegressionTestObject();
-            qEng.globalObject().setProperty("testObj", qEng.newQObject(obj));
-
-            QQuickJSValue r1 = qEng.evaluate("testObj.intProp = Symbol()");
-            TEST_RESULT("QProperty: Symbol to int throws TypeError",
-                        r1.isError() && r1.toString().contains("incompatible type", Qt::CaseInsensitive) && obj->intProp() == -1,
-                        QStringLiteral("silent default write: r='%1' intProp=%2").arg(r1.toString()).arg(obj->intProp()));
-
-            QQuickJSValue r2 = qEng.evaluate("testObj.doubleProp = Symbol()");
-            TEST_RESULT("QProperty: Symbol to double throws TypeError",
-                        r2.isError() && r2.toString().contains("incompatible type", Qt::CaseInsensitive) && obj->doubleProp() == -1.0,
-                        QStringLiteral("silent default write: r='%1'").arg(r2.toString()));
-
-            QQuickJSValue r3 = qEng.evaluate("testObj.objProp = Symbol()");
-            TEST_RESULT("QProperty: Symbol to QObject* throws TypeError",
-                        r3.isError() && r3.toString().contains("incompatible type", Qt::CaseInsensitive) && obj->objProp() == obj,
-                        QStringLiteral("silent nullptr write: r='%1'").arg(r3.toString()));
-
-            QQuickJSValue r4 = qEng.evaluate("testObj.objProp = new Map()");
-            TEST_RESULT("QProperty: Map to QObject* throws TypeError",
-                        r4.isError() && r4.toString().contains("incompatible type", Qt::CaseInsensitive) && obj->objProp() == obj,
-                        QStringLiteral("silent nullptr write: r='%1'").arg(r4.toString()));
-
-            // Legacy semantics preserved: undefined/null keep the old default writes
-            qEng.evaluate("testObj.intProp = undefined");
-            bool intOk = obj->intProp() == 0;
-            qEng.evaluate("testObj.intProp = null");
-            intOk = intOk && obj->intProp() == 0;
-            TEST_RESULT("QProperty: undefined/null to int keeps coercion default", intOk, "undefined/null no longer convert to 0");
-
-            obj->setObjProp(obj);
-            qEng.evaluate("testObj.objProp = undefined");
-            bool objOk = obj->objProp() == nullptr;
-            qEng.evaluate("testObj.objProp = null");
-            objOk = objOk && obj->objProp() == nullptr;
-            TEST_RESULT("QProperty: undefined/null to QObject* keeps nullptr write", objOk, "undefined/null no longer write nullptr");
-
-            qEng.evaluate("testObj.objProp = testObj");
-            TEST_RESULT("QProperty: QObject wrapper still assignable to QObject*", obj->objProp() == obj, "the QObject wrapper is no longer assignable");
-
-            // Bool fast path keeps ECMAScript ToBoolean semantics (total, never throws)
-            qEng.evaluate("testObj.boolProp = Symbol()");
-            TEST_RESULT("QProperty: Symbol to bool keeps ToBoolean coercion",
-                        obj->boolProp() == true,
-                        "the bool path must not break total ToBoolean semantics (Symbol is truthy)");
-
-            TEST_RESULT("QProperty: Engine alive after TypeErrors", qEng.evaluate("1+1").toInt() == 2, "engine damaged");
-            delete obj;
-        }
+        // r11 (D-60): type-coercion contracts moved to their own function (see
+        // the note above it) to keep this frame slim for the 1 MiB starved matrix.
+        runPropertyTypeCoercionTests();
 
         QString code = "throw new Error('X');";
         QQuickJSValue e1 = qEng.evaluate(code, "file1.js");
@@ -1997,7 +2217,11 @@ static void runAllTests(const bool runDangerous) {
         thread.wait();
 
         qEng.setProperty("dateVar", QVariant(QDate(2024, 1, 1)));
-        TEST_RESULT("Types: QDate to JS Date", qEng.evaluate("dateVar instanceof Date && dateVar.getFullYear() === 2024 && dateVar.getMonth() === 0 && dateVar.getDate() === 1").toBool(), "QDate to JS Date failed");
+        // UTC getters pin the V4 anchor: a valid QDate becomes the UTC
+        // midnight of that date (qv4dateobject.cpp Date::init(QDate)), so
+        // the UTC date components equal the QDate in every timezone. Local
+        // getters would shift a day in negative-offset zones - in V4 too.
+        TEST_RESULT("Types: QDate to JS Date", qEng.evaluate("dateVar instanceof Date && dateVar.getUTCFullYear() === 2024 && dateVar.getUTCMonth() === 0 && dateVar.getUTCDate() === 1 && dateVar.getUTCHours() === 0 && dateVar.getUTCMinutes() === 0").toBool(), "QDate to JS Date failed");
 
         bool ok = true;
         for (int i = 0; i < 12; ++i) if (qEng.evaluate(QStringLiteral("var a_%1 = %1;").arg(i)).isError()) ok = false;
@@ -2043,6 +2267,260 @@ static void runAllTests(const bool runDangerous) {
         }
         longLivedObject.setObjectName("Survived");
         TEST_RESULT("Regression: Destroy Engine while QObject Alive", longLivedObject.objectName() == "Survived", "Crashed or object corrupted");
+
+        // Review round-5 regressions: run-to-completion, invalid dates,
+        // argument counts, the __proto__ export, stale deadlines and the
+        // qsTr n coercion.
+        {
+            QQuickJSEngine qEng;
+            TestObject* robj = new TestObject();
+            qEng.globalObject().setProperty("testObj", qEng.newQObject(robj));
+
+            // Run-to-completion: a signal callback emitted from a running
+            // script is a NESTED entry and must not drain the microtask
+            // queue; the top-level evaluate exit owns the drain.
+            QQuickJSValue order1 = qEng.evaluate(QStringLiteral(
+                "var order = [];"
+                "testObj.valueChanged.connect(function(v) { order.push('sig'); });"
+                "Promise.resolve().then(function() { order.push('micro'); });"
+                "testObj.value = 7;"
+                "order.push('after');"
+                "order.join(',')"));
+            QQuickJSValue order2 = qEng.evaluate(QStringLiteral("order.join(',')"));
+            TEST_RESULT("Microtasks: nested signal callback does not drain the queue",
+                        order1.toString() == QStringLiteral("sig,after")
+                            && order2.toString() == QStringLiteral("sig,after,micro"),
+                        QStringLiteral("join1='%1' join2='%2' - the nested callback drained the microtask queue")
+                            .arg(order1.toString()).arg(order2.toString()));
+
+            // Invalid QDateTime/QDate/QTime convert to an Invalid Date (V4
+            // parity), never to the 1970 epoch: the method-return path and
+            // the QVariant setProperty path.
+            QQuickJSValue dates = qEng.evaluate(QStringLiteral(
+                "String(testObj.invalidDateTime()) + '|' + String(testObj.invalidDate())"
+                " + '|' + String(testObj.invalidTime())"));
+            qEng.globalObject().setProperty(QStringLiteral("invDt"), QVariant(QDateTime()));
+            qEng.globalObject().setProperty(QStringLiteral("invDate"), QVariant(QDate()));
+            qEng.globalObject().setProperty(QStringLiteral("invTime"), QVariant(QTime()));
+            QQuickJSValue dates2 = qEng.evaluate(QStringLiteral(
+                "String(invDt) + '|' + String(invDate) + '|' + String(invTime)"));
+            TEST_RESULT("Convert: invalid QDateTime/QDate/QTime are Invalid Date",
+                        dates.toString() == QStringLiteral("Invalid Date|Invalid Date|Invalid Date")
+                            && dates2.toString() == QStringLiteral("Invalid Date|Invalid Date|Invalid Date"),
+                        QStringLiteral("method='%1' variant='%2' - an invalid date became the epoch")
+                            .arg(dates.toString()).arg(dates2.toString()));
+
+            // QTime -> Date is real V4 parity (probed against live Qt 6.12 in
+            // UTC and Europe/Moscow): a real Date whose epoch is the LOCAL
+            // QDateTime(1971-04-01, time) - the "April Fools' day" anchor
+            // qtdeclarative uses for time-without-a-date. The epoch is
+            // therefore TZ-dependent; the test computes the expected value
+            // with the same QDateTime construction, so it holds in any zone.
+            // Property read, method return and QVariant setProperty paths.
+            const qint64 qtimeAnchorEpoch =
+                QDateTime(QDate(1971, 4, 1), QTime(13, 45, 36, 150)).toMSecsSinceEpoch();
+            qEng.globalObject().setProperty(QStringLiteral("timeVar"), QVariant(QTime(13, 45, 36, 150)));
+            QQuickJSValue epochRes = qEng.evaluate(QStringLiteral(
+                "var e = testObj.timeProp.getTime();"
+                "var f = testObj.echoTime(testObj.timeProp).getTime();"
+                "var g = timeVar.getTime(); e + ',' + f + ',' + g"));
+            const QString epochWant = QString::number(qtimeAnchorEpoch) + QLatin1Char(',')
+                + QString::number(qtimeAnchorEpoch) + QLatin1Char(',') + QString::number(qtimeAnchorEpoch);
+            TEST_RESULT("Convert: QTime Date epoch is the local 1971-04-01 anchor (V4 parity)",
+                        epochRes.toString() == epochWant,
+                        QStringLiteral("got='%1' want='%2' - QTime anchor diverges from V4")
+                            .arg(epochRes.toString(), epochWant));
+
+            // QDate -> Date anchors the UTC midnight of that date (V4 parity,
+            // probed in UTC and Europe/Moscow; qv4dateobject.cpp builds
+            // d.startOfDay(QTimeZone::UTC)). Unlike the QTime anchor above
+            // the epoch is therefore timezone-independent. Property read and
+            // QVariant setProperty paths; the Date -> QDate argument round
+            // trip is covered by the dual-engine parity suite below, because
+            // in negative-offset zones it legitimately shifts the date - an
+            // inherited V4 wart, not something to assert away.
+            robj->setDateProp(QDate(2020, 5, 17));
+            const qint64 qdateEpoch =
+                QDateTime::fromString(QStringLiteral("2020-05-17T00:00:00Z"), Qt::ISODateWithMs)
+                    .toMSecsSinceEpoch();
+            qEng.globalObject().setProperty(QStringLiteral("dateV"), QVariant(QDate(2020, 5, 17)));
+            QQuickJSValue dEpochRes = qEng.evaluate(QStringLiteral(
+                "var a = testObj.dateProp.getTime();"
+                "var b = dateV.getTime(); a + ',' + b"));
+            const QString dEpochWant = QString::number(qdateEpoch) + QLatin1Char(',')
+                + QString::number(qdateEpoch);
+            TEST_RESULT("Convert: QDate Date epoch is the UTC midnight of that date (V4 parity)",
+                        dEpochRes.toString() == dEpochWant,
+                        QStringLiteral("got='%1' want='%2' - QDate anchor diverges from V4")
+                            .arg(dEpochRes.toString(), dEpochWant));
+
+            // V4 parity (probed against live Qt 6.12): toVariant() does NOT
+            // punch through Proxies - quickjs-ng 0.18's JS_IsArray stopped
+            // doing it, and V4's QVariant conversion enumerates proxied
+            // arrays as maps with index keys just the same. Pinned so a
+            // future "fix" cannot silently change the shape.
+            {
+                QQuickJSValue pa = qEng.evaluate(QStringLiteral("new Proxy([1,2,3],{})"));
+                QVariant va = pa.toVariant();
+                const bool arrayMap = va.metaType().id() == QMetaType::QVariantMap
+                    && va.toMap().size() == 3 && va.toMap().value(QStringLiteral("1")).toInt() == 2;
+                TEST_RESULT("Convert: Proxy(array).toVariant() is an index-keyed map (V4 parity)",
+                            arrayMap,
+                            QStringLiteral("type='%1' - proxy punching changed the shape")
+                                .arg(QString::fromLatin1(va.metaType().name())));
+                QQuickJSValue po = qEng.evaluate(QStringLiteral("new Proxy({a:1,b:'x'},{})"));
+                QVariant vo = po.toVariant();
+                TEST_RESULT("Convert: Proxy(object).toVariant() is a map (V4 parity)",
+                            vo.metaType().id() == QMetaType::QVariantMap && vo.toMap().size() == 2,
+                            QStringLiteral("type='%1'").arg(QString::fromLatin1(vo.metaType().name())));
+                QQuickJSValue pd = qEng.evaluate(QStringLiteral("new Proxy(new Date(123),{})"));
+                QVariant vd = pd.toVariant();
+                TEST_RESULT("Convert: Proxy(Date).toVariant() is a map, not a QDateTime (V4 parity)",
+                            vd.metaType().id() == QMetaType::QVariantMap,
+                            QStringLiteral("type='%1'").arg(QString::fromLatin1(vd.metaType().name())));
+            }
+
+            // L-5 (probed against live Qt 6.12): a NULL QString converts to
+            // an EMPTY JS string, not to JS null; a NULL QByteArray converts
+            // to an EMPTY ArrayBuffer (byteLength 0), exactly like V4 (V4's
+            // own toScriptValue of a QByteArray is an ArrayBuffer view too).
+            {
+                QString nullStr;
+                QByteArray nullBa;
+                const QQuickJSValue jNullStr = qEng.toScriptValue<QString>(nullStr);
+                const QQuickJSValue jNullBa = qEng.toScriptValue<QByteArray>(nullBa);
+                const QQuickJSValue baLen = qEng.evaluate(QStringLiteral(
+                    "(function(v){ try { return 'len=' + v.byteLength; } catch(e){ return 'ERR'; } })"))
+                    .call(QList<QQuickJSValue>() << jNullBa);
+                TEST_RESULT("Convert: null QString gives '' and null QByteArray an empty ArrayBuffer (V4 parity)",
+                            jNullStr.isString() && jNullStr.toString().isEmpty() && !jNullStr.isNull()
+                                && jNullBa.isObject() && baLen.toString() == QStringLiteral("len=0"),
+                            QStringLiteral("str: null=%1 string=%2; ba: object=%3 %4")
+                                .arg(jNullStr.isNull()).arg(jNullStr.isString()).arg(jNullBa.isObject()).arg(baLen.toString()));
+            }
+
+            // M-3: prototype-chain classification. A Proxy itself is not an
+            // Error object (class check), so errorType() reports NoError for
+            // one; the REACHABLE trap scenario is an Error re-parented onto
+            // a Proxy - the in-loop prototype fetch throws and must classify
+            // as GenericError with no sticky exception left behind.
+            {
+                QQuickJSValue rawProxy = qEng.evaluate(QStringLiteral(
+                    "new Proxy(new Error('x'), { getPrototypeOf() { throw 1; } })"));
+                const QQuickJSValue::ErrorType proxyType = rawProxy.errorType();
+                QQuickJSValue chainErr = qEng.evaluate(QStringLiteral(
+                    "var e = new Error('x');"
+                    "Object.setPrototypeOf(e, new Proxy(Error.prototype, { getPrototypeOf() { throw 1; } })); e"));
+                const QQuickJSValue::ErrorType et = chainErr.errorType();
+                const bool nextClean = qEng.evaluate(QStringLiteral("1+1")).toInt() == 2
+                    && !qEng.hasError();
+                TEST_RESULT("Error: throwing prototype-chain trap yields GenericError with no sticky exception",
+                            proxyType == QQuickJSValue::NoError
+                                && et == QQuickJSValue::GenericError && nextClean,
+                            QStringLiteral("proxy=%1 chain=%2 nextClean=%3")
+                                .arg(static_cast<int>(proxyType)).arg(static_cast<int>(et)).arg(nextClean));
+            }
+
+            // Q9 (V4 parity, probed against live Qt 6.12): a sticky interrupt
+            // replaces even a REAL pending exception with the plain
+            // "Interrupted" error - V4 behaves the same way.
+            {
+                QQuickJSEngine iEng;
+                iEng.setInterrupted(true);
+                QQuickJSValue ir = iEng.evaluate(QStringLiteral(
+                    "var o = { get x() { throw new TypeError('REAL'); } }; o.x"));
+                TEST_RESULT("Interrupt: sticky interrupt wins over a pending real error (V4 parity)",
+                            ir.isError() && ir.toString() == QStringLiteral("Error: Interrupted"),
+                            QStringLiteral("got='%1'").arg(ir.toString()));
+                iEng.setInterrupted(false);
+            }
+
+            // L-3: a QByteArray property name with an embedded NUL installs
+            // the FULL name (the QString/atom path), not a truncated one.
+            {
+                const QByteArray nulName(QByteArray("a\0b", 3));
+                const int fortyTwo = 42;
+                qEng.setProperty(nulName, qEng.toScriptValue<int>(fortyTwo));
+                const QQuickJSValue v = qEng.evaluate(QStringLiteral(
+                    "typeof globalThis['a\\u0000b'] !== 'undefined' ? globalThis['a\\u0000b'] : 'missing'"));
+                TEST_RESULT("API: setProperty(QByteArray) keeps embedded NUL in the name",
+                            v.toInt() == 42,
+                            QStringLiteral("got='%1' - the name was truncated at the NUL").arg(v.toString()));
+            }
+
+            // Q3 (probed against live Qt 6.12): console.count() without
+            // arguments uses the EMPTY label, like Qt's own qml console
+            // (": 1"), not Chromium's "default".
+            {
+                QQuickJSEngine cEng;
+                cEng.installExtensions(QQuickJSEngine::ConsoleExtension);
+                bool sawEmptyLabel = false;
+                {
+                    MessageCaptureGuard guard;
+                    cEng.evaluate(QStringLiteral("console.count()"));
+                    for (const QString& m : g_capturedMessages)
+                        if (m.contains(QLatin1String("[JS console] : 1"))) sawEmptyLabel = true;
+                }
+                TEST_RESULT("Console: count() without label prints ': 1' (qml parity)",
+                            sawEmptyLabel,
+                            "the empty label was replaced by a 'default' label");
+            }
+
+            // Argument counts (V4 parity, live Qt 6.12): missing arguments
+            // throw "Insufficient arguments" instead of silently filling
+            // value-initialized defaults; extra arguments are ignored; C++
+            // default arguments resolve through moc's truncated synthetic
+            // signatures; same-name overloads select by argument type.
+            QQuickJSValue miss = qEng.evaluate(QStringLiteral(
+                "try { testObj.needTwo(1); 'ran'; } catch (e) { e.message; }"));
+            TEST_RESULT("QObject: missing arguments throw 'Insufficient arguments'",
+                        miss.toString() == QStringLiteral("Insufficient arguments"),
+                        QStringLiteral("got='%1' - missing arguments were silently defaulted").arg(miss.toString()));
+            TEST_RESULT("QObject: extra arguments are ignored",
+                        qEng.evaluate("testObj.needTwo(1, 'a', true)").toString() == QStringLiteral("1,a"),
+                        "an extra argument changed the outcome");
+            TEST_RESULT("QObject: default arguments resolve via truncated signatures",
+                        qEng.evaluate("testObj.withDefaults(1)").toString() == QStringLiteral("1,7")
+                            && qEng.evaluate("testObj.withDefaults(1, 2)").toString() == QStringLiteral("1,2"),
+                        "the default-argument signature was not selected");
+            TEST_RESULT("QObject: overloads select by argument type",
+                        qEng.evaluate("testObj.ovOverload(42)").toString() == QStringLiteral("int:42")
+                            && qEng.evaluate("testObj.ovOverload('x')").toString() == QStringLiteral("str:x"),
+                        "the wrong overload was selected");
+
+            // Stale deadline: after the previous run's timeout quota
+            // expired, a C++-driven accessor entry (a getter through
+            // property()) must start a FRESH quota, not inherit the dead
+            // one. No evaluate() may run between the sleep and the read.
+            {
+                QQuickJSEngine tEng;
+                tEng.setExecutionTimeoutMs(150);
+                QQuickJSValue getterObj = tEng.evaluate(QStringLiteral(
+                    "({ get slow() { var s = 0; for (var i = 0; i < 1000000; ++i) s += i; return s; } })"));
+                QThread::msleep(400);   // the old deadline is long past
+                QQuickJSValue v = getterObj.property(QStringLiteral("slow"));
+                TEST_RESULT("Limit: stale deadline does not kill a fresh accessor entry",
+                            !v.isError() && v.isNumber(),
+                            QStringLiteral("v='%1' - the getter was interrupted by the previous run's deadline")
+                                .arg(v.toString()));
+            }
+
+            // qsTr/qsTranslate/qsTrId with a non-integral n: ToInt32 coercion
+            // (NaN -> 0, huge -> 0), no UB. The UBSan gate turns the old raw
+            // double-to-int cast into a runtime error here.
+            qEng.installExtensions(QQuickJSEngine::TranslationExtension);
+            QQuickJSValue tr1 = qEng.evaluate(QStringLiteral("qsTr('src', '', NaN)"));
+            QQuickJSValue tr2 = qEng.evaluate(QStringLiteral("qsTranslate('ctx', 'src', '', 1e100)"));
+            QQuickJSValue tr3 = qEng.evaluate(QStringLiteral("qsTrId('id', NaN)"));
+            TEST_RESULT("qsTr family: non-integral n coerces via ToInt32",
+                        tr1.toString() == QStringLiteral("src")
+                            && tr2.toString() == QStringLiteral("src")
+                            && tr3.toString() == QStringLiteral("id"),
+                        QStringLiteral("tr1='%1' tr2='%2' tr3='%3'")
+                            .arg(tr1.toString()).arg(tr2.toString()).arg(tr3.toString()));
+
+            delete robj;
+        }
     }
 
     // 15. BigInt Support
@@ -2130,6 +2608,37 @@ static void runAllTests(const bool runDangerous) {
         parity("FastPath: qint64 method arg+return", "testObj.echoBigInt(41) + 1 === 42");
         parity("FastPath: uint method arg+return", "testObj.echoUint(3000000000) === 3000000000");
         parity("FastPath: QDate property is a Date", "Object.prototype.toString.call(testObj.dateProp) === '[object Date]'");
+        parity("FastPath: QTime property is a Date (V4 1971-04-01 anchor)", "Object.prototype.toString.call(testObj.timeProp) === '[object Date]'");
+        parity("FastPath: QTime Date local getters", "var t = testObj.timeProp; t.getFullYear() + '-' + (t.getMonth()+1) + '-' + t.getDate() + ' ' + t.getHours() + ':' + t.getMinutes() + ':' + t.getSeconds() + '.' + t.getMilliseconds()");
+        parity("FastPath: QTime Date epoch", "String(testObj.timeProp.getTime())");
+        parity("FastPath: QTime method arg+return round-trip", "var t = testObj.echoTime(testObj.timeProp); t instanceof Date && t.getTime() === testObj.timeProp.getTime() ? 'ok' : 'bad'");
+        parity("FastPath: string into QTime property parses", "testObj.timeProp = '09:05:07'; var t = testObj.timeProp; t.getHours() + ':' + t.getMinutes() + ':' + t.getSeconds()");
+        parity("FastPath: Date into QTime arg takes local time-of-day", "var d = new Date(2020, 4, 17, 13, 45); var t = testObj.echoTime(d); t.getHours() + ':' + t.getMinutes()");
+        parity("FastPath: number into QTime arg rejected", "try { testObj.echoTime(12345); 'no-throw' } catch (e) { e instanceof TypeError ? 'type-error' : 'other' }");
+        // QDate -> Date anchors the UTC midnight of the date, and Date ->
+        // QDate takes the local date (both probed against live Qt 6.12 in
+        // UTC and Europe/Moscow). The write below goes through the
+        // Date -> QDate local-date conversion, so dateProp holds
+        // QDate(2020-05-17) in both engines before the epoch is read back;
+        // the round trip then reports 'bad' in negative-offset zones on
+        // BOTH engines - an inherited V4 wart, pinned as-is.
+        parity("FastPath: QDate Date epoch is UTC midnight (V4 parity)", "testObj.dateProp = new Date(2020, 4, 17, 12, 0); String(testObj.dateProp.getTime())");
+        parity("FastPath: QDate Date toISOString", "testObj.dateProp.toISOString()");
+        parity("FastPath: QDate Date UTC getters", "var d = testObj.dateProp; d.getUTCFullYear() + '-' + (d.getUTCMonth()+1) + '-' + d.getUTCDate() + ' ' + d.getUTCHours() + ':' + d.getUTCMinutes() + ':' + d.getUTCSeconds()");
+        parity("FastPath: QDate method arg+return round-trip", "var t = testObj.echoDate(testObj.dateProp); t instanceof Date && t.getTime() === testObj.dateProp.getTime() ? 'ok' : 'bad'");
+        parity("FastPath: Date into QDate arg takes the local date", "var d = new Date(2020, 4, 17, 13, 45); var r = testObj.echoDate(d); r.getUTCFullYear() + '-' + (r.getUTCMonth()+1) + '-' + r.getUTCDate()");
+        // The QTBUG-92466 edge (probed against live Qt 6.12 in
+        // America/New_York): a date-only ISO string is the UTC midnight,
+        // whose local wall time falls on the previous day in a
+        // negative-offset zone - the UTC date wins, on both engines. A
+        // NaN Date passes/reads as the invalid target value silently,
+        // without a TypeError, in every date/time slot - also V4 parity,
+        // probed in both zones.
+        parity("FastPath: date-only ISO string into QDate arg keeps the date (QTBUG-92466)", "var t = testObj.echoDate(new Date('2020-05-17')); t.getTime() === new Date('2020-05-17').getTime() ? 'ok' : 'bad'");
+        parity("FastPath: NaN Date into QDate arg is a silent invalid date (V4 parity)", "var t = testObj.echoDate(new Date(NaN)); isNaN(t.getTime()) ? 'invalid' : 'valid'");
+        parity("FastPath: NaN Date into QDate property writes silently (V4 parity)", "testObj.dateProp = new Date(NaN); isNaN(testObj.dateProp.getTime()) ? 'invalid' : 'valid'");
+        parity("FastPath: NaN Date into QTime arg is a silent invalid time (V4 parity)", "var t = testObj.echoTime(new Date(NaN)); isNaN(t.getTime()) ? 'invalid' : 'valid'");
+        parity("FastPath: NaN Date into QDateTime arg is a silent invalid datetime (V4 parity)", "var t = testObj.echoDateTime(new Date(NaN)); isNaN(t.getTime()) ? 'invalid' : 'valid'");
         parity("FastPath: string -> float keeps generic coercion", "testObj.floatProp = '2.5'; testObj.floatProp === 2.5");
         QQuickJSValue bigRes = qEng.evaluate(QStringLiteral("testObj.bigProp = 9007199254740993n; testObj.bigProp === 9007199254740993n"));
         TEST_RESULT("FastPath: qint64 property keeps BigInt precision (engine-specific)",
@@ -2614,6 +3123,36 @@ static void runAllTests(const bool runDangerous) {
                         QStringLiteral("consumed=%1 wasRangeError=%2")
                             .arg(thread.pendingConsumed)
                             .arg(thread.pendingWasRangeError));
+        }
+
+        // Re-entrant signal emission with a disconnect in the outer frame:
+        // the receiver's execution state must be a DEPTH counter, not a
+        // flag - the nested emission's exit must not clear the "executing"
+        // state while the outer callback frame is still on the stack, or
+        // the disconnect deletes the receiver under the live ExecGuard
+        // (heap-use-after-free on unpatched code).
+        {
+            qInfo().noquote() << QStringLiteral(">>> Re-entrant signal + disconnect (use-after-free on unpatched code)");
+            QQuickJSEngine qEng;
+            TestObject* obj = new TestObject();
+            qEng.globalObject().setProperty("testObj", qEng.newQObject(obj));
+            QQuickJSValue r = qEng.evaluate(QStringLiteral(
+                "var calls = 0;"
+                "function cb(v) {"
+                "    calls++;"
+                "    if (calls === 1) {"
+                "        testObj.value = 42;"                      // nested emission of the same signal
+                "        testObj.valueChanged.disconnect(cb);"      // the outer frame is still executing
+                "    }"
+                "}"
+                "testObj.valueChanged.connect(cb);"
+                "testObj.value = 1;"
+                "calls;"));
+            TEST_RESULT("Signal: re-entrant emission + disconnect in the outer frame",
+                        r.toInt() == 2 && obj->getValue() == 42,
+                        QStringLiteral("calls=%1 value=%2 - the receiver died under a live frame")
+                            .arg(r.toInt()).arg(obj->getValue()));
+            delete obj;
         }
 
         // Foreign engine value should be rejected by setProperty
@@ -3657,6 +4196,30 @@ static void runAllTests(const bool runDangerous) {
                             .arg(qtOk).arg(qOk)
                             .arg(qtNs.property(QStringLiteral("ok")).toBool())
                             .arg(qNs.property(QStringLiteral("ok")).toBool()));
+        }
+
+        // An own enumerable "__proto__" property of the registered value is a
+        // plain named export: the snapshot must define it as an own property,
+        // not install it as the snapshot's prototype (a plain JS_SetProperty
+        // on "__proto__" does exactly that, leaving the export declared but
+        // never filled).
+        {
+            QQuickJSEngine qEng;
+            QQuickJSValue val = qEng.evaluate(QString::fromUtf8(
+                "(function(){ var o = { b: 2 }; "
+                "Object.defineProperty(o, '__proto__', "
+                "{ value: 42, enumerable: true, writable: true, configurable: true }); "
+                "return o; })()"));
+            const bool registered = qEng.registerModule(QStringLiteral("protomod.mjs"), val);
+            writeModule(QStringLiteral("useproto.mjs"),
+                "import * as m from \"protomod.mjs\";\n"
+                "export const protoOk = (m.__proto__ === 42 && m.b === 2 && m.default.b === 2);\n");
+            QQuickJSValue ns = qEng.importModule(moduleDir.filePath(QStringLiteral("useproto.mjs")));
+            TEST_RESULT("RegModule: own '__proto__' property exports as a plain value",
+                        registered && !ns.isError() && ns.property(QStringLiteral("protoOk")).toBool(),
+                        QStringLiteral("registered=%1 protoOk=%2 - the export was lost to the prototype")
+                            .arg(registered)
+                            .arg(ns.property(QStringLiteral("protoOk")).toBool()));
         }
 
         // Registered modules are matched by the bare specifier from any

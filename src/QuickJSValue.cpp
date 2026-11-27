@@ -35,23 +35,17 @@ QQuickJSValue QQuickJSValue::executeJsCall(QQuickJSEngine* engine, JSContext* c,
         return QQuickJSValue::fromException(engine);
     }
 
-    const bool topLevel = (engine->m_evalDepth == 0);
-    if (topLevel) {
-        engine->resetExecutionState();
-        // Starved entry (see QQuickJSEngine::evaluate()): the window below
-        // this anchor is inside the guard's safety margin; refuse with the
-        // same catchable RangeError before entering JS_Call.
-        if (Q_UNLIKELY(engine->m_stackStarved)) {
-            return engine->newErrorObject(QQuickJSValue::RangeError,
-                                           QStringLiteral("Maximum call stack size exceeded"));
-        }
+    // Entry bookkeeping shared by every JS-running path: at depth 0 a fresh
+    // quota (timeout deadline, step budget), a stack-guard re-anchor at the
+    // actual entry frame, and the end-of-tick rejection flush on the way out.
+    JsEntryScope entryScope(engine);
+    // Starved entry (see QQuickJSEngine::evaluate()): the window below this
+    // anchor is inside the guard's safety margin; refuse with the same
+    // catchable RangeError before entering JS_Call.
+    if (Q_UNLIKELY(entryScope.starved())) {
+        return engine->newErrorObject(QQuickJSValue::RangeError,
+                                       QStringLiteral("Maximum call stack size exceeded"));
     }
-
-    EvalDepthGuard depthGuard(engine->m_evalDepth);
-    // Declared after depthGuard so the flush (which may run user JS via reason
-    // toString) happens while the depth guard is still held. Top-level calls
-    // only: nested calls must not report the enclosing tick.
-    auto rejectionFlush = qScopeGuard([engine, topLevel]() { if (topLevel) engine->flushUnhandledRejections(); });
 
     // QJSEngine parity: an omitted thisObject binds the engine global object,
     // even for strict callees (which would otherwise see `this === undefined`).
@@ -69,13 +63,20 @@ QQuickJSValue QQuickJSValue::executeJsCall(QQuickJSEngine* engine, JSContext* c,
         errVal = QQuickJSValue::fromException(engine);
     }
 
-    if (engine->m_autoProcessPromises && JS_IsJobPending(engine->m_rt)) {
+    // Run-to-completion: only a TOP-LEVEL call drains the microtask queue;
+    // a call nested inside a running script (a host slot calling back into
+    // JS) leaves the drain to the outer entry, like V4.
+    if (entryScope.isTopLevel() && engine->m_autoProcessPromises && JS_IsJobPending(engine->m_rt)) {
         engine->processPendingJobs();
     }
 
-    // QJSEngine parity: a sticky interrupt flag yields an "Interrupted" error
-    // object for calls and constructions, even when the function body itself
-    // completed without hitting an interrupt check.
+    // QJSEngine parity (probed against live Qt 6.12): a sticky interrupt
+    // flag yields an "Interrupted" error object for calls and constructions,
+    // even when the function body itself completed without hitting an
+    // interrupt check - and it WINS over a real exception the call produced:
+    // V4 also replaces a pending real error with the plain "Interrupted"
+    // error in this combination (live probe: a getter that sets the
+    // interrupt flag and then throws reports only "Interrupted").
     if (engine->isInterrupted()) {
         return engine->newErrorObject(QQuickJSValue::GenericError, QStringLiteral("Interrupted"));
     }
@@ -262,6 +263,14 @@ QQuickJSValue::ErrorType QQuickJSValue::errorType() const {
         SyntaxError, TypeError, URIError,
     };
     ScopedJSValue proto(c, JS_GetPrototype(c, m_val));
+    if (JS_IsException(proto.value())) {
+        // The FIRST prototype fetch can itself throw (a Proxy
+        // getPrototypeOf trap): clear the pending exception and classify
+        // conservatively, exactly like a throwing trap deeper in the chain -
+        // leaving it pending would poison the next entry (invariant 11).
+        clearPendingException(c);
+        return GenericError;
+    }
     for (int hop = 0; hop < 16 && JS_IsObject(proto.value()); ++hop) {
         const void* protoPtr = JS_VALUE_GET_PTR(proto.value());
         const JSValue* const table = m_engine.data()->m_intrinsics.errorProtos;
@@ -310,6 +319,8 @@ bool QQuickJSValue::areArgsValid(const QList<QQuickJSValue>& args) const {
 bool QQuickJSValue::tryExtractErrorLineNumber(const char* name, QQuickJSValue& outResult) const {
     JSContext* c = ctx();
     if (!c) return false;
+    // Public API: a null name must not reach std::string_view(nullptr).
+    if (!name) return false;
 
     QQuickJSEngine* jsEngine = m_engine.data();
 
@@ -357,6 +368,11 @@ QQuickJSValue QQuickJSValue::property(const QString& name) const {
     ensureEngineThread();
     if (!isValid()) return QQuickJSValue();
 
+    // Property access can run user JS (getters on the prototype chain,
+    // Proxy traps): full entry bookkeeping, like the other JS entries.
+    QQuickJSEngine* jsEngine = m_engine.data();
+    JsEntryScope entryScope(jsEngine);
+
     if (JS_IsError(m_val) && (name == QLatin1String("lineNumber") || name == QLatin1String("line"))) {
         QQuickJSValue lineResult;
         if (tryExtractErrorLineNumber(name.toUtf8().constData(), lineResult)) {
@@ -378,6 +394,9 @@ QQuickJSValue QQuickJSValue::property(const QString& name) const {
 QQuickJSValue QQuickJSValue::property(const char* name) const {
     ensureEngineThread();
     if (!isValid() || !name) return QQuickJSValue();
+
+    QQuickJSEngine* jsEngine = m_engine.data();
+    JsEntryScope entryScope(jsEngine);
 
     if (JS_IsError(m_val) && (std::string_view(name) == "lineNumber" || std::string_view(name) == "line")) {
         QQuickJSValue lineResult;
@@ -407,6 +426,16 @@ int QQuickJSValue::toInt() const {
     JSContext* c = ctx();
     if (!c) return 0;
     if (JS_VALUE_GET_TAG(m_val) == JS_TAG_INT) return JS_VALUE_GET_INT(m_val);
+    // ToNumber of an object runs user code (valueOf/toString).
+    if (JS_IsObject(m_val)) {
+        JsEntryScope entryScope(m_engine.data());
+        int32_t i = 0;
+        if (JS_ToInt32(c, &i, m_val) < 0) {
+            clearPendingException(c);
+            return 0;
+        }
+        return i;
+    }
     int32_t i = 0;
     if (JS_ToInt32(c, &i, m_val) < 0) {
         clearPendingException(c);
@@ -421,6 +450,16 @@ quint32 QQuickJSValue::toUInt() const {
     if (!c) return 0;
     // ToUint32 wraps negative numbers like QJSEngine::toUInt() does.
     if (JS_VALUE_GET_TAG(m_val) == JS_TAG_INT) return static_cast<quint32>(JS_VALUE_GET_INT(m_val));
+    // ToNumber of an object runs user code (valueOf/toString).
+    if (JS_IsObject(m_val)) {
+        JsEntryScope entryScope(m_engine.data());
+        uint32_t u = 0;
+        if (JS_ToUint32(c, &u, m_val) < 0) {
+            clearPendingException(c);
+            return 0;
+        }
+        return u;
+    }
     uint32_t u = 0;
     if (JS_ToUint32(c, &u, m_val) < 0) {
         clearPendingException(c);
@@ -446,9 +485,22 @@ double QQuickJSValue::toDouble() const {
     ensureEngineThread();
     JSContext* c = ctx();
     if (!c) return std::numeric_limits<double>::quiet_NaN();
-    const int tag = JS_VALUE_GET_TAG(m_val);
+    // NORM_TAG (not GET_TAG): under NaN boxing a float64's raw tag never
+    // equals JS_TAG_FLOAT64, and the fallback below would then route every
+    // plain number through the slower JS_ToFloat64 path.
+    const int tag = JS_VALUE_GET_NORM_TAG(m_val);
     if (tag == JS_TAG_INT) return static_cast<double>(JS_VALUE_GET_INT(m_val));
     if (tag == JS_TAG_FLOAT64) return JS_VALUE_GET_FLOAT64(m_val);
+    // ToNumber of an object runs user code (valueOf/toString).
+    if (JS_IsObject(m_val)) {
+        JsEntryScope entryScope(m_engine.data());
+        double d = 0.0;
+        if (JS_ToFloat64(c, &d, m_val) < 0) {
+            clearPendingException(c);
+            return std::numeric_limits<double>::quiet_NaN();
+        }
+        return d;
+    }
     double d = 0.0;
     if (JS_ToFloat64(c, &d, m_val) < 0) {
         clearPendingException(c);
@@ -461,6 +513,12 @@ QString QQuickJSValue::toString() const {
     ensureEngineThread();
     JSContext* c = ctx();
     if (!c) return QString();
+    // ToString of an object runs user code (toString/valueOf/
+    // Symbol.toPrimitive): entry bookkeeping applies; primitives (the hot
+    // path of reading values back) take the direct conversion.
+    if (JS_IsObject(m_val)) {
+        JsEntryScope entryScope(m_engine.data());
+    }
     return QuickJSConvert::jsToQString(c, m_val);
 }
 
@@ -534,6 +592,10 @@ QVariant QQuickJSValue::toVariant() const {
     if (!c) return QVariant();
     QQuickJSEngine* jsEngine = m_engine.data();
     ensureEngineThread();
+    // Deep conversion reads properties: getters may run user JS.
+    if (JS_IsObject(m_val)) {
+        JsEntryScope entryScope(jsEngine);
+    }
     return jsEngine->toVariant(m_val);
 }
 
@@ -542,6 +604,9 @@ QVariant QQuickJSValue::toVariant(ObjectConversionBehavior behavior) const {
     if (!c) return QVariant();
     QQuickJSEngine* jsEngine = m_engine.data();
     ensureEngineThread();
+    if (JS_IsObject(m_val)) {
+        JsEntryScope entryScope(jsEngine);
+    }
     return jsEngine->toVariant(m_val, behavior);
 }
 
@@ -565,6 +630,21 @@ bool QQuickJSValue::hasProperty(const char* name) const {
     ensureEngineThread();
     if (!isValid()) return false;
     JSContext* c = ctx();
+    // A Proxy target runs its `has` trap, which is user JS.
+    if (JS_IsObject(m_val)) {
+        JsEntryScope entryScope(m_engine.data());
+        ScopedJSAtom atom(c, name);
+        if (!atom.isValid()) {
+            clearPendingException(c);
+            return false;
+        }
+        int res = JS_HasProperty(c, m_val, atom);
+        if (res < 0) {
+            clearPendingException(c);
+            return false;
+        }
+        return res > 0;
+    }
     ScopedJSAtom atom(c, name);
     if (!atom.isValid()) {
         clearPendingException(c);
@@ -591,6 +671,23 @@ bool QQuickJSValue::hasProperty(const QString& name) const {
     if (!isValid()) return false;
     JSContext* c = ctx();
 
+    if (JS_IsObject(m_val)) {
+        // A Proxy target runs its `has` trap, which is user JS.
+        JsEntryScope entryScope(m_engine.data());
+        JSAtom atom = QuickJSConvert::cachedStringAtom(m_engine.data(), c, name);
+        if (atom == JS_ATOM_NULL) {
+            clearPendingException(c);
+            return false;
+        }
+        int res = JS_HasProperty(c, m_val, atom);
+        JS_FreeAtom(c, atom);
+        if (res < 0) {
+            clearPendingException(c);
+            return false;
+        }
+        return res > 0;
+    }
+
     JSAtom atom = QuickJSConvert::cachedStringAtom(m_engine.data(), c, name);
     if (atom == JS_ATOM_NULL) {
         clearPendingException(c);
@@ -608,7 +705,14 @@ bool QQuickJSValue::hasProperty(const QString& name) const {
 
 void QQuickJSValue::setProperty(const char* name, const QQuickJSValue& value) {
     ensureEngineThread();
-    if (!isValid() || !isSameContext(value)) return;
+    if (!isValid() || !name || !isSameContext(value)) return;
+
+    // The write can run a setter on the prototype chain: entry bookkeeping
+    // applies. On a starved stack the write runs under the emergency
+    // budget; a setter too deep to fit throws, and the write becomes the
+    // same silent no-op as any other failure of this void API.
+    QQuickJSEngine* jsEngine = m_engine.data();
+    JsEntryScope entryScope(jsEngine);
 
     JSContext* c = ctx();
     JSValue dup = JS_DupValue(c, value.m_val);
@@ -621,6 +725,21 @@ bool QQuickJSValue::deleteProperty(const char* name) {
     ensureEngineThread();
     if (!isValid()) return false;
     JSContext* c = ctx();
+    // A Proxy target runs its deleteProperty trap, which is user JS.
+    if (JS_IsObject(m_val)) {
+        JsEntryScope entryScope(m_engine.data());
+        ScopedJSAtom atom(c, name);
+        if (!atom.isValid()) {
+            clearPendingException(c);
+            return false;
+        }
+        int res = JS_DeleteProperty(c, m_val, atom, 0);
+        if (res < 0) {
+            clearPendingException(c);
+            return false;
+        }
+        return res == 1;
+    }
     ScopedJSAtom atom(c, name);
     if (!atom.isValid()) {
         clearPendingException(c);
@@ -647,6 +766,23 @@ bool QQuickJSValue::deleteProperty(const QString& name) {
     if (!isValid()) return false;
     JSContext* c = ctx();
 
+    if (JS_IsObject(m_val)) {
+        // A Proxy target runs its deleteProperty trap, which is user JS.
+        JsEntryScope entryScope(m_engine.data());
+        JSAtom atom = QuickJSConvert::cachedStringAtom(m_engine.data(), c, name);
+        if (atom == JS_ATOM_NULL) {
+            clearPendingException(c);
+            return false;
+        }
+        int res = JS_DeleteProperty(c, m_val, atom, 0);
+        JS_FreeAtom(c, atom);
+        if (res < 0) {
+            clearPendingException(c);
+            return false;
+        }
+        return res == 1;
+    }
+
     JSAtom atom = QuickJSConvert::cachedStringAtom(m_engine.data(), c, name);
     if (atom == JS_ATOM_NULL) {
         clearPendingException(c);
@@ -666,6 +802,27 @@ bool QQuickJSValue::hasOwnProperty(const char* name) const {
     ensureEngineThread();
     if (!isValid() || !name) return false;
     JSContext* c = ctx();
+
+    // A Proxy target runs its getOwnPropertyDescriptor trap, which is user JS.
+    if (JS_IsObject(m_val)) {
+        JsEntryScope entryScope(m_engine.data());
+        ScopedJSAtom atom(c, name);
+        if (!atom.isValid()) {
+            clearPendingException(c);
+            return false;
+        }
+        JSPropertyDescriptor desc;
+        const int res = JS_GetOwnProperty(c, &desc, m_val, atom);
+        if (res < 0) {
+            clearPendingException(c);
+            return false;
+        }
+        if (res == 0) return false;
+        JS_FreeValue(c, desc.value);
+        JS_FreeValue(c, desc.getter);
+        JS_FreeValue(c, desc.setter);
+        return true;
+    }
 
     ScopedJSAtom atom(c, name);
     if (!atom.isValid()) {
@@ -702,6 +859,29 @@ bool QQuickJSValue::hasOwnProperty(const QString& name) const {
     if (!isValid()) return false;
     JSContext* c = ctx();
 
+    if (JS_IsObject(m_val)) {
+        // A Proxy target runs its getOwnPropertyDescriptor trap, which is
+        // user JS.
+        JsEntryScope entryScope(m_engine.data());
+        JSAtom atom = QuickJSConvert::cachedStringAtom(m_engine.data(), c, name);
+        if (atom == JS_ATOM_NULL) {
+            clearPendingException(c);
+            return false;
+        }
+        JSPropertyDescriptor desc;
+        const int res = JS_GetOwnProperty(c, &desc, m_val, atom);
+        JS_FreeAtom(c, atom);
+        if (res < 0) {
+            clearPendingException(c);
+            return false;
+        }
+        if (res == 0) return false;
+        JS_FreeValue(c, desc.value);
+        JS_FreeValue(c, desc.getter);
+        JS_FreeValue(c, desc.setter);
+        return true;
+    }
+
     JSAtom atom = QuickJSConvert::cachedStringAtom(m_engine.data(), c, name);
     if (atom == JS_ATOM_NULL) {
         clearPendingException(c);
@@ -728,6 +908,9 @@ bool QQuickJSValue::hasOwnProperty(const QString& name) const {
 QQuickJSValue QQuickJSValue::prototype() const {
     ensureEngineThread();
     if (!isValid() || !JS_IsObject(m_val)) return QQuickJSValue();
+    QQuickJSEngine* jsEngine = m_engine.data();
+    // A Proxy target runs its getPrototypeOf trap, which is user JS.
+    JsEntryScope entryScope(jsEngine);
     JSContext* c = ctx();
     JSValue proto = JS_GetPrototype(c, m_val);
     if (JS_IsException(proto)) {
@@ -743,6 +926,9 @@ void QQuickJSValue::setPrototype(const QQuickJSValue& prototype) {
     // Only an object or JS null is a valid prototype; anything else is
     // ignored, matching QJSEngine::setPrototype().
     if (!JS_IsObject(prototype.m_val) && !JS_IsNull(prototype.m_val)) return;
+    QQuickJSEngine* jsEngine = m_engine.data();
+    // A Proxy target runs its setPrototypeOf trap, which is user JS.
+    JsEntryScope entryScope(jsEngine);
     JSContext* c = ctx();
     if (JS_SetPrototype(c, m_val, prototype.m_val) < 0) {
         clearPendingException(c);
@@ -752,6 +938,8 @@ void QQuickJSValue::setPrototype(const QQuickJSValue& prototype) {
 QQuickJSValue QQuickJSValue::property(quint32 arrayIndex) const {
     ensureEngineThread();
     if (!isValid()) return QQuickJSValue();
+    QQuickJSEngine* jsEngine = m_engine.data();
+    JsEntryScope entryScope(jsEngine);
     JSContext* c = ctx();
     JSValue propVal = JS_GetPropertyUint32(c, m_val, arrayIndex);
 
@@ -772,6 +960,9 @@ void QQuickJSValue::setProperty(QStringView name, const QQuickJSValue& value) {
 void QQuickJSValue::setProperty(const QString& name, const QQuickJSValue& value) {
     ensureEngineThread();
     if (!isValid() || !isSameContext(value)) return;
+
+    QQuickJSEngine* jsEngine = m_engine.data();
+    JsEntryScope entryScope(jsEngine);
 
     JSContext* c = ctx();
 
@@ -795,6 +986,7 @@ void QQuickJSValue::setProperty(const QString& name, const QVariant& value) {
     if (!c) return;
     QQuickJSEngine* jsEngine = m_engine.data();
     if (!jsEngine) return;
+    ensureEngineThread();
     JSValue v = jsEngine->toJSValue(value);
     if (JS_IsException(v)) {
         clearPendingException(c);
@@ -812,6 +1004,7 @@ void QQuickJSValue::setProperty(const char* name, const QVariant& value) {
     if (!c || !name) return;
     QQuickJSEngine* jsEngine = m_engine.data();
     if (!jsEngine) return;
+    ensureEngineThread();
     JSValue v = jsEngine->toJSValue(value);
     if (JS_IsException(v)) {
         clearPendingException(c);
@@ -823,6 +1016,10 @@ void QQuickJSValue::setProperty(const char* name, const QVariant& value) {
 void QQuickJSValue::setProperty(quint32 arrayIndex, const QQuickJSValue& value) {
     ensureEngineThread();
     if (!isValid() || !isSameContext(value)) return;
+
+    QQuickJSEngine* jsEngine = m_engine.data();
+    JsEntryScope entryScope(jsEngine);
+
     JSContext* c = ctx();
     if (JS_SetPropertyUint32(c, m_val, arrayIndex, JS_DupValue(c, value.m_val)) < 0) {
         clearPendingException(c);
@@ -834,6 +1031,7 @@ void QQuickJSValue::setProperty(quint32 arrayIndex, const QVariant& value) {
     if (!c) return;
     QQuickJSEngine* jsEngine = m_engine.data();
     if (!jsEngine) return;
+    ensureEngineThread();
     JSValue v = jsEngine->toJSValue(value);
     if (JS_IsException(v)) {
         clearPendingException(c);
@@ -848,6 +1046,15 @@ bool QQuickJSValue::equals(const QQuickJSValue& other) const {
     JSContext* c = ctx();
     // ECMA-262 abstract equality: the check can run user code (valueOf)
     // and report an exception instead of a verdict.
+    if (JS_IsObject(m_val) || JS_IsObject(other.m_val)) {
+        JsEntryScope entryScope(m_engine.data());
+        const int res = JS_IsEqual(c, m_val, other.m_val);
+        if (res < 0) {
+            clearPendingException(c);
+            return false;
+        }
+        return res != 0;
+    }
     const int res = JS_IsEqual(c, m_val, other.m_val);
     if (res < 0) {
         clearPendingException(c);
@@ -857,6 +1064,7 @@ bool QQuickJSValue::equals(const QQuickJSValue& other) const {
 }
 
 bool QQuickJSValue::strictlyEquals(const QQuickJSValue& other) const {
+    ensureEngineThread();
     if (!isValid() || !isSameContext(other)) return false;
     JSContext* c = ctx();
     return JS_IsStrictEqual(c, m_val, other.m_val);
@@ -919,6 +1127,12 @@ bool QQuickJSValue::instanceOf(const QQuickJSValue& other) const {
     JSContext* c = ctx();
     if (!c) return false;
 
+    // instanceof consults @@hasInstance, which may be user code - and the
+    // SPEC runs it based on the RIGHT operand regardless of the left one's
+    // type (OrdinaryHasInstance is reached through the method even for a
+    // primitive left side), so the entry bookkeeping cannot be gated on
+    // JS_IsObject(m_val). Nested (depth > 0) this is a pair of integer ops.
+    JsEntryScope entryScope(m_engine.data());
     int res = JS_IsInstanceOf(c, m_val, other.m_val);
     if (res < 0) {
         clearPendingException(c);

@@ -22,6 +22,9 @@ public:
     static JSValue getMetaProperty(QQuickJSEngine* engine, JSContext* ctx, JSQObjectData* data, const MetaCacheEntry& entry);
     static JSValue getMethodProxy(QQuickJSEngine* engine, JSContext* ctx, JSQObjectData* data, JSAtom prop, const MetaCacheEntry& entry);
     static JSValue createMethodProxy(QQuickJSEngine* engine, JSContext* ctx, JSQObjectData* data, JSAtom prop, const MetaCacheEntry& entry, JSClassID classId);
+    // Rebinds the wrapper's cached metaobject when the QObject's dynamic
+    // metaobject changed at runtime (one pointer compare on the happy path).
+    static bool refreshMetaCacheIfChanged(QQuickJSEngine* engine, JSQObjectData* data);
 
     static int qobject_get_own_property(JSContext* ctx, JSPropertyDescriptor *desc, JSValueConst obj, JSAtom prop);
     static int qobject_get_own_property_names(JSContext* ctx, JSPropertyEnum** ptab, uint32_t* plen, JSValueConst obj);

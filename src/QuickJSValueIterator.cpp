@@ -33,7 +33,7 @@ QString QQuickJSValueIterator::name() const {
     JSContext* c = ctx();
     if (!c || m_current < 0 || m_current >= static_cast<qint64>(m_count)) return QString();
     m_object.ensureEngineThread();
-    const QString& name = QuickJSConvert::atomName(m_object.engine(), c, m_props[m_current].atom);
+    const QString name = QuickJSConvert::atomName(m_object.engine(), c, m_props[m_current].atom);
     if (name.isNull()) return QString();
     return name;
 }
@@ -42,6 +42,9 @@ QQuickJSValue QQuickJSValueIterator::value() const {
     JSContext* c = ctx();
     if (!c || m_current < 0 || m_current >= static_cast<qint64>(m_count)) return QQuickJSValue();
     m_object.ensureEngineThread();
+    // The read can run a getter (user JS): entry bookkeeping applies, like
+    // the other property reads.
+    JsEntryScope entryScope(m_object.engine());
     JSValue val = JS_GetProperty(c, m_object.jsVal(), m_props[m_current].atom);
     if (JS_IsException(val)) {
         // A getter threw: mirror QJSValueIterator, which swallows the
@@ -79,6 +82,12 @@ void QQuickJSValueIterator::reset(const QQuickJSValue& value) {
     // JS_GPN_STRING_MASK: own string-keyed properties, enumerability
     // disregarded - the closest match to V4's ownPropertyKeys()-based
     // QJSValueIterator (which also skips symbols but keeps "length" on arrays).
+    //
+    // For a Proxy the enumeration runs the ownKeys trap - user JS - so the
+    // entry bookkeeping applies like for value(): a stale deadline from a
+    // previous run must not abort the trap poll with a phantom interrupt
+    // (which would surface as a silently exhausted iterator).
+    JsEntryScope entryScope(value.engine());
     if (JS_GetOwnPropertyNames(c, &m_props, &m_count, value.jsVal(), JS_GPN_STRING_MASK) < 0) {
         m_props = nullptr;
         m_count = 0;
