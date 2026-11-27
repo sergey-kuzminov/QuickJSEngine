@@ -339,9 +339,18 @@ QString QuickJSConvert::atomName(QQuickJSEngine* engine, JSContext* ctx, JSAtom 
     // above the limit the caller gets an uncached copy (one QString
     // refcount per call - the price of a stable by-value contract).
     QString name;
-    ScopedCString key(ctx, JS_AtomToCString(ctx, atom));
+    // Length-aware render: JS property names may contain embedded
+    // NULs, and JS_AtomToCString-based QString::fromUtf8(const char*)
+    // would truncate the name at the first one - two distinct JS keys
+    // ("a\0b", "a\0c") would silently merge into one QVariantMap key.
+    // V4 keeps such keys whole (probed against live Qt 6.12:
+    // map size 2, keys 61 00 62 / 61 00 63); JS_AtomToCStringLen carries
+    // the byte length for exactly this. Symbols render as "Symbol(...)"
+    // with the same length either way.
+    size_t keyLen = 0;
+    ScopedCString key(ctx, JS_AtomToCStringLen(ctx, &keyLen, atom));
     if (key.isValid()) {
-        name = QString::fromUtf8(key.value());
+        name = QString::fromUtf8(key.value(), static_cast<qsizetype>(keyLen));
         if (engine->m_atomNameCache.size() < AtomNameCacheLimit) {
             JSAtom dupAtom = JS_DupAtom(ctx, atom);
             if (dupAtom != JS_ATOM_NULL) {

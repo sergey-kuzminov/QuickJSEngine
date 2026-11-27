@@ -414,7 +414,10 @@ QQuickJSValue QQuickJSValue::property(const char* name) const {
 }
 
 QQuickJSValue QQuickJSValue::property(const QByteArray& name) const {
-    return property(name.constData());
+    // Route through the QString overload (atom cache): a QByteArray with an
+    // embedded NUL would be truncated at constData() (same fix as
+    // QQuickJSEngine::setProperty(QByteArray), L-3).
+    return property(QString::fromUtf8(name));
 }
 
 QQuickJSValue QQuickJSValue::property(QStringView name) const {
@@ -515,9 +518,15 @@ QString QQuickJSValue::toString() const {
     if (!c) return QString();
     // ToString of an object runs user code (toString/valueOf/
     // Symbol.toPrimitive): entry bookkeeping applies; primitives (the hot
-    // path of reading values back) take the direct conversion.
+    // path of reading values back) take the direct conversion. The scope
+    // must COVER the conversion (V2, r14): destroyed earlier, the user JS
+    // would run at m_evalDepth == 0 - a re-entrant entry from a
+    // toString/valueOf would see a fresh top level and reset the quota and
+    // re-anchor the guard mid-JS (the hazard the evaluate() invariant
+    // describes). Same shape as toInt()/toDouble() above.
     if (JS_IsObject(m_val)) {
         JsEntryScope entryScope(m_engine.data());
+        return QuickJSConvert::jsToQString(c, m_val);
     }
     return QuickJSConvert::jsToQString(c, m_val);
 }
@@ -592,9 +601,11 @@ QVariant QQuickJSValue::toVariant() const {
     if (!c) return QVariant();
     QQuickJSEngine* jsEngine = m_engine.data();
     ensureEngineThread();
-    // Deep conversion reads properties: getters may run user JS.
+    // Deep conversion reads properties: getters may run user JS. The scope
+    // must cover the conversion itself (V2, r14), like toString() above.
     if (JS_IsObject(m_val)) {
         JsEntryScope entryScope(jsEngine);
+        return jsEngine->toVariant(m_val);
     }
     return jsEngine->toVariant(m_val);
 }
@@ -604,8 +615,11 @@ QVariant QQuickJSValue::toVariant(ObjectConversionBehavior behavior) const {
     if (!c) return QVariant();
     QQuickJSEngine* jsEngine = m_engine.data();
     ensureEngineThread();
+    // Deep conversion reads properties: getters may run user JS; the
+    // scope covers the conversion (V2, r14).
     if (JS_IsObject(m_val)) {
         JsEntryScope entryScope(jsEngine);
+        return jsEngine->toVariant(m_val, behavior);
     }
     return jsEngine->toVariant(m_val, behavior);
 }
@@ -659,7 +673,8 @@ bool QQuickJSValue::hasProperty(const char* name) const {
 }
 
 bool QQuickJSValue::hasProperty(const QByteArray& name) const {
-    return hasProperty(name.constData());
+    // Length-aware routing, see property(QByteArray).
+    return hasProperty(QString::fromUtf8(name));
 }
 
 bool QQuickJSValue::hasProperty(QStringView name) const {
@@ -754,7 +769,8 @@ bool QQuickJSValue::deleteProperty(const char* name) {
 }
 
 bool QQuickJSValue::deleteProperty(const QByteArray& name) {
-    return deleteProperty(name.constData());
+    // Length-aware routing, see property(QByteArray).
+    return deleteProperty(QString::fromUtf8(name));
 }
 
 bool QQuickJSValue::deleteProperty(QStringView name) {
@@ -847,7 +863,8 @@ bool QQuickJSValue::hasOwnProperty(const char* name) const {
 }
 
 bool QQuickJSValue::hasOwnProperty(const QByteArray& name) const {
-    return hasOwnProperty(name.constData());
+    // Length-aware routing, see property(QByteArray).
+    return hasOwnProperty(QString::fromUtf8(name));
 }
 
 bool QQuickJSValue::hasOwnProperty(QStringView name) const {
@@ -950,7 +967,8 @@ QQuickJSValue QQuickJSValue::property(quint32 arrayIndex) const {
 }
 
 void QQuickJSValue::setProperty(const QByteArray& name, const QQuickJSValue& value) {
-    setProperty(name.constData(), value);
+    // Length-aware routing, see property(QByteArray).
+    setProperty(QString::fromUtf8(name), value);
 }
 
 void QQuickJSValue::setProperty(QStringView name, const QQuickJSValue& value) {

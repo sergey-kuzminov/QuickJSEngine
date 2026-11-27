@@ -128,17 +128,23 @@ JSValue QQuickJSEngine::toJSValueImpl(const QVariant& var, int depth) {
         return QuickJSConvert::int64ToJS(m_ctx, var.toLongLong());
     }
 
+    // constData() casts, not the QVariant accessors: the case guarantees
+    // the exact stored type, and toString()/toByteArray()/... would take a
+    // COW copy of the scalar on every conversion (S1, r14) - the container
+    // switch above already reads its payloads this way.
     switch (var.userType()) {
-    case QMetaType::QString: return qStringToJS(m_ctx, var.toString());
-    case QMetaType::QChar: return qStringToJS(m_ctx, QString(var.toChar()));
+    case QMetaType::QString:
+        return qStringToJS(m_ctx, *static_cast<const QString*>(var.constData()));
+    case QMetaType::QChar:
+        return qStringToJS(m_ctx, QString(*static_cast<const QChar*>(var.constData())));
     case QMetaType::QByteArray:
-        return QuickJSConvert::byteArrayToJS(m_ctx, var.toByteArray());
+        return QuickJSConvert::byteArrayToJS(m_ctx, *static_cast<const QByteArray*>(var.constData()));
     case QMetaType::QDateTime:
-        return QuickJSConvert::dateTimeToJS(m_ctx, var.toDateTime());
+        return QuickJSConvert::dateTimeToJS(m_ctx, *static_cast<const QDateTime*>(var.constData()));
     case QMetaType::QDate:
-        return QuickJSConvert::dateToJS(m_ctx, var.toDate());
+        return QuickJSConvert::dateToJS(m_ctx, *static_cast<const QDate*>(var.constData()));
     case QMetaType::QTime:
-        return QuickJSConvert::timeToJS(m_ctx, var.toTime());
+        return QuickJSConvert::timeToJS(m_ctx, *static_cast<const QTime*>(var.constData()));
     // The QVariant Qt builds for a JS null assigned to a QVariant-typed
     // property ("std::nullptr_t", V4 parity - see qobject_set_property):
     // it reads back as JS null.

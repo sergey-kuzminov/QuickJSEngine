@@ -509,9 +509,8 @@ int QuickJSQObjectProxy::qobject_set_property(JSContext* ctx, JSValueConst this_
             return safeMetacall(ctx, data->obj.data(), QMetaObject::WriteProperty, idx, a);
         };
 
-        const MetaCacheEntry* it = data->metaCache->find(prop);
         if (!refreshMetaCacheIfChanged(engine, data)) return -1;
-        it = data->metaCache->find(prop);
+        const MetaCacheEntry* it = data->metaCache->find(prop);
         if (it && it->kind == MetaCacheEntry::Kind::Property) {
             const auto& entry = *it;
 
@@ -612,6 +611,16 @@ int QuickJSQObjectProxy::qobject_set_property(JSContext* ctx, JSValueConst this_
                     if (!writeProp(entry.index, a)) return -1;
                     return 1;
                 }
+                // V4 parity (probed against live Qt 6.12): a failed numeric
+                // coercion is always a JS exception from user code (valueOf/
+                // toString throwing, Symbol, BigInt) - the double/float set
+                // path propagates it, so does the argument path. Propagate
+                // the pending exception instead of falling through to the
+                // generic QVariant route, which would replace the user's
+                // error with a generic "incompatible type" TypeError. A
+                // failure without a pending exception is not produced by the
+                // vendor; keep the old fallback for it defensively.
+                if (JS_HasException(ctx)) return -1;
                 clearPendingException(ctx);
             } else if (metaType == QMetaType::Bool) {
                 int b = JS_ToBool(ctx, val);
@@ -628,6 +637,9 @@ int QuickJSQObjectProxy::qobject_set_property(JSContext* ctx, JSValueConst this_
                     if (!writeProp(entry.index, a)) return -1;
                     return 1;
                 }
+                // Same as the Int branch above: V4's double/float set
+                // path propagates a valueOf exception; do not swallow it.
+                if (JS_HasException(ctx)) return -1;
                 clearPendingException(ctx);
             } else if (metaType == QMetaType::QString) {
                 ScopedJSValue strVal(ctx, JS_ToString(ctx, val));
@@ -654,9 +666,15 @@ int QuickJSQObjectProxy::qobject_set_property(JSContext* ctx, JSValueConst this_
                 if (!writeProp(entry.index, a)) return -1;
                 return 1;
             } else if (metaType == QMetaType::Float) {
-                // Exact numeric tags only: other shapes keep the generic
+                // Exact numeric tags: other shapes keep the generic
                 // toVariant()+convert() route below (its coercion for
-                // strings/objects is not a plain cast).
+                // strings/BigInt is not a plain cast). Objects are the
+                // exception (probed against live Qt 6.12): V4 coerces
+                // them through valueOf - a returning valueOf assigns, a
+                // throwing one propagates, a valueOf-less object (and a
+                // QObject wrapper) yields NaN - while the generic QVariant
+                // route would report "incompatible type" and lose the
+                // user's exception.
                 const int tag = JS_VALUE_GET_TAG(val);
                 if (tag == JS_TAG_INT || JS_TAG_IS_FLOAT64(tag)) {
                     const double num = (tag == JS_TAG_INT)
@@ -666,6 +684,16 @@ int QuickJSQObjectProxy::qobject_set_property(JSContext* ctx, JSValueConst this_
                     void* a[1] = { &v };
                     if (!writeProp(entry.index, a)) return -1;
                     return 1;
+                } else if (tag == JS_TAG_OBJECT) {
+                    double d = 0;
+                    if (JS_ToFloat64(ctx, &d, val) == 0) {
+                        float v = static_cast<float>(d);
+                        void* a[1] = { &v };
+                        if (!writeProp(entry.index, a)) return -1;
+                        return 1;
+                    }
+                    if (JS_HasException(ctx)) return -1;
+                    clearPendingException(ctx);
                 }
             } else if (metaType == QMetaType::LongLong) {
                 // Integral int/float64 tags only: QVariant::convert rounds
@@ -928,18 +956,25 @@ JSValue QuickJSQObjectProxy::js_method_invoke(JSContext* ctx, JSValueConst func_
             if (expectedType != QMetaType::UnknownType && expectedType != QMetaType::QVariant) {
                 if (expectedType == QMetaType::Int) {
                     if (JS_ToInt32(ctx, &nativeArgs[i].i, argv[i]) == 0) { args[i+1] = &nativeArgs[i].i; converted = true; }
-                    else clearPendingException(ctx);
+                    // V4 parity (probed against live Qt 6.12): the argument
+                    // path propagates the ORIGINAL exception thrown by
+                    // valueOf/toString instead of replacing it with a generic
+                    // "incompatible type" TypeError.
+                    else if (JS_HasException(ctx)) return JS_EXCEPTION;
                 } else if (expectedType == QMetaType::Bool) {
                     int b = JS_ToBool(ctx, argv[i]);
                     if (b >= 0) { nativeArgs[i].b = (b != 0); args[i+1] = &nativeArgs[i].b; converted = true; }
-                    else clearPendingException(ctx);
+                    else if (JS_HasException(ctx)) return JS_EXCEPTION;
                 } else if (expectedType == QMetaType::Double) {
                     if (JS_ToFloat64(ctx, &nativeArgs[i].d, argv[i]) == 0) { args[i+1] = &nativeArgs[i].d; converted = true; }
-                    else clearPendingException(ctx);
+                    else if (JS_HasException(ctx)) return JS_EXCEPTION;
                 } else if (expectedType == QMetaType::Float) {
-                    // Exact numeric tags only: other shapes (strings, objects,
-                    // BigInt) keep the generic toVariant()+convert() route
-                    // below, whose coercion is not a plain cast.
+                    // Exact numeric tags: strings/BigInt keep the generic
+                    // toVariant()+convert() route below, whose coercion is
+                    // not a plain cast. Objects coerce through valueOf
+                    // (probed against live Qt 6.12: a returning valueOf
+                    // assigns, a throwing one propagates, a valueOf-less
+                    // object or a QObject wrapper yields NaN).
                     const int tag = JS_VALUE_GET_TAG(argv[i]);
                     if (tag == JS_TAG_INT) {
                         nativeArgs[i].f = static_cast<float>(JS_VALUE_GET_INT(argv[i]));
@@ -947,6 +982,12 @@ JSValue QuickJSQObjectProxy::js_method_invoke(JSContext* ctx, JSValueConst func_
                     } else if (JS_TAG_IS_FLOAT64(tag)) {
                         nativeArgs[i].f = static_cast<float>(JS_VALUE_GET_FLOAT64(argv[i]));
                         args[i+1] = &nativeArgs[i].f; converted = true;
+                    } else if (tag == JS_TAG_OBJECT) {
+                        double d = 0;
+                        if (JS_ToFloat64(ctx, &d, argv[i]) == 0) {
+                            nativeArgs[i].f = static_cast<float>(d);
+                            args[i+1] = &nativeArgs[i].f; converted = true;
+                        } else if (JS_HasException(ctx)) return JS_EXCEPTION;
                     }
                 } else if (expectedType == QMetaType::LongLong) {
                     // Integral int/float64 tags only: QVariant::convert

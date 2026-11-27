@@ -197,6 +197,18 @@ public:
         return r.isError() ? -2 : r.toInt();
     }
 
+    // Nested evaluate() probe (r13, D-62): invoked from JS that runs inside engine
+    // entries - the pending-exception report (a hostile "stack" getter) or a
+    // script-installed global setter behind setProperty(). The nested entry
+    // must be a NESTED entry: it may not drain the microtask queue
+    // (run-to-completion belongs to the outer top-level tick) and must not
+    // re-arm the guard/quota machinery.
+    Q_INVOKABLE int reenterEval(const QString& code) {
+        if (!m_jsEngine) return -1;
+        QQuickJSValue r = m_jsEngine->evaluate(code);
+        return r.isError() ? -2 : r.toInt();
+    }
+
     Q_INVOKABLE void takeUnregistered(UnregisteredType t) { Q_UNUSED(t); ++m_unregArgs; }
     Q_INVOKABLE UnregisteredType makeUnregistered() { return UnregisteredType(); }
     UnregisteredType getUProp() const { return UnregisteredType(); }
@@ -299,6 +311,8 @@ public:
     Q_INVOKABLE void takeBa(const QByteArray& b) { m_ba = b; }
     // A no-op sink whose argument coercion runs user JS (valueOf)
     Q_INVOKABLE int sink(int v) { return v; }
+    // Float twin of sink() for the valueOf-propagation coverage (r13, D-62)
+    Q_INVOKABLE float sinkFlt(float v) { return v; }
 
     // Enables the execution timeout while a script is running
     Q_INVOKABLE void enableTimeout(int ms) { if (m_jsEngine) m_jsEngine->setExecutionTimeoutMs(static_cast<quint32>(ms)); }
@@ -670,14 +684,20 @@ static void runPropertyTypeCoercionTests()
     RegressionTestObject* obj = new RegressionTestObject();
     qEng.globalObject().setProperty("testObj", qEng.newQObject(obj));
 
+    // (r13, D-62): a failed numeric coercion propagates the VENDOR TypeError
+    // instead of the generic "incompatible type" text (V4's double
+    // set-path throws a TypeError for a Symbol as well - probed; its int
+    // set-path wraps the object into a QVariant and reports a generic
+    // "Cannot assign QJSValue to int" Error - the documented divergence
+    // of the wrapper's ECMAScript-coercion contract).
     QQuickJSValue r1 = qEng.evaluate("testObj.intProp = Symbol()");
     TEST_RESULT("QProperty: Symbol to int throws TypeError",
-                r1.isError() && r1.toString().contains("incompatible type", Qt::CaseInsensitive) && obj->intProp() == -1,
+                r1.isError() && r1.toString().contains("cannot convert symbol to number", Qt::CaseInsensitive) && obj->intProp() == -1,
                 QStringLiteral("silent default write: r='%1' intProp=%2").arg(r1.toString()).arg(obj->intProp()));
 
     QQuickJSValue r2 = qEng.evaluate("testObj.doubleProp = Symbol()");
     TEST_RESULT("QProperty: Symbol to double throws TypeError",
-                r2.isError() && r2.toString().contains("incompatible type", Qt::CaseInsensitive) && obj->doubleProp() == -1.0,
+                r2.isError() && r2.toString().contains("cannot convert symbol to number", Qt::CaseInsensitive) && obj->doubleProp() == -1.0,
                 QStringLiteral("silent default write: r='%1'").arg(r2.toString()));
 
     QQuickJSValue r3 = qEng.evaluate("testObj.objProp = Symbol()");
@@ -782,6 +802,97 @@ static void runPropertyTypeCoercionTests()
     TEST_RESULT("QArgs: null to QByteArray argument is a null QByteArray (V4 parity)",
                 obj->baProp().isNull(),
                 QStringLiteral("got='%1'").arg(QString::fromLatin1(obj->baProp())));
+
+    // (r13, D-62): a failed numeric coercion is always user JS (valueOf/toString
+    // throwing, Symbol, BigInt). V4 propagates the ORIGINAL exception -
+    // probed against live Qt 6.12 on the int/double/float property writes
+    // and the int/double/float method arguments; the wrapper must not
+    // replace it with a generic "incompatible type" TypeError.
+    {
+        // Sentinels: earlier tests in this function legitimately wrote
+        // 0/empty into these slots through the null-coercion table.
+        qEng.evaluate(QStringLiteral("testObj.intProp = 101; testObj.doubleProp = 102.5; testObj.floatProp = 103.5;"));
+        QQuickJSValue v1 = qEng.evaluate(
+            "try { testObj.intProp = { valueOf() { throw new Error('Original error'); } }; 'no-throw'; }"
+            " catch (e) { e.message; }");
+        TEST_RESULT("QCoerce: valueOf exception propagates from an int property write",
+                    v1.toString() == QStringLiteral("Original error") && obj->intProp() == 101,
+                    QStringLiteral("got='%1' intProp=%2").arg(v1.toString()).arg(obj->intProp()));
+        QQuickJSValue v2 = qEng.evaluate(
+            "try { testObj.doubleProp = { valueOf() { throw new Error('Original error'); } }; 'no-throw'; }"
+            " catch (e) { e.message; }");
+        TEST_RESULT("QCoerce: valueOf exception propagates from a double property write",
+                    v2.toString() == QStringLiteral("Original error") && obj->doubleProp() == 102.5,
+                    QStringLiteral("got='%1' dbl=%2").arg(v2.toString()).arg(obj->doubleProp()));
+        QQuickJSValue v3 = qEng.evaluate(
+            "try { testObj.floatProp = { valueOf() { throw new Error('Original error'); } }; 'no-throw'; }"
+            " catch (e) { e.message; }");
+        TEST_RESULT("QCoerce: valueOf exception propagates from a float property write",
+                    v3.toString() == QStringLiteral("Original error") && obj->floatProp() == 103.5f,
+                    QStringLiteral("got='%1' flt=%2").arg(v3.toString()).arg(obj->floatProp()));
+        QQuickJSValue v3b = qEng.evaluate(
+            "try { testObj.sinkFlt({ valueOf() { throw new Error('Original error'); } }); 'no-throw'; }"
+            " catch (e) { e.message; }");
+        TEST_RESULT("QCoerce: valueOf exception propagates from a float method argument",
+                    v3b.toString() == QStringLiteral("Original error"),
+                    QStringLiteral("got='%1' - the user's error was replaced").arg(v3b.toString()));
+        // Float object-coercion controls (V4 parity, probed): a returning
+        // valueOf assigns; a valueOf-less object (and a QObject wrapper)
+        // silently yields NaN - full ToNumber semantics, no TypeError.
+        QQuickJSValue v3c = qEng.evaluate(
+            "testObj.floatProp = { valueOf() { return 1.25; } }; testObj.floatProp;");
+        TEST_RESULT("QCoerce: returning valueOf coerces in a float property write (V4 parity)",
+                    v3c.toDouble() == 1.25 && obj->floatProp() == 1.25f,
+                    QStringLiteral("got='%1' flt=%2").arg(v3c.toString()).arg(obj->floatProp()));
+        QQuickJSValue v3d = qEng.evaluate(
+            "var r1 = testObj.sinkFlt({ valueOf() { return 1.25; } });"
+            "var r2 = testObj.sinkFlt({});"
+            "var r3 = testObj.sinkFlt(testObj);"
+            "String(r1) + ',' + String(r2) + ',' + String(r3);");
+        TEST_RESULT("QCoerce: float argument coerces objects - valueOf, NaN, wrapper NaN (V4 parity)",
+                    v3d.toString() == QLatin1String("1.25,NaN,NaN"),
+                    QStringLiteral("got='%1'").arg(v3d.toString()));
+        QQuickJSValue v4 = qEng.evaluate(
+            "try { testObj.sink({ valueOf() { throw new Error('Original error'); } }); 'no-throw'; }"
+            " catch (e) { e.message; }");
+        TEST_RESULT("QCoerce: valueOf exception propagates from an int method argument",
+                    v4.toString() == QStringLiteral("Original error"),
+                    QStringLiteral("got='%1' - the user's error was replaced").arg(v4.toString()));
+        QQuickJSValue v5 = qEng.evaluate(
+            "try { testObj.sink({ valueOf() { throw 'plain-string'; } }); 'no-throw'; }"
+            " catch (e) { typeof e + ':' + e; }");
+        TEST_RESULT("QCoerce: a thrown non-Error value keeps its shape",
+                    v5.toString() == QStringLiteral("string:plain-string"),
+                    QStringLiteral("got='%1'").arg(v5.toString()));
+        // Controls: a returning valueOf still coerces - our documented
+        // ECMAScript-coercion contract (V4's int set-path rejects objects
+        // outright with "Cannot assign QJSValue to int" - a pre-existing
+        // intentional divergence, unchanged by the propagation fix; V4's
+        // double set-path and both argument paths coerce, probed).
+        QQuickJSValue v6 = qEng.evaluate("testObj.sink({ valueOf() { return 7; } });");
+        TEST_RESULT("QCoerce: returning valueOf coerces in an int argument (control)",
+                    v6.toInt() == 7,
+                    QStringLiteral("got='%1'").arg(v6.toString()));
+        QQuickJSValue v7 = qEng.evaluate("testObj.intProp = { valueOf() { return 42; } }; testObj.intProp;");
+        TEST_RESULT("QCoerce: returning valueOf coerces in an int property write (control)",
+                    v7.toInt() == 42 && obj->intProp() == 42,
+                    QStringLiteral("got='%1' intProp=%2").arg(v7.toString()).arg(obj->intProp()));
+        QQuickJSValue v8 = qEng.evaluate("testObj.doubleProp = '2.5'; testObj.doubleProp;");
+        TEST_RESULT("QCoerce: string into a double property keeps generic coercion (control)",
+                    v8.toDouble() == 2.5 && obj->doubleProp() == 2.5,
+                    QStringLiteral("got='%1'").arg(v8.toString()));
+        // BigInt into an int argument: the vendor TypeError (quickjs.c
+        // "cannot convert BigInt to number") instead of a silent 1 through
+        // the QVariant fallback. V4's own evaluate() cannot parse BigInt
+        // literals in this position (SyntaxError, probed), so there is no
+        // V4 reference for the shape; the JS-semantics answer is a throw.
+        QQuickJSValue v9 = qEng.evaluate(
+            "try { testObj.sink(1n); 'no-throw'; } catch (e) { e.constructor.name + '/' + e.message; }");
+        TEST_RESULT("QCoerce: BigInt into an int argument throws the vendor TypeError",
+                    v9.toString().contains(QLatin1String("TypeError"))
+                        && v9.toString().contains(QLatin1String("cannot convert BigInt to number")),
+                    QStringLiteral("got='%1' - a silent conversion happened").arg(v9.toString()));
+    }
 
     // H-3: user JS running during argument/value conversion may
     // delete the target QObject; the metacall must be skipped with a
@@ -975,6 +1086,35 @@ static void runAllTests(const bool runDangerous) {
                         reports == 1,
                         QStringLiteral("reports=%1 - the report was lost until the next evaluate").arg(reports));
             delete obj;
+        }
+
+        // The same end-of-tick contract for the light accessors (r14, V2):
+        // the JsEntryScope of toString()/toVariant() must COVER the
+        // conversion - user JS inside an object's toString(), or a getter
+        // read by toVariant(), runs under the entry's bookkeeping, and a
+        // rejection it raises is flushed by that same entry (the scope's
+        // top-level exit). With the scope expiring before the conversion
+        // (the r13 bug) the report stays buffered and reports==0.
+        {
+            QQuickJSEngine qEng;
+            int reports = 0;
+            QString lastMsg;
+            QObject::connect(&qEng, &QQuickJSEngine::uncaughtException, [&](const QString& m, int) { reports++; lastMsg = m; });
+            QQuickJSValue obj = qEng.evaluate(
+                "({ toString() { Promise.reject(new Error('toStr rejection')); return 'ok'; } })");
+            reports = 0;
+            const QString s = obj.toString();
+            TEST_RESULT("Promise: Rejection inside toString reported by the entry",
+                        s == QLatin1String("ok") && reports == 1 && lastMsg.contains("toStr rejection"),
+                        QStringLiteral("s='%1' reports=%2 - the scope expired before the conversion ran").arg(s).arg(reports));
+
+            QQuickJSValue obj2 = qEng.evaluate(
+                "({ get x() { Promise.reject(new Error('getter rejection')); return 42; } })");
+            reports = 0;
+            const QVariant v = obj2.toVariant();
+            TEST_RESULT("Promise: Rejection inside toVariant getter reported by the entry",
+                        v.toMap().value("x").toInt() == 42 && reports == 1,
+                        QStringLiteral("reports=%1 - the scope expired before the conversion ran").arg(reports));
         }
 
         // Soft ceiling of the unhandled-rejection buffer (r8): with
@@ -2448,6 +2588,52 @@ static void runAllTests(const bool runDangerous) {
                             QStringLiteral("got='%1' - the name was truncated at the NUL").arg(v.toString()));
             }
 
+            // (r13, D-62): the QQuickJSValue QByteArray overloads keep embedded NULs
+            // as well (they used to truncate at constData()); V4's QString
+            // path preserves such names (probed), and Qt 6 QJSValue has no
+            // QByteArray overloads - the QString behavior is the reference.
+            {
+                QQuickJSValue holder = qEng.evaluate(QStringLiteral(
+                    "({ 'p\\u0000q': 11, 'p': 22 })"));
+                const QByteArray nulKey(QByteArray("p\0q", 3));
+                TEST_RESULT("API: value property(QByteArray) keeps embedded NUL",
+                            holder.property(nulKey).toInt() == 11
+                                && holder.property(QByteArray("p")).toInt() == 22,
+                            "the NUL name was truncated and hit the prefix property");
+                TEST_RESULT("API: value hasProperty/hasOwnProperty(QByteArray) keep embedded NUL",
+                            holder.hasProperty(nulKey) && holder.hasOwnProperty(nulKey)
+                                && !holder.hasProperty(QByteArray("p\0z", 3)),
+                            "the NUL name was truncated");
+                const QQuickJSValue ok = qEng.evaluate(QStringLiteral("'ok'"));
+                holder.setProperty(nulKey, ok);
+                TEST_RESULT("API: value setProperty(QByteArray) keeps embedded NUL",
+                            holder.property(nulKey).toString() == QStringLiteral("ok")
+                                && holder.property(QByteArray("p")).toInt() == 22,
+                            QStringLiteral("got='%1' - the write hit the prefix property")
+                                .arg(holder.property(nulKey).toString()));
+                // deleteProperty round trip on the NUL-named property
+                TEST_RESULT("API: value deleteProperty(QByteArray) keeps embedded NUL",
+                            holder.deleteProperty(nulKey)
+                                && !holder.hasProperty(nulKey)
+                                && holder.property(QByteArray("p")).toInt() == 22,
+                            "delete missed the NUL-named property");
+            }
+
+            // (r13, D-62): object -> QVariantMap keeps NUL-bearing keys whole (V4
+            // parity, probed: map size 2, keys 61 00 62 / 61 00 63); the
+            // old atomName() truncated at the first NUL and silently merged
+            // two distinct JS properties into one key.
+            {
+                const QVariant mv = qEng.evaluate(QStringLiteral(
+                    "({ ['a\\u0000b']: 11, ['a\\u0000c']: 22 })")).toVariant();
+                const QVariantMap map = mv.toMap();
+                const QString keyB = QString::fromUtf8(QByteArray("a\0b", 3));
+                const QString keyC = QString::fromUtf8(QByteArray("a\0c", 3));
+                TEST_RESULT("Convert: toVariant keeps embedded-NUL map keys (V4 parity)",
+                            map.size() == 2 && map.value(keyB).toInt() == 11 && map.value(keyC).toInt() == 22,
+                            QStringLiteral("size=%1 - distinct keys merged at the NUL").arg(map.size()));
+            }
+
             // Q3 (probed against live Qt 6.12): console.count() without
             // arguments uses the EMPTY label, like Qt's own qml console
             // (": 1"), not Chromium's "default".
@@ -3888,6 +4074,141 @@ static void runAllTests(const bool runDangerous) {
                         "script side effect visible after a preempted evaluate");
             TEST_RESULT("Throw: hasError false after preempted evaluate",
                         !qtEng.hasError() && !qEng.hasError(), "preempted evaluate left the error pending");
+        }
+
+        // (r13, D-62): the pending-exception REPORT itself runs user JS (a hostile
+        // "stack" getter, toString overrides, a C++ slot behind
+        // uncaughtException()). It must run under the entry bookkeeping: a
+        // re-entrant evaluate() from inside the report is a NESTED entry -
+        // it may not drain the microtask queue (run-to-completion belongs
+        // to the outer tick) and may not re-arm the guard/quota machinery
+        // as a false top level. Pre-fix, the re-entrant entry saw
+        // m_evalDepth == 0 and drained the queue during the report.
+        {
+            QQuickJSEngine qEng;
+            TestObject* obj = new TestObject();
+            obj->setJsEngine(&qEng);
+            qEng.globalObject().setProperty(QStringLiteral("testObj"), qEng.newQObject(obj));
+            const QQuickJSValue hostile = qEng.evaluate(QStringLiteral(
+                "var microLog = [];"
+                "var reenterResult = 'not-run';"
+                "var hostile = new Error('pending boom');"
+                "Object.defineProperty(hostile, 'stack', {"
+                "    get: function() {"
+                "        reenterResult = String(testObj.reenterEval("
+                "            'Promise.resolve().then(function(){ microLog.push(\"micro\"); }); 21+21'));"
+                "        return '    at fake (f.js:1:2)';"
+                "    }"
+                "});"
+                "hostile;"));
+            qEng.throwError(hostile);
+            QStringList stack;
+            QQuickJSValue r = qEng.evaluate(QStringLiteral("'not executed'"),
+                                            QStringLiteral("preempted.js"), 1, &stack);
+            TEST_RESULT("Reentry: pending-exception report survives a hostile stack getter",
+                        r.isError() && r.toString() == QLatin1String("Error: pending boom"),
+                        QStringLiteral("got='%1'").arg(r.toString()));
+            // the fake frame returned by the hostile getter flowed through
+            // the stack parser (func:line:col:file)
+            TEST_RESULT("Reentry: hostile stack getter output parsed into the trace",
+                        stack.size() == 1 && stack.first() == QLatin1String("fake:1:2:f.js"),
+                        QStringLiteral("got=%1").arg(stack.join(QLatin1Char('|'))));
+            // The script body of this very evaluate reads microLog BEFORE
+            // its own end-of-tick drain: a nested (non-draining) re-entrant
+            // entry leaves it empty here; a false top level would have run
+            // the microtask during the report already. This must be the
+            // FIRST evaluate after the preempted one - any intermediate
+            // top-level entry would drain the queue itself.
+            TEST_RESULT("Reentry: nested evaluate during the report does not drain microtasks",
+                        qEng.evaluate(QStringLiteral("microLog.length")).toInt() == 0,
+                        QStringLiteral("got=%1 - the queue was drained by a false top level")
+                            .arg(qEng.evaluate(QStringLiteral("microLog.length")).toInt()));
+            TEST_RESULT("Reentry: the stack getter's nested evaluate ran and returned",
+                        qEng.evaluate(QStringLiteral("reenterResult")).toString() == QLatin1String("42"),
+                        QStringLiteral("got='%1'").arg(qEng.evaluate(QStringLiteral("reenterResult")).toString()));
+            TEST_RESULT("Reentry: the microtask runs on the next top-level entry",
+                        qEng.evaluate(QStringLiteral("microLog.join(',')")).toString() == QLatin1String("micro"),
+                        QStringLiteral("got='%1'").arg(qEng.evaluate(QStringLiteral("microLog.join(',')")).toString()));
+            TEST_RESULT("Reentry: engine consistent after the hostile report",
+                        qEng.evaluate(QStringLiteral("1+1")).toInt() == 2 && !qEng.hasError(),
+                        "engine damaged");
+            delete obj;
+        }
+
+        // (r13, D-62): QQuickJSEngine::setProperty() on a script-installed global
+        // accessor runs the setter - user JS. It needs the entry bookkeeping
+        // (QQuickJSValue::setProperty has had it all along): the setter's
+        // nested engine calls are nested entries, and its JS runs under a
+        // FRESH quota instead of inheriting an expired timeout deadline.
+        {
+            QQuickJSEngine qEng;
+            TestObject* obj = new TestObject();
+            obj->setJsEngine(&qEng);
+            qEng.globalObject().setProperty(QStringLiteral("testObj"), qEng.newQObject(obj));
+            const QQuickJSValue setterSetup = qEng.evaluate(QStringLiteral(
+                "var setterLog = [];"
+                "Object.defineProperty(globalThis, 'gHostile', {"
+                "    set: function(v) { setterLog.push(v);"
+                "        String(testObj.reenterEval('Promise.resolve().then(function(){ setterLog.push(\"micro\"); }); 5')); }"
+                "});"));
+            TEST_RESULT("Reentry: setter fixture installed",
+                        !setterSetup.isError(),
+                        QStringLiteral("setup error: %1").arg(setterSetup.toString()));
+            qEng.setProperty(QStringLiteral("gHostile"), QVariant(7));
+            // Drain check FIRST: the script body of this very evaluate reads
+            // setterLog before its own end-of-tick drain; any intermediate
+            // top-level entry would drain the queue itself.
+            TEST_RESULT("Reentry: setter's nested evaluate does not drain microtasks",
+                        qEng.evaluate(QStringLiteral("setterLog.length")).toInt() == 1,
+                        QStringLiteral("got=%1 - the queue was drained by a false top level")
+                            .arg(qEng.evaluate(QStringLiteral("setterLog.length")).toInt()));
+            TEST_RESULT("Reentry: engine setProperty runs a script-installed global setter",
+                        qEng.evaluate(QStringLiteral("setterLog[0]")).toInt() == 7,
+                        QStringLiteral("got='%1' - the setter did not run")
+                            .arg(qEng.evaluate(QStringLiteral("String(setterLog[0])")).toString()));
+            TEST_RESULT("Reentry: setter microtask runs on the next top-level entry",
+                        qEng.evaluate(QStringLiteral("setterLog.join(',')")).toString() == QLatin1String("7,micro"),
+                        QStringLiteral("got='%1'").arg(qEng.evaluate(QStringLiteral("setterLog.join(',')")).toString()));
+            // A throwing setter stays a silent no-op of the void API (the
+            // pending exception is cleared), like any failed write.
+            qEng.evaluate(QStringLiteral(
+                "Object.defineProperty(globalThis, 'gThrow', {"
+                "    set: function(v) { throw new Error('setter boom'); }"
+                "});"));
+            qEng.setProperty(QStringLiteral("gThrow"), QVariant(1));
+            TEST_RESULT("Reentry: throwing setter is a silent no-op, engine consistent",
+                        !qEng.hasError() && qEng.evaluate(QStringLiteral("1+1")).toInt() == 2,
+                        "a throwing setter damaged the engine");
+            delete obj;
+        }
+
+        // (r13, D-62, quota half of the setProperty fix): the setter's JS runs under
+        // a fresh timeout deadline. Pre-fix, setProperty entered the engine
+        // without a scope: with the previous top-level entry's deadline long
+        // expired, the setter's first interrupt check aborted it with a
+        // non-catchable "Interrupted" (the same stale-deadline class H-2
+        // fixed for newErrorObject in r11).
+        {
+            QQuickJSEngine qEng;
+            TestObject* obj = new TestObject();
+            obj->setJsEngine(&qEng);
+            qEng.globalObject().setProperty(QStringLiteral("testObj"), qEng.newQObject(obj));
+            qEng.evaluate(QStringLiteral(
+                "var marker = 'none';"
+                "Object.defineProperty(globalThis, 'gSlow', {"
+                "    set: function(v) { var t0 = Date.now();"
+                "        while (Date.now() - t0 < 40) {} marker = 'set-done'; }"
+                "});"));
+            qEng.setExecutionTimeoutMs(250);
+            qEng.evaluate(QStringLiteral("1+1"));   // deadline := now + 250ms
+            QThread::msleep(400);                   // expires with no JS running
+            qEng.setProperty(QStringLiteral("gSlow"), QVariant(1));   // ~40ms of setter JS
+            TEST_RESULT("Reentry: setter runs under a fresh quota, not a stale deadline",
+                        qEng.evaluate(QStringLiteral("marker")).toString() == QLatin1String("set-done"),
+                        QStringLiteral("got='%1' - the setter inherited an expired timeout")
+                            .arg(qEng.evaluate(QStringLiteral("marker")).toString()));
+            qEng.setExecutionTimeoutMs(0);
+            delete obj;
         }
 
         // a pending error preempts call(): the function is not invoked

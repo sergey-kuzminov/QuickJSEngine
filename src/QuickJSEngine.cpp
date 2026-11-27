@@ -502,6 +502,10 @@ QQuickJSValue QQuickJSEngine::newErrorObject(QQuickJSValue::ErrorType errorType,
         return QQuickJSValue();
     }
 
+    // Materialize the message once (N1, r14): all three constructor
+    // branches below need the QString (and most the UTF-8) form.
+    const QString msg = message.toString();
+
     // quickjs-ng provides C constructors with the built-in prototypes for
     // these five classes: engine-created errors stay immune to scripts
     // replacing globalThis.TypeError etc. (QJSEngine parity — V4 also uses
@@ -510,7 +514,7 @@ QQuickJSValue QQuickJSEngine::newErrorObject(QQuickJSValue::ErrorType errorType,
     if (errorType != QQuickJSValue::EvalError && errorType != QQuickJSValue::URIError) {
         // "%s" stops at an embedded NUL; error messages are not expected
         // to contain one.
-        const QByteArray utf8 = message.toString().toUtf8();
+        const QByteArray utf8 = msg.toUtf8();
         JSValue err = JS_EXCEPTION;
         switch (errorType) {
         case QQuickJSValue::GenericError: err = JS_NewPlainError(m_ctx, "%s", utf8.constData()); break;
@@ -521,7 +525,7 @@ QQuickJSValue QQuickJSEngine::newErrorObject(QQuickJSValue::ErrorType errorType,
         default: break;   // unreachable: the remaining types are handled above
         }
         if (JS_IsException(err)) return QQuickJSValue::fromException(this);
-        restoreFullErrorMessage(m_ctx, err, message.toString());
+        restoreFullErrorMessage(m_ctx, err, msg);
         QQuickJSValue result(this, err, true);
         result.m_isError = true;
         return result;
@@ -543,10 +547,10 @@ QQuickJSValue QQuickJSEngine::newErrorObject(QQuickJSValue::ErrorType errorType,
     // metadata the host branches on, the message is the payload, and the C
     // path can neither recurse nor run script.
     if (Q_UNLIKELY(m_stackStarved)) {
-        const QByteArray utf8 = message.toString().toUtf8();
+        const QByteArray utf8 = msg.toUtf8();
         JSValue err = JS_NewPlainError(m_ctx, "%s", utf8.constData());
         if (JS_IsException(err)) return QQuickJSValue::fromException(this);
-        restoreFullErrorMessage(m_ctx, err, message.toString());
+        restoreFullErrorMessage(m_ctx, err, msg);
         QQuickJSValue result(this, err, true);
         result.m_isError = true;
         return result;
@@ -571,7 +575,7 @@ QQuickJSValue QQuickJSEngine::newErrorObject(QQuickJSValue::ErrorType errorType,
     ScopedJSValue ctor(m_ctx, JS_GetPropertyStr(m_ctx, global.value(), ctorName));
     if (consumeException(m_ctx, ctor.value())) return QQuickJSValue();
 
-    ScopedJSValue msgVal(m_ctx, qStringToJS(m_ctx, message.toString()));
+    ScopedJSValue msgVal(m_ctx, qStringToJS(m_ctx, msg));
     if (JS_IsException(msgVal.value())) return QQuickJSValue::fromException(this);
 
     JSValueConst argv[1] = { msgVal.value() };
@@ -868,6 +872,39 @@ void QQuickJSEngine::processPendingJobs() {
     }
 }
 
+// Shared tail of both evaluate() execution paths - the eval-cache hit and
+// the freshly compiled run (S2, r14): takes the raw JS_EvalFunction
+// result, wraps it exception-safely, drains the microtask queue on
+// top-level entries (run-to-completion), reports an uncaught exception
+// and applies the sticky-interrupt check. One copy instead of two that
+// used to drift apart comment by comment.
+QQuickJSValue QQuickJSEngine::finishEvaluationRun(JSValue ret, bool topLevel,
+                                                  QStringList* exceptionStackTrace) {
+    ScopedJSValue retScoped(m_ctx, ret);
+
+    const bool hadException = JS_IsException(retScoped.value());
+    QQuickJSValue errVal;
+    if (hadException) errVal = QQuickJSValue::fromException(this);
+
+    // Run-to-completion: only a top-level entry drains the microtask queue;
+    // a nested evaluate (from a getter or a host slot below a running
+    // script) leaves the drain to the outer entry, like V4.
+    if (topLevel && m_autoProcessPromises) processPendingJobs();
+
+    if (hadException) {
+        collectExceptionStackTrace(this, errVal.jsVal(), exceptionStackTrace);
+        processAndEmitException(m_ctx, errVal.jsVal());
+    }
+    // QJSEngine parity: a sticky interrupt flag yields an "Interrupted"
+    // error object even when the script completed without hitting an
+    // interrupt check.
+    if (isInterrupted()) {
+        return newErrorObject(QQuickJSValue::GenericError, QStringLiteral("Interrupted"));
+    }
+    if (hadException) return errVal;
+    return QQuickJSValue(this, retScoped.release(), true);
+}
+
 QQuickJSValue QQuickJSEngine::evaluate(const QString& script, const QString& fileName,
                                        int lineNumber, QStringList* exceptionStackTrace) {
     ensureEngineThread();
@@ -903,6 +940,21 @@ QQuickJSValue QQuickJSEngine::evaluate(const QString& script, const QString& fil
         }
     }
 
+    // Entry bookkeeping BEFORE the pending-exception report below: the
+    // report itself runs user JS - a hostile "stack" getter, an overridden
+    // Error.prototype.toString, or a C++ slot behind uncaughtException() can
+    // re-enter the engine. Without the depth guard such a re-entrant entry
+    // sees m_evalDepth == 0, treats itself as a fresh top level and calls
+    // resetExecutionState() mid-JS: the stack guard would re-anchor below the
+    // already-running JS frames (the exact hazard reanchorStackGuard()'s
+    // m_evalDepth check exists to prevent) and the timeout/step quota of the
+    // still-active report would be reset. The rejection flush is declared
+    // after depthGuard so the flush (which may run user JS via reason
+    // toString) happens while the depth guard is still held. Top-level calls
+    // only: nested evaluates must not report the enclosing tick.
+    EvalDepthGuard depthGuard(m_evalDepth);
+    auto rejectionFlush = qScopeGuard([this, topLevel]() { if (topLevel) flushUnhandledRejections(); });
+
     // QJSEngine parity: a pending exception (e.g. throwError() called from C++
     // between script executions) preempts evaluation: the script is not
     // executed and the pending error is returned, reported like any other
@@ -914,12 +966,6 @@ QQuickJSValue QQuickJSEngine::evaluate(const QString& script, const QString& fil
         return errVal;
     }
 
-    EvalDepthGuard depthGuard(m_evalDepth);
-    // Declared after depthGuard so the flush (which may run user JS via reason
-    // toString) happens while the depth guard is still held. Top-level calls
-    // only: nested evaluates must not report the enclosing tick.
-    auto rejectionFlush = qScopeGuard([this, topLevel]() { if (topLevel) flushUnhandledRejections(); });
-
     if (m_evalCacheEnabled && lineNumber == 1) {
         for (int i = 0; i < m_evalCache.size(); ++i) {
             if (m_evalCache[i].script == script && m_evalCache[i].fileName == fileName) {
@@ -927,31 +973,7 @@ QQuickJSValue QQuickJSEngine::evaluate(const QString& script, const QString& fil
                 const EvalCacheEntry& entry = m_evalCache.first();
 
                 JSValue bc = JS_DupValue(m_ctx, entry.bytecode);
-                JSValue ret = JS_EvalFunction(m_ctx, bc);
-                ScopedJSValue retScoped(m_ctx, ret);
-
-                const bool hadException = JS_IsException(retScoped.value());
-                QQuickJSValue errVal;
-                if (hadException) errVal = QQuickJSValue::fromException(this);
-
-                // Run-to-completion: only a top-level entry drains the
-                // microtask queue; a nested evaluate (from a getter or a host
-                // slot below a running script) leaves the drain to the outer
-                // entry, like V4.
-                if (topLevel && m_autoProcessPromises) processPendingJobs();
-
-                if (hadException) {
-                    collectExceptionStackTrace(this, errVal.jsVal(), exceptionStackTrace);
-                    processAndEmitException(m_ctx, errVal.jsVal());
-                }
-                // QJSEngine parity: a sticky interrupt flag yields an "Interrupted"
-                // error object even when the script completed without hitting
-                // an interrupt check.
-                if (isInterrupted()) {
-                    return newErrorObject(QQuickJSValue::GenericError, QStringLiteral("Interrupted"));
-                }
-                if (hadException) return errVal;
-                return QQuickJSValue(this, retScoped.release(), true);
+                return finishEvaluationRun(JS_EvalFunction(m_ctx, bc), topLevel, exceptionStackTrace);
             }
         }
     }
@@ -990,29 +1012,7 @@ QQuickJSValue QQuickJSEngine::evaluate(const QString& script, const QString& fil
         }
     }
 
-    JSValue ret = JS_EvalFunction(m_ctx, bc);
-    ScopedJSValue retScoped(m_ctx, ret);
-
-    const bool hadException = JS_IsException(retScoped.value());
-    QQuickJSValue errVal;
-    if (hadException) errVal = QQuickJSValue::fromException(this);
-
-    // Run-to-completion: only a top-level entry drains the microtask queue
-    // (see the eval-cache branch above).
-    if (topLevel && m_autoProcessPromises) processPendingJobs();
-
-    if (hadException) {
-        collectExceptionStackTrace(this, errVal.jsVal(), exceptionStackTrace);
-        processAndEmitException(m_ctx, errVal.jsVal());
-    }
-    // QJSEngine parity: a sticky interrupt flag yields an "Interrupted" error
-    // object even when the script completed without hitting an interrupt check.
-    if (isInterrupted()) {
-        return newErrorObject(QQuickJSValue::GenericError, QStringLiteral("Interrupted"));
-    }
-    if (hadException) return errVal;
-
-    return QQuickJSValue(this, retScoped.release(), true);
+    return finishEvaluationRun(JS_EvalFunction(m_ctx, bc), topLevel, exceptionStackTrace);
 }
 
 void QQuickJSEngine::setProperty(const char* name, const QQuickJSValue& value) {
@@ -1021,6 +1021,11 @@ void QQuickJSEngine::setProperty(const char* name, const QQuickJSValue& value) {
     if (value.m_engine.data() != this) {
         if (!(value.m_engine.isNull() && JS_IsUndefined(value.m_val))) return;
     }
+
+    // JS_SetPropertyStr runs user JS when the global object holds an
+    // accessor property (a script-installed setter): entry bookkeeping
+    // applies, like in the QString overload.
+    JsEntryScope entryScope(this);
 
     JSValue v = JS_DupValue(m_ctx, value.jsVal());
     if (JS_SetPropertyStr(m_ctx, m_globalObj, name, v) < 0) {
@@ -1043,6 +1048,14 @@ void QQuickJSEngine::setProperty(const QString& name, const QQuickJSValue& value
     if (value.m_engine.data() != this) {
         if (!(value.m_engine.isNull() && JS_IsUndefined(value.m_val))) return;
     }
+
+    // JS_SetProperty on the global object runs user JS when the property
+    // is a script-installed accessor (Object.defineProperty(globalThis,
+    // "x", {set: ...})): the setter needs the fresh quota and the
+    // re-anchored guard of a real entry, and a re-entrant engine call from
+    // inside it must see a nested depth, not a fresh top level
+    // (QQuickJSValue::setProperty has kept the same scope since D-57).
+    JsEntryScope entryScope(this);
 
     JSAtom atom = QuickJSConvert::cachedStringAtom(this, m_ctx, name);
     if (atom == JS_ATOM_NULL) {
@@ -1164,6 +1177,8 @@ JSMetaObjectCache* QQuickJSEngine::metaObjectCacheFor(const QMetaObject* meta) {
     const int propCount = meta->propertyCount();
 
     cache->entries.reserve(methodCount + propCount);
+    cache->methodAtoms.reserve(methodCount);
+    cache->propertyAtoms.reserve(propCount);
 
     for (int i = 0; i < methodCount; ++i) {
         QMetaMethod m = meta->method(i);

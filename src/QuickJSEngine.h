@@ -624,6 +624,12 @@ private:
     // exceptionStackTrace frame format; see the definition in the .cpp.
     static void collectExceptionStackTrace(QQuickJSEngine* engine, JSValueConst errVal, QStringList* out);
 
+    // Shared post-processing of a JS_EvalFunction result in evaluate(),
+    // common to the eval-cache hit and the freshly compiled path: the
+    // exception-safe wrap, the run-to-completion microtask drain, the
+    // uncaught-exception report and the sticky-interrupt check.
+    QQuickJSValue finishEvaluationRun(JSValue ret, bool topLevel, QStringList* exceptionStackTrace);
+
     static qint64 steadyNowMs() {
         return std::chrono::duration_cast<std::chrono::milliseconds>(
                    std::chrono::steady_clock::now().time_since_epoch()).count();
