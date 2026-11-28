@@ -502,7 +502,7 @@ QQuickJSValue QQuickJSEngine::newErrorObject(QQuickJSValue::ErrorType errorType,
         return QQuickJSValue();
     }
 
-    // Materialize the message once (N1, r14): all three constructor
+    // Materialize the message once: all three constructor
     // branches below need the QString (and most the UTF-8) form.
     const QString msg = message.toString();
 
@@ -535,17 +535,25 @@ QQuickJSValue QQuickJSEngine::newErrorObject(QQuickJSValue::ErrorType errorType,
     // the global constructor and CALLS it (JS_CallConstructor) - script-
     // visible execution, the only such branch in this function. The call
     // therefore needs the full entry bookkeeping (fresh timeout/step quota,
-    // guard re-anchor, rejection flush on exit) - without it, a
+    // guard re-anchor, tick-end drain and rejection flush) - without it, a
     // throwError(EvalError, ...) from C++ between runs under an enabled
     // setExecutionTimeoutMs would inherit the previous run's expired
     // deadline and abort with a non-cached InternalError "interrupted"
-    // instead of the requested error class. On a starved stack that is
-    // exactly what the entry refusal prevents (script execution under the
-    // emergency budget, where even the throw path may not fit); degrade to
-    // the plain C-constructed error instead (GenericError class,
+    // instead of the requested error class. The scope is created BEFORE
+    // the starved check below, so the flag describes THIS frame: at the
+    // top level the scope construction re-anchors the guard, and reading
+    // the flag earlier would see the previous entry's residue - a starved
+    // entry that already returned would silently degrade this error to a
+    // plain Error; when nested, the flag keeps the live value of the
+    // enclosing entry, which the raw check (not starved(), a top-level-
+    // only predicate) must keep honoring. On a starved stack script
+    // execution under the emergency budget is exactly what the entry
+    // refusal prevents (where even the throw path may not fit); degrade
+    // to the plain C-constructed error instead (GenericError class,
     // engine-internal prototype, message preserved): an error's class is
     // metadata the host branches on, the message is the payload, and the C
     // path can neither recurse nor run script.
+    JsEntryScope entryScope(this);
     if (Q_UNLIKELY(m_stackStarved)) {
         const QByteArray utf8 = msg.toUtf8();
         JSValue err = JS_NewPlainError(m_ctx, "%s", utf8.constData());
@@ -566,10 +574,6 @@ QQuickJSValue QQuickJSEngine::newErrorObject(QQuickJSValue::ErrorType errorType,
     case QQuickJSValue::URIError: ctorName = "URIError"; break;
     default: break;
     }
-
-    // Script-visible execution below (the global constructor call): full
-    // entry bookkeeping. Nested (depth > 0) this is a pair of integer ops.
-    JsEntryScope entryScope(this);
 
     ScopedJSValue global(m_ctx, JS_GetGlobalObject(m_ctx));
     ScopedJSValue ctor(m_ctx, JS_GetPropertyStr(m_ctx, global.value(), ctorName));
@@ -873,7 +877,7 @@ void QQuickJSEngine::processPendingJobs() {
 }
 
 // Shared tail of both evaluate() execution paths - the eval-cache hit and
-// the freshly compiled run (S2, r14): takes the raw JS_EvalFunction
+// the freshly compiled run: takes the raw JS_EvalFunction
 // result, wraps it exception-safely, drains the microtask queue on
 // top-level entries (run-to-completion), reports an uncaught exception
 // and applies the sticky-interrupt check. One copy instead of two that
@@ -910,50 +914,45 @@ QQuickJSValue QQuickJSEngine::evaluate(const QString& script, const QString& fil
     ensureEngineThread();
     if (exceptionStackTrace) exceptionStackTrace->clear();
 
-    // Anchor the stack guard (and the fresh timeout quota) before anything
-    // else: reporting a stale pending exception below also runs JS
-    // (Error.prototype.toString in the uncaught report), which must happen
-    // below a guard measured from THIS entry, not from a stale anchor.
-    const bool topLevel = (m_evalDepth == 0);
-    if (topLevel) {
-        resetExecutionState();
-        // Starved entry: the usable window below this anchor is inside the
-        // guard's safety margin, so even the C++ exception-throw path may
-        // not fit below it. Fail fast with the same catchable RangeError the
-        // stack guard raises, BEFORE entering JS (engine compile/run or
-        // the pending-exception report below) - the engine is unusable on
-        // such a stack either way, but the process must stay alive.
-        if (Q_UNLIKELY(m_stackStarved)) {
-            // A pending exception preempts the refusal exactly like it
-            // preempts the evaluation itself: consume it through the pure C
-            // path (JS_GetException runs no script - the guarantee this
-            // refusal makes) and return it instead of the RangeError, so the
-            // error does not stay pending behind every subsequent starved
-            // entry. The full report (stack collection, uncaughtException)
-            // stays skipped: it runs JS and needs the stack this entry
-            // refused. With nothing pending, the refusal RangeError itself.
-            if (JS_HasException(m_ctx)) {
-                return QQuickJSValue::fromException(this);
-            }
-            return newErrorObject(QQuickJSValue::RangeError,
-                                   QStringLiteral("Maximum call stack size exceeded"));
-        }
-    }
+    // Entry bookkeeping: the scope anchors the stack guard (and the fresh
+    // timeout quota) from THIS frame before anything else - reporting a
+    // stale pending exception below also runs JS (Error.prototype.toString
+    // in the uncaught report), which must happen below a guard measured
+    // from THIS entry, not from a stale anchor - and it keeps the report's
+    // re-entries (a hostile "stack" getter, an overridden
+    // Error.prototype.toString, a C++ slot behind uncaughtException()) at a
+    // nested depth instead of a fresh top level: a re-entrant entry seeing
+    // m_evalDepth == 0 would call resetExecutionState() mid-JS, re-anchor
+    // the guard below the already-running JS frames (the exact hazard
+    // reanchorStackGuard()'s m_evalDepth check exists to prevent) and reset
+    // the still-active report's quota. The tick-end work (microtask drain,
+    // rejection flush) lives in the scope's destructor.
+    JsEntryScope entryScope(this);
+    const bool topLevel = entryScope.isTopLevel();
 
-    // Entry bookkeeping BEFORE the pending-exception report below: the
-    // report itself runs user JS - a hostile "stack" getter, an overridden
-    // Error.prototype.toString, or a C++ slot behind uncaughtException() can
-    // re-enter the engine. Without the depth guard such a re-entrant entry
-    // sees m_evalDepth == 0, treats itself as a fresh top level and calls
-    // resetExecutionState() mid-JS: the stack guard would re-anchor below the
-    // already-running JS frames (the exact hazard reanchorStackGuard()'s
-    // m_evalDepth check exists to prevent) and the timeout/step quota of the
-    // still-active report would be reset. The rejection flush is declared
-    // after depthGuard so the flush (which may run user JS via reason
-    // toString) happens while the depth guard is still held. Top-level calls
-    // only: nested evaluates must not report the enclosing tick.
-    EvalDepthGuard depthGuard(m_evalDepth);
-    auto rejectionFlush = qScopeGuard([this, topLevel]() { if (topLevel) flushUnhandledRejections(); });
+    // Starved entry: the usable window below this anchor is inside the
+    // guard's safety margin, so even the C++ exception-throw path may
+    // not fit below it. Fail fast with the same catchable RangeError the
+    // stack guard raises, BEFORE entering JS (engine compile/run or
+    // the pending-exception report below) - the engine is unusable on
+    // such a stack either way, but the process must stay alive. The
+    // refusal returns straight through the scope: a starved destructor
+    // skips the tick-end work by design.
+    if (Q_UNLIKELY(entryScope.starved())) {
+        // A pending exception preempts the refusal exactly like it
+        // preempts the evaluation itself: consume it through the pure C
+        // path (JS_GetException runs no script - the guarantee this
+        // refusal makes) and return it instead of the RangeError, so the
+        // error does not stay pending behind every subsequent starved
+        // entry. The full report (stack collection, uncaughtException)
+        // stays skipped: it runs JS and needs the stack this entry
+        // refused. With nothing pending, the refusal RangeError itself.
+        if (JS_HasException(m_ctx)) {
+            return QQuickJSValue::fromException(this);
+        }
+        return newErrorObject(QQuickJSValue::RangeError,
+                               QStringLiteral("Maximum call stack size exceeded"));
+    }
 
     // QJSEngine parity: a pending exception (e.g. throwError() called from C++
     // between script executions) preempts evaluation: the script is not
@@ -1054,7 +1053,7 @@ void QQuickJSEngine::setProperty(const QString& name, const QQuickJSValue& value
     // "x", {set: ...})): the setter needs the fresh quota and the
     // re-anchored guard of a real entry, and a re-entrant engine call from
     // inside it must see a nested depth, not a fresh top level
-    // (QQuickJSValue::setProperty has kept the same scope since D-57).
+    // (QQuickJSValue::setProperty keeps the same scope).
     JsEntryScope entryScope(this);
 
     JSAtom atom = QuickJSConvert::cachedStringAtom(this, m_ctx, name);
@@ -1155,7 +1154,7 @@ QQuickJSValue QQuickJSEngine::newFunction(JSCFunction* func, const char* name, i
     return QQuickJSValue(this, funcVal.release(), true);
 }
 
-// Engine-wide metaobject cache lookup/build (L-12): returns the cache for
+// Engine-wide metaobject cache lookup/build: returns the cache for
 // the metaobject, building it on first sight. nullptr means the build
 // failed with a pending JS exception (OOM). Callers: wrapQObject() and the
 // proxy's runtime metaobject-change refresh.

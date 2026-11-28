@@ -499,7 +499,7 @@ int QuickJSQObjectProxy::qobject_set_property(JSContext* ctx, JSValueConst this_
 
         // Liveness for every write below: the value conversions can run user
         // JS (valueOf, toString, getters) and that JS may delete the target
-        // QObject; a local raw pointer would dangle (H-3). data->obj is a
+        // QObject; a local raw pointer would dangle. data->obj is a
         // QPointer and reflects the deletion immediately.
         auto writeProp = [&](int idx, void** a) -> bool {
             if (Q_UNLIKELY(data->obj.isNull())) {
@@ -833,7 +833,7 @@ int QuickJSQObjectProxy::qobject_set_property(JSContext* ctx, JSValueConst this_
             return -1;
         }
 
-        // Liveness re-check (H-3): the toVariant() conversion above may have
+        // Liveness re-check: the toVariant() conversion above may have
         // run user JS that deleted the target QObject.
         if (Q_UNLIKELY(data->obj.isNull())) {
             JS_ThrowTypeError(ctx, "QObject has been deleted");
@@ -1087,7 +1087,7 @@ JSValue QuickJSQObjectProxy::js_method_invoke(JSContext* ctx, JSValueConst func_
             }
         }
 
-        // Liveness re-check (H-3): the argument conversions above may have
+        // Liveness re-check: the argument conversions above may have
         // run user JS (valueOf, toString, getters) that deleted the target
         // QObject; the metacall must not go through the dangling pointer.
         if (Q_UNLIKELY(data->obj.isNull())) {
@@ -1099,6 +1099,14 @@ JSValue QuickJSQObjectProxy::js_method_invoke(JSContext* ctx, JSValueConst func_
 }
 
 JSValue QuickJSQObjectProxy::getMethodProxy(QQuickJSEngine* engine, JSContext* ctx, JSQObjectData* data, JSAtom prop, const MetaCacheEntry& entry) {
+    // Issued proxies pin the metamethod indices they were built with: a
+    // dynamic metaobject swap afterwards rebuilds the class cache (later
+    // lookups resolve the new indices), but a proxy already handed to the
+    // script keeps calling through its captured candidates. Accepted
+    // residual risk: the wrapper targets plain QObjects whose metaobjects
+    // do not change at runtime; re-resolving by signature on every call
+    // would tax the common path for a scenario the wrapper does not
+    // promise to support.
     for (const auto& e : data->methodProxyCache) {
         if (e.atom == prop) return JS_DupValue(ctx, e.value);
     }

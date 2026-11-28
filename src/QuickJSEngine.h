@@ -13,7 +13,9 @@
  * (QuickJSEngine.h, QuickJSValue.h), not after the classes. Helpers
  * without the prefix (QuickJSConvert, QuickJSQObjectProxy,
  * QuickJSSignalProxy, JsErrorTranslator) are internal implementation
- * details, not public API.
+ * details, not public API - with one documented exception: the host-side
+ * error-translation helper translateJsError() (JsErrorTranslator.h),
+ * see the README.
  *
  * @note JavaScript does not support C++ method overloading by type.
  * If a QObject has overloaded Q_INVOKABLE methods or signals,

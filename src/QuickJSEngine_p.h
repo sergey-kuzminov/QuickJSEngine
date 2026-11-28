@@ -141,17 +141,6 @@ auto invokeSafe(JSContext* ctx, const char* contextName, F&& func) {
     return QVariant(QMetaType(metaType));
 }
 
-class EvalDepthGuard {
-public:
-    explicit EvalDepthGuard(int& depth) : m_depth(depth) { ++m_depth; }
-    ~EvalDepthGuard() { --m_depth; }
-
-    Q_DISABLE_COPY(EvalDepthGuard)
-
-private:
-    int& m_depth;
-};
-
 // RAII bookkeeping shared by EVERY path that can run user JavaScript:
 // the engine entries (evaluate, importModule, registerModule, value calls
 // and constructions, signal callbacks) and the QQuickJSValue accessors
@@ -162,10 +151,17 @@ private:
 // against a deadline or a guard line measured at some earlier entry.
 // Nested scopes only track depth.
 //
-// Ordering contract: the destructor flushes unhandled rejections BEFORE
-// releasing the depth, so the end-of-tick report (which may run user JS
-// through reason toString) still runs under the depth guard, exactly like
-// the former per-entry EvalDepthGuard + rejectionFlush pairs.
+// Ordering contract: the destructor ends the tick BEFORE releasing the
+// depth. It drains the microtask queue first (run-to-completion, only
+// when the host enabled auto-processing), then flushes the unhandled
+// rejections: a rejection raised by a drained job must be reported by
+// THIS exit, and flushUnhandledRejections() itself defers while jobs are
+// still pending (a handler may still attach). A starved entry skips
+// both - job trampolines and the reason-toString report are exactly the
+// JS the entry refusal keeps off a starved stack; the buffered
+// rejections wait for a healthier entry. Everything runs under the
+// depth guard, so re-entry from a drained job sees a nested depth, not
+// a fresh top level.
 //
 // Starved-stack policy is two-tier. Bulky entries (evaluate, module
 // import/registration, JS calls and constructions, signal callbacks)
@@ -188,7 +184,10 @@ public:
     }
 
     ~JsEntryScope() {
-        if (m_topLevel) m_engine->flushUnhandledRejections();
+        if (m_topLevel && !m_engine->m_stackStarved) {
+            if (m_engine->m_autoProcessPromises) m_engine->processPendingJobs();
+            m_engine->flushUnhandledRejections();
+        }
         --m_engine->m_evalDepth;
     }
 
@@ -310,6 +309,29 @@ public:
 private:
     JSContext* m_ctx;
     JSAtom m_atom;
+};
+
+// Owns a JSPropertyEnum array for the scope lifetime: a C++ exception
+// escaping the loop that walks the enum (bad_alloc from a container
+// insert, a throw from a nested conversion) must not leak the array and
+// its atoms. JS_FreePropertyEnum(nullptr, 0) is a no-op, so a failed
+// JS_GetOwnPropertyNames needs no special casing.
+class ScopedPropertyEnum {
+public:
+    ScopedPropertyEnum(JSContext* ctx, JSPropertyEnum* props, uint32_t n)
+        : m_ctx(ctx), m_props(props), m_n(n) {}
+    ~ScopedPropertyEnum() { if (m_ctx && m_props) JS_FreePropertyEnum(m_ctx, m_props, m_n); }
+
+    ScopedPropertyEnum(const ScopedPropertyEnum&) = delete;
+    ScopedPropertyEnum& operator=(const ScopedPropertyEnum&) = delete;
+
+    [[nodiscard]] JSPropertyEnum* props() const noexcept { return m_props; }
+    [[nodiscard]] uint32_t count() const noexcept { return m_n; }
+
+private:
+    JSContext* m_ctx;
+    JSPropertyEnum* m_props;
+    uint32_t m_n;
 };
 
 inline void clearPendingException(JSContext* ctx) {

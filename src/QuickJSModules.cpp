@@ -135,6 +135,9 @@ int QQuickJSEngine::registeredModuleInit(JSContext* ctx, JSModuleDef* m) {
         if (JS_GetOwnPropertyNames(ctx, &props, &count, snap.value(), JS_GPN_STRING_MASK) < 0) {
             return -1;
         }
+        // RAII ownership: an escaping C++ exception (the safety net below)
+        // used to skip the manual JS_FreePropertyEnum on its way out.
+        const ScopedPropertyEnum propsGuard(ctx, props, count);
 
         int ret = 0;
         for (uint32_t i = 0; i < count && ret == 0; ++i) {
@@ -151,7 +154,6 @@ int QQuickJSEngine::registeredModuleInit(JSContext* ctx, JSModuleDef* m) {
             // the engine on failure.
             if (JS_SetModuleExport(ctx, m, name.value(), val) < 0) ret = -1;
         }
-        JS_FreePropertyEnum(ctx, props, count);
         return ret;
     } catch (...) {
         return -1;
@@ -168,23 +170,18 @@ QQuickJSValue QQuickJSEngine::importModule(const QString& fileName) {
         return QQuickJSValue::fromException(this);
     }
 
-    const bool topLevel = (m_evalDepth == 0);
-    if (topLevel) {
-        resetExecutionState();
-        // Starved entry (see evaluate()): the window below this anchor is
-        // inside the guard's safety margin; module compilation/evaluation
-        // would run on a stack that cannot even fit the throw path. Refuse
-        // with the same catchable RangeError before entering JS.
-        if (Q_UNLIKELY(m_stackStarved)) {
-            return newErrorObject(QQuickJSValue::RangeError,
-                                   QStringLiteral("Maximum call stack size exceeded"));
-        }
+    // Entry bookkeeping (fresh quota, guard re-anchor, tick-end drain and
+    // rejection flush - all in the scope; see evaluate()). A starved anchor
+    // refuses before the module machinery runs: the window below it is
+    // inside the guard's safety margin; module compilation/evaluation
+    // would run on a stack that cannot even fit the throw path. Refuse
+    // with the same catchable RangeError before entering JS.
+    JsEntryScope entryScope(this);
+    const bool topLevel = entryScope.isTopLevel();
+    if (Q_UNLIKELY(entryScope.starved())) {
+        return newErrorObject(QQuickJSValue::RangeError,
+                               QStringLiteral("Maximum call stack size exceeded"));
     }
-    EvalDepthGuard depthGuard(m_evalDepth);
-    // Declared after depthGuard so the flush (which may run user JS via reason
-    // toString) happens while the depth guard is still held. Top-level calls
-    // only: nested imports must not report the enclosing tick.
-    auto rejectionFlush = qScopeGuard([this, topLevel]() { if (topLevel) flushUnhandledRejections(); });
 
     // Singleton cache: the first import evaluates the module; every later
     // import - from C++ or from JavaScript - returns the same instance. A
@@ -296,28 +293,23 @@ bool QQuickJSEngine::registerModule(const QString& moduleName, const QQuickJSVal
     }
 
     // The snapshot reads property values, which may run user JavaScript
-    // (getters): start a fresh execution-timeout quota and keep the tick
-    // bookkeeping consistent with the other JS entry points.
-    const bool topLevel = (m_evalDepth == 0);
-    if (topLevel) {
-        resetExecutionState();
-        // Starved entry (see evaluate()): the snapshot below reads values
-        // through JS_GetProperty - it runs user getters ("Values -
-        // including getters - are read exactly once, here"), i.e. script
-        // execution on a stack the guard already considers starved, where
-        // even the overflow throw path may not fit below the anchor.
-        // Refuse like the other entry points: 'false' keeps parity with
-        // every other registration failure, and the pending RangeError
-        // (built through the pure C path - refusing must not itself run
-        // script) surfaces at the next importModule()/evaluate(), exactly
-        // like a throwing getter's failed registration.
-        if (Q_UNLIKELY(m_stackStarved)) {
-            JS_ThrowRangeError(m_ctx, "Maximum call stack size exceeded");
-            return false;
-        }
+    // (getters): the scope keeps the tick bookkeeping consistent with the
+    // other JS entry points (fresh quota, guard re-anchor, tick-end drain
+    // and rejection flush - see evaluate()).
+    JsEntryScope entryScope(this);
+    // Starved entry: the snapshot below reads values through JS_GetProperty
+    // - it runs user getters ("Values - including getters - are read
+    // exactly once, here"), i.e. script execution on a stack the guard
+    // already considers starved, where even the overflow throw path may
+    // not fit below the anchor. Refuse like the other entry points:
+    // 'false' keeps parity with every other registration failure, and the
+    // pending RangeError (built through the pure C path - refusing must
+    // not itself run script) surfaces at the next importModule()/
+    // evaluate(), exactly like a throwing getter's failed registration.
+    if (Q_UNLIKELY(entryScope.starved())) {
+        JS_ThrowRangeError(m_ctx, "Maximum call stack size exceeded");
+        return false;
     }
-    EvalDepthGuard depthGuard(m_evalDepth);
-    auto rejectionFlush = qScopeGuard([this, topLevel]() { if (topLevel) flushUnhandledRejections(); });
 
     // Snapshot: "default" is the value itself; every own enumerable string
     // property becomes a named export. Values - including getters - are read
@@ -341,6 +333,9 @@ bool QQuickJSEngine::registerModule(const QString& moduleName, const QQuickJSVal
             JS_FreeValue(m_ctx, snap);
             return false;
         }
+        // RAII ownership: the exportNames append below can throw bad_alloc
+        // past the old manual free, leaking the enum array and its atoms.
+        const ScopedPropertyEnum propsGuard(m_ctx, props, count);
         for (uint32_t i = 0; i < count && ok; ++i) {
             ScopedCString name(m_ctx, JS_AtomToCString(m_ctx, props[i].atom));
             if (!name.isValid()) {
@@ -369,7 +364,6 @@ bool QQuickJSEngine::registerModule(const QString& moduleName, const QQuickJSVal
                 exportNames.append(QByteArray(name.value()));
             }
         }
-        JS_FreePropertyEnum(m_ctx, props, count);
         if (!ok) {
             JS_FreeValue(m_ctx, snap);
             return false;

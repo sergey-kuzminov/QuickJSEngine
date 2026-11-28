@@ -287,30 +287,25 @@ void QQuickJSEngine::installExtensions(QQuickJSEngine::Extensions extensions, co
         if (JS_IsObject(object.m_val)) target = object.m_val;
     }
 
-    // Entry bookkeeping like the other JS entry points: the presence probe
-    // below reads target properties (JS_GetPropertyStr runs user getters on
-    // a custom target object) and the install writes them (JS_SetPropertyStr
-    // runs user setters), so the guard must be anchored from THIS entry and
-    // the starved refusal applies.
-    const bool topLevel = (m_evalDepth == 0);
-    if (topLevel) {
-        resetExecutionState();
-        if (Q_UNLIKELY(m_stackStarved)) {
-            // Starved entry (see evaluate()): installing executes user
-            // accessors on the target under the emergency budget - the
-            // exact execution the entry refusal exists to prevent. A void
-            // setup API has no error channel: report and skip the install;
-            // every subsequent evaluate() refuses on its own anchor
-            // anyway, and re-calling installExtensions() after the host
-            // climbs back to a healthy stack installs normally.
-            qWarning("QQuickJSEngine: installExtensions() refused - the stack is "
-                     "starved below the safety margin at this entry; console/gc/qsTr "
-                     "were not installed");
-            return;
-        }
+    // Entry bookkeeping like the other JS entry points (see evaluate()):
+    // the presence probe below reads target properties (JS_GetPropertyStr
+    // runs user getters on a custom target object) and the install writes
+    // them (JS_SetPropertyStr runs user setters), so the scope anchors the
+    // guard from THIS entry and the starved refusal applies.
+    JsEntryScope entryScope(this);
+    if (Q_UNLIKELY(entryScope.starved())) {
+        // Starved entry: installing executes user accessors on the target
+        // under the emergency budget - the exact execution the entry
+        // refusal exists to prevent. A void setup API has no error
+        // channel: report and skip the install; every subsequent
+        // evaluate() refuses on its own anchor anyway, and re-calling
+        // installExtensions() after the host climbs back to a healthy
+        // stack installs normally.
+        qWarning("QQuickJSEngine: installExtensions() refused - the stack is "
+                 "starved below the safety margin at this entry; console/gc/qsTr "
+                 "were not installed");
+        return;
     }
-    EvalDepthGuard depthGuard(m_evalDepth);
-    auto rejectionFlush = qScopeGuard([this, topLevel]() { if (topLevel) flushUnhandledRejections(); });
 
     // Deduplicate by the actual property presence, not only by the installed
     // mask: scripts can delete console/gc/qsTr from the target object, and a
@@ -331,7 +326,7 @@ void QQuickJSEngine::installExtensions(QQuickJSEngine::Extensions extensions, co
     if (extensions.testFlag(TranslationExtension) && needsInstall(TranslationExtension, "qsTr")) toInstall |= TranslationExtension;
     if (static_cast<int>(toInstall) == 0) return;
 
-    // Per-extension success accounting (N-5): a bit is set only when that
+    // Per-extension success accounting: a bit is set only when that
     // extension actually installed, so a failed install is not masked as
     // done - the presence probe above reinstalls on the next call.
     Extensions installed = Extensions(0);

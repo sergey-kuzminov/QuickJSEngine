@@ -139,7 +139,7 @@ static QVariant jsBufferToVariant(JSContext* ctx, JSValueConst val)
         // conversion (V4 parity: a clean error, not garbage); only a
         // detached backing store converts to an empty QByteArray.
         //
-        // Tamper surface (accepted): unlike the Date read (D-51 captures
+        // Tamper surface (accepted): unlike the Date read (which captures
         // the intrinsic getTime), this probe goes through the MUTABLE
         // "buffer" property - a tampered prototype getter or a Proxy
         // get-trap on a buffer-like object runs here and its return value
@@ -186,24 +186,9 @@ static QVariant jsBufferToVariant(JSContext* ctx, JSValueConst val)
 // escaping the conversion loop (bad_alloc from map.insert, or a throw from
 // a nested conversion) must not leak the enum array and its atoms
 // (invariant 3). JS_FreePropertyEnum(nullptr, 0) is a no-op, so a failed
-// JS_GetOwnPropertyNames needs no special casing.
-class ScopedPropertyEnum {
-public:
-    ScopedPropertyEnum(JSContext* ctx, JSPropertyEnum* props, uint32_t n)
-        : m_ctx(ctx), m_props(props), m_n(n) {}
-    ~ScopedPropertyEnum() { if (m_ctx && m_props) JS_FreePropertyEnum(m_ctx, m_props, m_n); }
-
-    ScopedPropertyEnum(const ScopedPropertyEnum&) = delete;
-    ScopedPropertyEnum& operator=(const ScopedPropertyEnum&) = delete;
-
-    [[nodiscard]] JSPropertyEnum* props() const noexcept { return m_props; }
-    [[nodiscard]] uint32_t count() const noexcept { return m_n; }
-
-private:
-    JSContext* m_ctx;
-    JSPropertyEnum* m_props;
-    uint32_t m_n;
-};
+// JS_GetOwnPropertyNames needs no special casing. (Moved to
+// QuickJSEngine_p.h: the module registration paths own property enums
+// with the same exception-safety requirements.)
 
 QVariant QuickJSConvert::variantFromJSObject(QQuickJSEngine* engine, JSContext* ctx, JSValueConst val,
                                             JSClassID qobjectClassID, JSClassID objectClassID,
@@ -287,7 +272,7 @@ QVariant QuickJSConvert::variantFromJSObject(QQuickJSEngine* engine, JSContext* 
     for (uint32_t i = 0; i < n_props; ++i) {
         JSAtom atom = props[i].atom;
 
-        // atomName() returns the key by value (D-56), so a getter that
+        // atomName() returns the key by value, so a getter that
         // recurses into the atom-name cache cannot invalidate it.
         ScopedJSValue item(ctx, JS_GetProperty(ctx, val, atom));
         const QString keyStr = atomName(engine, ctx, atom);

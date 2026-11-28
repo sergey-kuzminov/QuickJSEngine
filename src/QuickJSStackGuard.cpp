@@ -176,7 +176,7 @@ std::atomic<bool> g_floorUnknownWarned{false};
 // Separate one-shot latch for INVALID bounds (a floor at/above the current
 // SP, or an absurd distance away): the unknown-floor latch above covers
 // the "no measurement API" regime only, and its one-shot warning must not
-// be consumed by a different degenerate input (L-8).
+// be consumed by a different degenerate input.
 std::atomic<bool> g_floorInvalidWarned{false};
 
 // Process-wide calibration cache for calibrateMachineryAllowance(): the
@@ -213,6 +213,11 @@ void warnIfFakeStackActive()
 {
 #if defined(__GNUC__) || defined(__clang__)
     static std::atomic<bool> checked{false};
+    // Relaxed read first: this fires on EVERY top-level entry (the guard
+    // re-anchor), and after the first check the locked exchange would be
+    // pure overhead on the accessor paths.
+    if (checked.load(std::memory_order_relaxed))
+        return;
     if (checked.exchange(true))
         return;
     const uintptr_t frameAddress = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
@@ -304,7 +309,7 @@ size_t clampedStackBudget(size_t wanted, uintptr_t sp)
         // process must stay alive. Entries this deep are refused before
         // entering JS at all (see m_stackStarved), so this budget only has
         // to cover the engine-internal JS that cannot be refused.
-        // The budget never exceeds what is actually left (N-4): with
+        // The budget never exceeds what is actually left: with
         // `above` smaller than the emergency constant, a fixed 16 KiB line
         // would land below the real bottom - an unreachable guard.
         return above > 2 * kEmergencyGuardBudget ? kEmergencyGuardBudget : above / 2;

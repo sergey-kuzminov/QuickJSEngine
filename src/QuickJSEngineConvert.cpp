@@ -19,6 +19,7 @@
 #include <QDateTime>
 #include <QTime>
 
+#include <cmath>
 #include <limits>
 
 namespace {
@@ -130,7 +131,7 @@ JSValue QQuickJSEngine::toJSValueImpl(const QVariant& var, int depth) {
 
     // constData() casts, not the QVariant accessors: the case guarantees
     // the exact stored type, and toString()/toByteArray()/... would take a
-    // COW copy of the scalar on every conversion (S1, r14) - the container
+    // COW copy of the scalar on every conversion - the container
     // switch above already reads its payloads this way.
     switch (var.userType()) {
     case QMetaType::QString:

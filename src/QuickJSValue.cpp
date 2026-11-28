@@ -246,6 +246,13 @@ QQuickJSValue::ErrorType QQuickJSValue::errorType() const {
     if (!c) return NoError;
     if (!JS_IsError(m_val)) return NoError;
 
+    // The prototype walk below goes through JS_GetPrototype, and a Proxy
+    // anywhere in the chain runs its getPrototypeOf trap - user JS. It
+    // needs the entry bookkeeping like every other accessor that can
+    // execute script: the fresh quota, the re-anchored guard, and a
+    // nested depth for anything the trap calls back into.
+    JsEntryScope entryScope(m_engine.data());
+
     // Classification by prototype identity, NOT by the 'name' property:
     // QJSEngine branches on the internal error class, while reading 'name'
     // would both run script (a getter/toString) and misclassify trivial
@@ -416,7 +423,7 @@ QQuickJSValue QQuickJSValue::property(const char* name) const {
 QQuickJSValue QQuickJSValue::property(const QByteArray& name) const {
     // Route through the QString overload (atom cache): a QByteArray with an
     // embedded NUL would be truncated at constData() (same fix as
-    // QQuickJSEngine::setProperty(QByteArray), L-3).
+    // QQuickJSEngine::setProperty(QByteArray)).
     return property(QString::fromUtf8(name));
 }
 
@@ -519,7 +526,7 @@ QString QQuickJSValue::toString() const {
     // ToString of an object runs user code (toString/valueOf/
     // Symbol.toPrimitive): entry bookkeeping applies; primitives (the hot
     // path of reading values back) take the direct conversion. The scope
-    // must COVER the conversion (V2, r14): destroyed earlier, the user JS
+    // must COVER the conversion: destroyed earlier, the user JS
     // would run at m_evalDepth == 0 - a re-entrant entry from a
     // toString/valueOf would see a fresh top level and reset the quota and
     // re-anchor the guard mid-JS (the hazard the evaluate() invariant
@@ -602,7 +609,7 @@ QVariant QQuickJSValue::toVariant() const {
     QQuickJSEngine* jsEngine = m_engine.data();
     ensureEngineThread();
     // Deep conversion reads properties: getters may run user JS. The scope
-    // must cover the conversion itself (V2, r14), like toString() above.
+    // must cover the conversion itself, like toString() above.
     if (JS_IsObject(m_val)) {
         JsEntryScope entryScope(jsEngine);
         return jsEngine->toVariant(m_val);
@@ -616,7 +623,7 @@ QVariant QQuickJSValue::toVariant(ObjectConversionBehavior behavior) const {
     QQuickJSEngine* jsEngine = m_engine.data();
     ensureEngineThread();
     // Deep conversion reads properties: getters may run user JS; the
-    // scope covers the conversion (V2, r14).
+    // scope covers the conversion.
     if (JS_IsObject(m_val)) {
         JsEntryScope entryScope(jsEngine);
         return jsEngine->toVariant(m_val, behavior);
